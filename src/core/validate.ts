@@ -7,7 +7,9 @@
 export type JsonObject = Record<string, unknown>;
 
 export function isPlainObject(value: unknown): value is JsonObject {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 /** Non-empty string after trim; returns the original (untrimmed) value on success. */
@@ -23,12 +25,15 @@ export function isNonEmptyStringArray(value: unknown): value is string[] {
 }
 
 /**
- * Own-enumerable keys only, so inherited properties cannot smuggle unknown
- * fields past this check. Field reads must use {@link ownValue} so that
- * prototype-chain values never satisfy validation either.
+ * Own property keys only (including symbols and non-enumerable keys), so
+ * inherited properties cannot smuggle unknown fields past this check. Field
+ * reads must use {@link ownValue} so prototype-chain values never satisfy
+ * validation either.
  */
 export function hasExactFields(value: JsonObject, allowed: readonly string[]): boolean {
-  return Object.keys(value).every((key) => allowed.includes(key));
+  return Reflect.ownKeys(value).every(
+    (key) => typeof key === 'string' && allowed.includes(key),
+  );
 }
 
 /** Reads an own property only; inherited values read as absent. */
@@ -37,10 +42,18 @@ export function ownValue(obj: JsonObject, key: string): unknown {
 }
 
 const MAX_ECHO_CHARS = 160;
+const TRUNCATION_SUFFIX = '…[truncated]';
 
-/** Bounds input values echoed in error messages; error codes/structure unchanged. */
+/** Bounds echoed input to ≤160 UTF-16 code units without splitting a surrogate pair. */
 export function truncateForMessage(value: string): string {
-  return value.length > MAX_ECHO_CHARS ? `${value.slice(0, MAX_ECHO_CHARS)}…[truncated]` : value;
+  if (value.length <= MAX_ECHO_CHARS) return value;
+  const prefixLimit = MAX_ECHO_CHARS - TRUNCATION_SUFFIX.length;
+  let prefix = '';
+  for (const character of value) {
+    if (prefix.length + character.length > prefixLimit) break;
+    prefix += character;
+  }
+  return `${prefix}${TRUNCATION_SUFFIX}`;
 }
 
 /** Recursively freezes a value; used for catalog state and dispatch plans. */
