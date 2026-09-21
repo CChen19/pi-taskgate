@@ -7,11 +7,13 @@
  * module has no wall-clock, process, or network behavior.
  */
 
-import type {
-  AttemptHandle,
-  AttemptPollResult,
-  ExecutorPort,
-  ExecutorStartRequest,
+import {
+  SETTLEMENT_FAILURE_CODES,
+  type AttemptHandle,
+  type AttemptPollResult,
+  type AttemptSettlement,
+  type ExecutorPort,
+  type ExecutorStartRequest,
 } from './executor-port.ts';
 import {
   TaskGraph,
@@ -55,8 +57,8 @@ export type SchedulerEvent =
       readonly at: number;
       readonly taskId: string;
       readonly attemptId: string;
-      readonly phase: 'start' | 'poll';
-      readonly code: 'EXECUTOR_PROTOCOL_VIOLATION' | 'EXECUTOR_START_FAILED';
+      readonly phase: 'start' | 'poll' | 'close';
+      readonly code: 'EXECUTOR_PROTOCOL_VIOLATION' | 'EXECUTOR_START_FAILED' | 'EXECUTOR_CLEANUP_FAILED';
       readonly message: string;
       readonly path: string;
       readonly available: readonly string[];
@@ -82,6 +84,14 @@ export type SchedulerEvent =
       readonly taskId: string;
       readonly attemptId: string;
       readonly outcome: string;
+      readonly settlement: AttemptSettlement;
+    }
+  | {
+      readonly type: 'acceptance_blocked';
+      readonly at: number;
+      readonly taskId: string;
+      readonly attemptId: string;
+      readonly settlement: AttemptSettlement;
     }
   | {
       readonly type: 'verdict_recorded';
@@ -101,7 +111,7 @@ export type SchedulerEvent =
       readonly at: number;
       readonly taskId: string;
       readonly attemptId: string;
-      readonly reason: 'rejected' | 'timeout' | 'executor_error';
+      readonly reason: 'rejected' | 'policy_rejected' | 'timeout' | 'executor_error';
       readonly delayMs: number;
       readonly dueAt: number;
     }
@@ -162,7 +172,8 @@ export type SchedulerErrorCode =
   | 'INVALID_SCHEDULER_OPERATION'
   | 'INVALID_STATE_TRANSITION'
   | 'INVALID_TRANSITION_EVENT'
-  | 'INVALID_TRANSITION_INPUT';
+  | 'INVALID_TRANSITION_INPUT'
+  | 'EXECUTOR_CLEANUP_FAILED';
 
 export interface SchedulerError {
   readonly code: SchedulerErrorCode;
@@ -188,7 +199,7 @@ interface InFlightAttempt {
 
 interface RetryDeadline {
   readonly attemptId: string;
-  readonly reason: 'rejected' | 'timeout' | 'executor_error';
+  readonly reason: 'rejected' | 'policy_rejected' | 'timeout' | 'executor_error';
   readonly dueAt: number;
 }
 
@@ -196,8 +207,8 @@ interface ExecutorFailureInput {
   readonly taskId: string;
   readonly attemptId: string;
   readonly now: number;
-  readonly phase: 'start' | 'poll';
-  readonly code: 'EXECUTOR_PROTOCOL_VIOLATION' | 'EXECUTOR_START_FAILED';
+  readonly phase: 'start' | 'poll' | 'close';
+  readonly code: 'EXECUTOR_PROTOCOL_VIOLATION' | 'EXECUTOR_START_FAILED' | 'EXECUTOR_CLEANUP_FAILED';
   readonly message: string;
   readonly path: string;
   readonly available: readonly string[];
@@ -376,8 +387,8 @@ export class Scheduler {
     if (task === undefined) return this.unknownTask(taskId);
     const running = this.inFlight.get(taskId);
     if (running !== undefined) {
-      running.handle.cancel(reason);
-      running.handle.close();
+      const lifecycleFailure = cancelAndCloseHandle(running.handle, reason);
+      if (lifecycleFailure !== undefined) return { ok: false, error: this.executorCleanupError(taskId, lifecycleFailure) };
       this.inFlight.delete(taskId);
       this.emit({ type: 'attempt_cancelled', at: now, taskId, attemptId: running.attemptId, reason });
     }
@@ -396,8 +407,11 @@ export class Scheduler {
       if (task !== undefined && task.state === 'RUNNING') continue;
       const state = task?.state ?? 'UNKNOWN';
       const reason = `task state is ${state}; executor handle withdrawn by scheduler`;
-      running.handle.cancel(reason);
-      running.handle.close();
+      const lifecycleFailure = cancelAndCloseHandle(running.handle, reason);
+      if (lifecycleFailure !== undefined) {
+        this.emitExecutorError({ taskId, attemptId: running.attemptId, now, phase: 'close', code: 'EXECUTOR_CLEANUP_FAILED', message: lifecycleFailure.message, path: lifecycleFailure.path, available: lifecycleFailure.available });
+        continue;
+      }
       this.inFlight.delete(taskId);
       this.emit({ type: 'attempt_cancelled', at: now, taskId, attemptId: running.attemptId, reason });
     }
@@ -492,7 +506,7 @@ export class Scheduler {
       ...(terminal ? { terminal: true } : {}),
     });
     if (input.handle !== undefined) {
-      this.withdrawHandle(input.taskId, {
+      this.withdrawHandle(input.now, input.taskId, {
         taskId: input.taskId,
         attemptId: input.attemptId,
         handle: input.handle,
@@ -533,10 +547,18 @@ export class Scheduler {
     this.emitDerivedStateEvents(before, updated, input.now, input.taskId);
   }
 
-  private withdrawHandle(taskId: string, running: InFlightAttempt): void {
-    running.handle.cancel(`executor failure for ${taskId}`);
-    running.handle.close();
+  private withdrawHandle(now: number, taskId: string, running: InFlightAttempt): void {
+    const lifecycleFailure = cancelAndCloseHandle(running.handle, `executor failure for ${taskId}`);
+    if (lifecycleFailure !== undefined) {
+      this.emitExecutorError({ taskId, attemptId: running.attemptId, now, phase: 'close', code: 'EXECUTOR_CLEANUP_FAILED', message: lifecycleFailure.message, path: lifecycleFailure.path, available: lifecycleFailure.available });
+      return;
+    }
     this.inFlight.delete(taskId);
+  }
+
+  private executorCleanupError(taskId: string, failure: HandleBoundaryFailure): SchedulerError {
+    const from = this.graph.getTask(taskId)?.state;
+    return { code: 'EXECUTOR_CLEANUP_FAILED', message: truncateForMessage(failure.message), path: failure.path, available: [...failure.available], ...(from === undefined ? {} : { from }) };
   }
 
   private emitExecutorError(input: ExecutorFailureInput): void {
@@ -596,7 +618,7 @@ export class Scheduler {
           outcome: result.outcome,
         });
         if (!settled.ok) {
-          this.withdrawHandle(taskId, running);
+          this.withdrawHandle(now, taskId, running);
           this.emitExecutorError({
             now,
             taskId,
@@ -609,7 +631,11 @@ export class Scheduler {
           });
           continue;
         }
-        running.handle.close();
+        const closeFailure = closeHandle(running.handle);
+        if (closeFailure !== undefined) {
+          this.emitExecutorError({ taskId, attemptId: running.attemptId, now, phase: 'close', code: 'EXECUTOR_CLEANUP_FAILED', message: closeFailure.message, path: closeFailure.path, available: closeFailure.available });
+          continue;
+        }
         this.inFlight.delete(taskId);
         this.emit({
           type: 'attempt_settled',
@@ -617,7 +643,33 @@ export class Scheduler {
           taskId,
           attemptId: running.attemptId,
           outcome: result.outcome,
+          settlement: result.settlement,
         });
+        if (!result.settlement.acceptanceEligible) {
+          const before = this.graph.snapshot();
+          const taskBefore = this.graph.getTask(taskId)!;
+          let retryDelay: number | undefined;
+          if (hasAttemptsRemaining(taskBefore)) {
+            const delay = this.calculateBackoff(taskBefore.attempts.length, now);
+            if (!delay.ok) {
+              this.emitSchedulerError(now, delay.error);
+              continue;
+            }
+            retryDelay = delay.value;
+          }
+          const blocked = this.graph.transitionTask(taskId, { type: 'verdict', verdict: 'rejected' });
+          if (!blocked.ok) {
+            this.emitExecutorError({ now, taskId, attemptId: running.attemptId, phase: 'poll', code: 'EXECUTOR_PROTOCOL_VIOLATION', message: `acceptance block transition rejected: ${truncateForMessage(blocked.error.message)}`, path: blocked.error.path, available: blocked.error.available });
+            continue;
+          }
+          this.emit({ type: 'acceptance_blocked', at: now, taskId, attemptId: running.attemptId, settlement: result.settlement });
+          this.emit({ type: 'verdict_recorded', at: now, taskId, attemptId: running.attemptId, verdict: 'rejected' });
+          const updated = blocked.snapshot;
+          const current = updated.tasks.find((entry) => entry.id === taskId)!;
+          if (current.state === 'RETRYING') this.scheduleRetry(taskId, running.attemptId, 'policy_rejected', now, retryDelay!);
+          else if (current.state === 'FAILED') this.emit({ type: 'task_failed', at: now, taskId, attemptId: running.attemptId, reason: result.settlement.reason ?? result.settlement.conclusion });
+          this.emitDerivedStateEvents(before, updated, now, taskId);
+        }
         continue;
       }
 
@@ -644,9 +696,9 @@ export class Scheduler {
           outcome: `timeout after ${elapsedMs}ms`,
           ...(terminal ? { terminal: true } : {}),
         });
-        running.handle.cancel(`timeout after ${elapsedMs}ms`);
-        running.handle.close();
-        this.inFlight.delete(taskId);
+        const lifecycleFailure = cancelAndCloseHandle(running.handle, `timeout after ${elapsedMs}ms`);
+        if (lifecycleFailure !== undefined) this.emitExecutorError({ taskId, attemptId: running.attemptId, now, phase: 'close', code: 'EXECUTOR_CLEANUP_FAILED', message: lifecycleFailure.message, path: lifecycleFailure.path, available: lifecycleFailure.available });
+        else this.inFlight.delete(taskId);
         if (!timedOut.ok) {
           this.emitExecutorError({
             now,
@@ -704,7 +756,7 @@ export class Scheduler {
   private scheduleRetry(
     taskId: string,
     attemptId: string,
-    reason: 'rejected' | 'timeout' | 'executor_error',
+    reason: 'rejected' | 'policy_rejected' | 'timeout' | 'executor_error',
     now: number,
     delayMs: number,
   ): void {
@@ -861,6 +913,41 @@ function errorMessage(error: unknown): string {
   return 'executor threw a non-Error value';
 }
 
+interface HandleBoundaryFailure {
+  readonly message: string;
+  readonly path: string;
+  readonly available: readonly string[];
+}
+
+function readHandleError(handle: AttemptHandle): HandleBoundaryFailure | undefined {
+  try {
+    const raw = handle.lastError?.();
+    if (raw === undefined || raw === null) return undefined;
+    if (typeof raw === 'object' && raw !== null) {
+      const value = raw as Record<string, unknown>;
+      const message = typeof value['message'] === 'string' ? value['message'] : 'executor handle lifecycle failed';
+      const path = typeof value['path'] === 'string' ? value['path'] : 'executor.handle';
+      const available = Array.isArray(value['available']) && value['available'].every((entry) => typeof entry === 'string') ? [...value['available']] as string[] : [];
+      return { message: truncateForMessage(message), path, available };
+    }
+    return { message: 'executor handle lifecycle failed', path: 'executor.handle', available: [] };
+  } catch {
+    return { message: 'executor handle error could not be inspected', path: 'executor.handle', available: [] };
+  }
+}
+
+function closeHandle(handle: AttemptHandle): HandleBoundaryFailure | undefined {
+  try { handle.close(); } catch (error) { return { message: errorMessage(error), path: 'executor.close', available: [] }; }
+  return readHandleError(handle);
+}
+
+function cancelAndCloseHandle(handle: AttemptHandle, reason: string): HandleBoundaryFailure | undefined {
+  let thrown: HandleBoundaryFailure | undefined;
+  try { handle.cancel(reason); } catch (error) { thrown = { message: errorMessage(error), path: 'executor.cancel', available: [] }; }
+  const closeFailure = closeHandle(handle);
+  return thrown ?? closeFailure;
+}
+
 function isAttemptHandle(value: unknown): value is AttemptHandle {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Record<string, unknown>;
@@ -874,33 +961,67 @@ type PollValidation =
   | { readonly ok: false; readonly message: string; readonly path: string; readonly available: readonly string[] };
 
 function validatePollResult(value: unknown): PollValidation {
-  if (!isPlainObject(value)) {
-    return { ok: false, message: 'executor.poll must return an object', path: 'executor.poll.return', available: ['pending', 'settled'] };
+  try {
+    if (!isPlainObject(value)) {
+      return { ok: false, message: 'executor.poll must return an object', path: 'executor.poll.return', available: ['pending', 'settled'] };
+    }
+    const status = ownValue(value, 'status');
+    if (status === 'pending') {
+      if (!hasExactFields(value, ['status', 'activity'])) {
+        return { ok: false, message: 'pending poll result has unknown field(s)', path: 'executor.poll.return', available: ['status', 'activity'] };
+      }
+      const activity = ownValue(value, 'activity');
+      if (activity !== undefined && typeof activity !== 'boolean') {
+        return { ok: false, message: 'executor.poll.return.activity must be boolean', path: 'executor.poll.return.activity', available: ['true', 'false'] };
+      }
+      return activity === undefined
+        ? { ok: true, result: { status: 'pending' } }
+        : { ok: true, result: { status: 'pending', activity } };
+    }
+    if (status === 'settled') {
+      const outcome = ownValue(value, 'outcome');
+      if (typeof outcome !== 'string' || asNonEmptyString(outcome) === undefined) {
+        return { ok: false, message: 'executor.poll.return.outcome must be a non-empty string', path: 'executor.poll.return.outcome', available: ['outcome'] };
+      }
+      if (!hasExactFields(value, ['status', 'outcome', 'settlement'])) {
+        return { ok: false, message: 'settled poll result requires structured settlement', path: 'executor.poll.return.settlement', available: ['settlement'] };
+      }
+      const settlement = validateSettlement(ownValue(value, 'settlement'), outcome);
+      if (!settlement.ok) return settlement;
+      return { ok: true, result: { status: 'settled', outcome, settlement: settlement.value } };
+    }
+    return { ok: false, message: 'executor.poll.return.status must be pending or settled', path: 'executor.poll.return.status', available: ['pending', 'settled'] };
+  } catch (error) {
+    return { ok: false, message: 'executor.poll.return could not be inspected', path: 'executor.poll.return', available: ['pending', 'settled'] };
   }
-  const status = ownValue(value, 'status');
-  if (status === 'pending') {
-    if (!hasExactFields(value, ['status', 'activity'])) {
-      return { ok: false, message: 'pending poll result has unknown field(s)', path: 'executor.poll.return', available: ['status', 'activity'] };
-    }
-    const activity = ownValue(value, 'activity');
-    if (activity !== undefined && typeof activity !== 'boolean') {
-      return { ok: false, message: 'executor.poll.return.activity must be boolean', path: 'executor.poll.return.activity', available: ['true', 'false'] };
-    }
-    return activity === undefined
-      ? { ok: true, result: { status: 'pending' } }
-      : { ok: true, result: { status: 'pending', activity } };
+}
+
+function validateSettlement(value: unknown, outcome: string):
+  | { readonly ok: true; readonly value: AttemptSettlement }
+  | { readonly ok: false; readonly message: string; readonly path: string; readonly available: readonly string[] } {
+  if (!isPlainObject(value) || !hasExactFields(value, ['conclusion', 'acceptanceEligible', 'artifact', 'failureCode', 'reason'])) {
+    return { ok: false, message: 'settlement must be an exact object', path: 'executor.poll.return.settlement', available: ['conclusion', 'acceptanceEligible', 'artifact', 'failureCode', 'reason'] };
   }
-  if (status === 'settled') {
-    if (!hasExactFields(value, ['status', 'outcome'])) {
-      return { ok: false, message: 'settled poll result has unknown field(s)', path: 'executor.poll.return', available: ['status', 'outcome'] };
-    }
-    const outcome = ownValue(value, 'outcome');
-    if (typeof outcome !== 'string' || asNonEmptyString(outcome) === undefined) {
-      return { ok: false, message: 'executor.poll.return.outcome must be a non-empty string', path: 'executor.poll.return.outcome', available: ['outcome'] };
-    }
-    return { ok: true, result: { status: 'settled', outcome } };
+  const conclusion = ownValue(value, 'conclusion');
+  if (typeof conclusion !== 'string' || asNonEmptyString(conclusion) === undefined || conclusion !== outcome) {
+    return { ok: false, message: 'settlement.conclusion must equal outcome', path: 'executor.poll.return.settlement.conclusion', available: ['conclusion'] };
   }
-  return { ok: false, message: 'executor.poll.return.status must be pending or settled', path: 'executor.poll.return.status', available: ['pending', 'settled'] };
+  const eligible = ownValue(value, 'acceptanceEligible');
+  if (typeof eligible !== 'boolean') return { ok: false, message: 'settlement.acceptanceEligible must be boolean', path: 'executor.poll.return.settlement.acceptanceEligible', available: ['true', 'false'] };
+  const artifact = ownValue(value, 'artifact');
+  if (!isPlainObject(artifact) || !hasExactFields(artifact, ['artifactRevision', 'diffRef', 'changedPaths'])) return { ok: false, message: 'settlement.artifact is malformed', path: 'executor.poll.return.settlement.artifact', available: ['artifactRevision', 'diffRef', 'changedPaths'] };
+  const artifactRevision = ownValue(artifact, 'artifactRevision');
+  if (typeof artifactRevision !== 'string' || asNonEmptyString(artifactRevision) === undefined || artifactRevision.length > 256) return { ok: false, message: 'artifactRevision must be bounded', path: 'executor.poll.return.settlement.artifact.artifactRevision', available: ['artifactRevision'] };
+  const diffRef = ownValue(artifact, 'diffRef');
+  if (diffRef !== undefined && (typeof diffRef !== 'string' || asNonEmptyString(diffRef) === undefined || diffRef.length > 256)) return { ok: false, message: 'diffRef must be bounded', path: 'executor.poll.return.settlement.artifact.diffRef', available: ['diffRef'] };
+  const changedPaths = ownValue(artifact, 'changedPaths');
+  if (!Array.isArray(changedPaths) || changedPaths.length > 256 || changedPaths.some((entry) => typeof entry !== 'string' || entry.length === 0 || entry.length > 256)) return { ok: false, message: 'changedPaths must be a bounded string array', path: 'executor.poll.return.settlement.artifact.changedPaths', available: ['changedPaths'] };
+  const failureCode = ownValue(value, 'failureCode');
+  if (failureCode !== undefined && (typeof failureCode !== 'string' || !SETTLEMENT_FAILURE_CODES.includes(failureCode as (typeof SETTLEMENT_FAILURE_CODES)[number]))) return { ok: false, message: 'failureCode is unknown', path: 'executor.poll.return.settlement.failureCode', available: SETTLEMENT_FAILURE_CODES };
+  const reason = ownValue(value, 'reason');
+  if (reason !== undefined && (typeof reason !== 'string' || asNonEmptyString(reason) === undefined || reason.length > 160)) return { ok: false, message: 'reason must be bounded', path: 'executor.poll.return.settlement.reason', available: ['reason'] };
+  if (!eligible && (failureCode === undefined || reason === undefined)) return { ok: false, message: 'ineligible settlement requires failureCode and reason', path: 'executor.poll.return.settlement', available: ['failureCode', 'reason'] };
+  return { ok: true, value: deepFreeze({ conclusion, acceptanceEligible: eligible, artifact: deepFreeze({ artifactRevision, ...(diffRef === undefined ? {} : { diffRef }), changedPaths: Object.freeze([...changedPaths]) }), ...(failureCode === undefined ? {} : { failureCode: failureCode as (typeof SETTLEMENT_FAILURE_CODES)[number] }), ...(reason === undefined ? {} : { reason: reason as string }) }) };
 }
 
 function schedulerError(error: TaskGraphError): SchedulerError {

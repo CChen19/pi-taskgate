@@ -1,6 +1,6 @@
 # agent-orchestrator
 
-面向 Pi / herdr 的独立 orchestration 核心。当前处于**第七阶段（S7）：Durable State 纯核**，不含任何真实进程、git、worktree、终端、数据库/文件系统、模型调用或网络副作用。
+面向 Pi / herdr 的独立 orchestration 核心。当前处于**第八阶段（S8）：production-shaped Pi/herdr/worktree 适配边界**：核心仍不含真实进程、git、worktree、终端、数据库/文件系统、模型调用或网络副作用；S8 只提供可注入 host ports。
 
 ## 目标
 
@@ -17,7 +17,7 @@
 - 默认角色定义：`coordinator`、`explorer`、`implementer`、`reviewer`（工具仅为声明性策略数据，不是沙箱）。
 - 纯核心、无 I/O；配置、计划、契约、状态与任务图快照均为深度冻结视图，防外部突变。
 - `validateTaskContract`：对 `unknown` Task Contract 做 exact-fields、格式、依赖形状、预算与重试校验；`depends_on` 引用存在性在图层拒绝（契约层只查形状）；错误聚合为 `INVALID_CONTRACT`，成功返回深度冻结副本。
-- `task-state`：九态状态机与合法转移表；`max_attempts` 是总 attempt 上限，`0` 表示仅首次；任意 attempt 结束（包括 `BLOCKED` / `CANCELLED`）都会计入预算，执行结果先进入 `VERIFYING`，验证裁决才决定 `PASSED` / `RETRYING` / `FAILED`。
+- `task-state`：九态状态机与合法转移表；`max_attempts` 是总 attempt 上限，`0` 表示仅首次；任意 attempt 结束（包括 `BLOCKED` / `CANCELLED`）都会计入预算，eligible 执行结果进入 `VERIFYING`，而 non-eligible settlement 由 Scheduler 直接走 rejected/retry/failed。
 - `TaskGraph`：内存纯核，支持严格前置依赖、环检测、ready/blocked 查询、动态子任务插入、重试与取消阻塞传播。
 - `ExecutorPort` + `FakeExecutor`：执行器是轮询接口；S3 只提供按脚本返回结果、记录 start/cancel/close 的内存 fake，不创建真实执行资源。
 - `Scheduler`：唯一调度权威；按并发上限选择 READY 任务，驱动 start/settle/verdict，支持注入时钟与 RNG 的 backoff、超时、一次性 stuck 报告、取消和冻结结构化事件流。每次 tick 对账外部图变更，撤销已非 RUNNING 的 handle；执行器协议错误和连续 start 失败均结构化处置。任务状态只由 `TaskGraph`/状态机持有。
@@ -26,9 +26,48 @@
 - `assembleReviewerBrief` / `validateReviewVerdict` / `decideFinalVerdict`：S5 fresh-context reviewer 契约；brief 只包含 spec、revision-bound diff 引用和 evidence 摘要，不包含 worker 转录或完整日志；不接真实模型。
 - `planIntegration` / `runIntegration` / `decideEscalation`：S6 确定性机械集成；按拓扑/给定顺序执行注入式 rebase、merge、验证和冲突检查，失败止步并产出冻结报告；冲突只组装 Integration Agent brief，不调用模型。
 - `durable-state` / `recovery`：S7 append-only 事件 envelope、schema 校验、事件日志与快照端口、CAS/原子 batch、幂等 replay、带完整性标记的 projection snapshot，以及不启动 executor 的崩溃恢复对账规划。`InMemoryDurableStore` 仅为测试 fake；日志权威，快照只是缓存。
+- `adapters/scoped-context`：每次 worker 只收到 task objective、验收、scope、验证命令、已验证角色/模型、revision 和有界摘要；主会话转录、其他 worker 上下文、凭据、环境和全量日志被 exact-fields 拒绝。
+- `adapters/worktree-manager`：每 attempt 通过 `WorktreePort` 申请唯一、受 containment 约束的 lease；恢复必须调用 host `verifyOwnership`，marker/token/base revision 不匹配时不会注册或 cleanup。
+- `adapters/pi-herdr-executor`：实现现有 `ExecutorPort`，通过注入的 `HerdrSubagentPort`、`WorktreePort`、dispatch resolver 和 clock 适配 spawn/poll/interrupt/close；settlement 携带 host-observed artifact provenance，不信任 worker 自报 revision，失败 settlement 永不具 acceptance eligibility。
 - 任务 ID 最长 64 个字符，用于约束图键、错误路径和事件中的 task/attempt 标识；`artifactRevision`、分支和 base revision 与 S5 一致限制为 256 字符；`outcome/reason` 等有界字段超限直接拒绝，不截断。
 
-## 明确未实现
+## S8 适配边界与明确未实现
+
+S8 完成的是 production-shaped adapters + injectable host ports，不是已经接线的 Pi/herdr/git。`PiHerdrExecutor` 的 `HerdrSubagentPort` 只暴露稳定最小协议：`spawn({ cwd, roleId, modelProfileId, provider, model, contract, scopedContext, prompt, baseRevision })`、`poll(sessionId)`（`running | idle | settled | failed | cancelled | lost`）、`interrupt`、`close`。settled executor result 必须包含 `conclusion`、`acceptanceEligible` 和 host-observed `artifact`；Scheduler 会把 non-eligible settlement 直接记录为 rejected/retry/failed，不能再提交 passed。宿主负责把它映射到当前 Pi/herdr transport；本项目不 import pier 私有源码、不启动 pane/进程、不读取终端。
+
+`WorktreePort` 同样是 host seam：`create(...)`、`bindSession({ taskId, attemptId, sessionId, roleId, modelProfileId, filesInScope, baseRevision, workspacePath, branch, ownershipToken, managedMarker })`、`verifyOwnership(...)`、`inspectChangedPaths(...)`、`remove(...)`。host 必须保存 binding ledger 并返回权威完整 binding；codec 自身不提供认证。fake 可直接返回 marker、changed paths、observed artifact revision 和 diff reference；生产宿主未来才实现 git/worktree。连接示例：
+
+```ts
+function wireS8(
+  catalog: Catalog,
+  graph: TaskGraph,
+  host: {
+    repoRoot: string;
+    workspaceRoot: string;
+    idSource: () => string;
+    clock: () => number;
+    herdr: HerdrSubagentPort;
+    worktree: WorktreePort;
+  },
+) {
+  const manager = new WorktreeManager({ repoRoot: host.repoRoot, workspaceRoot: host.workspaceRoot, idSource: host.idSource });
+  const executor = new PiHerdrExecutor({
+    herdr: host.herdr,
+    workspace: manager,
+    worktreePort: host.worktree,
+    dispatchResolver: (request) => planDispatch(catalog, request),
+    roleId: 'implementer', modelProfileId: 'profile-fast',
+    baseRevision: 'base-revision', clock: host.clock,
+  });
+  return new Scheduler(graph, executor, { concurrency: 1, clock: host.clock });
+}
+```
+
+这里的 `host` 是宿主以后实现的端口集合；函数本身不会创建任何真实资源。
+
+以上变量表示宿主接线时提供的端口、catalog、graph 和注入时钟；示例不执行任何操作。本切片没有可直接启动进程的 transport。
+
+S8 不变式：scope 目录用 `src/` 形式表达，scope gate 按完整路径段匹配，拒绝任意 ASCII 大小写的 `.git`、absolute、`..`、反斜杠和 NUL；repo/workspace root 在构造阶段也拒绝 `.git` segment；每 attempt 独立 lease，cleanup 失败保留 lease 并可通过 `retryPendingCleanup` 重试；worker 的 artifact revision 永远不具权威性，必须由 adapter 观察；越界、worker failed/cancelled、session lost、malformed transport 和 inspect failure 都是 non-eligible settlement；恢复 codec 只做结构校验，start 先写入完整 host binding，reattach 再由 host 完整比对 task/attempt/session/role/model/scope/revision/path/token/marker，不 spawn、不 inspect、不 remove。S7 的 durable adapter 真实数据库/文件系统仍未实现。
 
 - 不接 Pi / herdr，不创建进程、pane 或 worktree；`FakeExecutor` 不是生产执行器。
 - S7 不直接 hydrate `TaskGraph` 实例，也不启动、重启、cancel 或 reattach executor；它只恢复 canonical projection 并输出确定性 reconciliation actions。
@@ -62,6 +101,9 @@ src/core/reviewer-brief.ts # S5 fresh-context brief、review verdict 与最终�
 src/core/integration.ts   # S6 rebase/merge/验证/冲突检查纯核与升级 brief
 src/core/durable-state.ts # S7 事件 envelope、CAS store/snapshot port、replay/projection
 src/core/recovery.ts      # S7 纯函数崩溃恢复对账与审计 action
+src/adapters/scoped-context.ts      # S8 bounded fresh worker context 与 diff scope gate
+src/adapters/worktree-manager.ts     # S8 injectable WorktreePort 与 per-attempt lease
+src/adapters/pi-herdr-executor.ts    # S8 injectable HerdrSubagentPort ExecutorPort adapter
 tests/                    # node:test + assert，全部离线，无真实模型/Agent
 ```
 
@@ -102,7 +144,7 @@ S7 把控制面状态拆成 **append-only event log → canonical projection →
 
 S6 的架构不变式是 **deterministic mechanism first, LLM escalation second**：默认路径只执行纯核可描述的 rebase → merge → final verification → conflict/status check。`IntegrationRunner` 的 `gitOps` 与 `commandRunner` 全部由调用方注入；本项目不启动真 git/命令，不创建 worktree，不接模型。成功 rebase/merge 缺少非空 revision 会进入 `runner_error`，不会被当作合并成功。`IntegrationReport.finalVerification` 复用 S5 的 `EvidenceBundle` 与 artifactRevision-bound `VerificationVerdict`，最终裁决仍由 S5 `decideVerdict` 规则产生。
 
-`decideEscalation` 矩阵固定为：`merged → none`；`verification_failed → mechanical-retry`（可传剩余次数）；`conflict → integration-agent`；runner/结构错误 → `human`。report 校验会用 S5 `decideVerdict` 从 evidence 重算 verdict，并要求严格的 rebase → merge → verification → conflict-check → status 管线，拒绝重复或重排步骤。命令条目和冲突路径超过 256 UTF-16 code units 直接拒绝（fail closed，不截断）。Integration Agent 当前只有纯数据契约：冲突文件、base/unit revisions 和双方 diff 摘要；它不是模型调用授权，也不会改变 S2–S5 行为。S6 只写内存冻结快照，不持久化报告。未来 S8 的 Pi/herdr worktree 回收与真实 Git/VerificationRunner 适配可复用这一端口，但适配器必须留在核心之外。
+`decideEscalation` 矩阵固定为：`merged → none`；`verification_failed → mechanical-retry`（可传剩余次数）；`conflict → integration-agent`；runner/结构错误 → `human`。report 校验会用 S5 `decideVerdict` 从 evidence 重算 verdict，并要求严格的 rebase → merge → verification → conflict-check → status 管线，拒绝重复或重排步骤。命令条目和冲突路径超过 256 UTF-16 code units 直接拒绝（fail closed，不截断）。Integration Agent 当前只有纯数据契约：冲突文件、base/unit revisions 和双方 diff 摘要；它不是模型调用授权，也不会改变 S2–S5 行为。S6 只写内存冻结快照，不持久化报告。S8 的 Pi/herdr/worktree production-shaped adapter 可复用这一端口，但适配器必须留在纯核之外，且本项目不提供 host transport。
 
 `reviewer` 只在 `plan` / `complex` 或验证失败、不确定时启用，且可用 `reviewer: 'always' | 'never'` 做消融。`mode: 'auto' | 'force-single' | 'force-plan'` 可绕过路由估计，结果仍记录 `forced`、估计复杂度、信号 `reasons` 与路由 `decisionReasons`。Gate 输出的 `maxConcurrency` 与 `expectedTaskCount` 是供 S3 Scheduler / 后续 S5 消费的建议，不会改变 S3 行为。
 

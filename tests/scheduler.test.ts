@@ -104,6 +104,54 @@ describe('Scheduler', () => {
     assert.equal(cancelExecutor.startCalls.length, 2);
   });
 
+  it('blocks acceptance for a non-eligible settlement and never exposes VERIFYING for passed', () => {
+    const graph = new TaskGraph();
+    add(graph, contract('Tblocked'));
+    const executor = new FakeExecutor({
+      Tblocked: [{
+        status: 'settled',
+        outcome: 'scope violation',
+        settlement: {
+          conclusion: 'scope violation',
+          acceptanceEligible: false,
+          artifact: { artifactRevision: 'observed-1', changedPaths: ['outside.ts'] },
+          failureCode: 'SCOPE_VIOLATION',
+          reason: 'changed paths exceed filesInScope',
+        },
+      }],
+    });
+    const scheduler = new Scheduler(graph, executor, { concurrency: 1, clock: () => 0 });
+    const events = scheduler.tick();
+    assert.deepEqual(events.map((event) => event.type), ['task_started', 'attempt_settled', 'acceptance_blocked', 'verdict_recorded', 'task_failed']);
+    assert.equal(graph.getTask('Tblocked')?.state, 'FAILED');
+    const passed = scheduler.submitVerdict('Tblocked', 'passed');
+    assert.equal(passed.ok, false);
+    assert.equal(scheduler.events().some((event) => event.type === 'acceptance_blocked'), true);
+  });
+
+  it('labels non-eligible retry scheduling as policy_rejected', () => {
+    const graph = new TaskGraph();
+    add(graph, contract('Tpolicy', [], { retry: { max_attempts: 2 } }));
+    const executor = new FakeExecutor({
+      Tpolicy: [{
+        status: 'settled',
+        outcome: 'worker failed',
+        settlement: {
+          conclusion: 'worker failed',
+          acceptanceEligible: false,
+          artifact: { artifactRevision: 'observed-1', changedPaths: [] },
+          failureCode: 'WORKER_FAILED',
+          reason: 'worker failed',
+        },
+      }],
+    });
+    const scheduler = new Scheduler(graph, executor, { concurrency: 1, clock: () => 0 });
+    const events = scheduler.tick();
+    const retry = events.find((event) => event.type === 'retry_scheduled');
+    assert.equal(retry?.type, 'retry_scheduled');
+    assert.equal(retry?.reason, 'policy_rejected');
+  });
+
   it('does not start a dependent until its prerequisite is PASSED', () => {
     const graph = new TaskGraph();
     add(graph, contract('Ta'));

@@ -17,17 +17,50 @@ export interface ExecutorStartRequest {
   readonly startedAt: number;
 }
 
+export const SETTLEMENT_FAILURE_CODES = [
+  'SCOPE_VIOLATION',
+  'WORKER_FAILED',
+  'WORKER_CANCELLED',
+  'SESSION_LOST',
+  'INSPECTION_FAILED',
+  'MALFORMED_TRANSPORT',
+  'TRANSPORT_FAILED',
+  'CLEANUP_PENDING',
+] as const;
+export type SettlementFailureCode = (typeof SETTLEMENT_FAILURE_CODES)[number];
+
+export interface AttemptArtifact {
+  /** Host-observed revision; never populated from worker claims. */
+  readonly artifactRevision: string;
+  readonly diffRef?: string;
+  readonly changedPaths: readonly string[];
+}
+
+export interface AttemptSettlement {
+  readonly conclusion: string;
+  readonly acceptanceEligible: boolean;
+  readonly artifact: AttemptArtifact;
+  readonly failureCode?: SettlementFailureCode;
+  readonly reason?: string;
+}
+
 export type AttemptPollResult =
   | { readonly status: 'pending'; readonly activity?: boolean }
-  | { readonly status: 'settled'; readonly outcome: string };
+  | {
+      readonly status: 'settled';
+      readonly outcome: string;
+      readonly settlement: AttemptSettlement;
+    };
 
 export interface AttemptHandle {
   /** Return the current result. Pending polling must not settle an attempt. */
   poll(): AttemptPollResult;
   /** Ask the executor to stop this attempt. The scheduler closes it after this call. */
   cancel(reason: string): void;
-  /** Release executor-side resources. This is called exactly once by Scheduler. */
+  /** Release executor-side resources; adapters may retry this operation. */
   close(): void;
+  /** Optional structured status for staged close/cleanup failures. */
+  lastError?(): unknown;
 }
 
 export interface ExecutorPort {
@@ -38,7 +71,7 @@ export interface ExecutorPort {
 /** A deterministic offline script step for FakeExecutor. */
 export type FakeExecutorStep =
   | { readonly status: 'pending'; readonly activity?: boolean }
-  | { readonly status: 'settled'; readonly outcome: string };
+  | { readonly status: 'settled'; readonly outcome: string; readonly settlement?: AttemptSettlement };
 
 export type FakeExecutorScript =
   | Readonly<Record<string, readonly FakeExecutorStep[]>>
@@ -97,12 +130,12 @@ export class FakeExecutor implements ExecutorPort {
       poll: () => {
         if (cancelled || closed) return { status: 'pending' };
         const step = steps[Math.min(cursor, steps.length - 1)];
-        if (step === undefined) return { status: 'settled', outcome: 'completed' };
+        if (step === undefined) return { status: 'settled', outcome: 'completed', settlement: fakeSettlement('completed') };
         if (cursor < steps.length - 1 || step.status === 'settled') cursor++;
         if (step.status === 'pending') {
           return step.activity === undefined ? { status: 'pending' } : { status: 'pending', activity: step.activity };
         }
-        return { status: 'settled', outcome: step.outcome };
+        return { status: 'settled', outcome: step.outcome, settlement: step.settlement ?? fakeSettlement(step.outcome) };
       },
       cancel: (reason: string) => {
         if (cancelled || closed) return;
@@ -146,6 +179,36 @@ function isOptions(value: FakeExecutorScript | FakeExecutorOptions): value is Fa
   return typeof value === 'object' && value !== null && (Object.hasOwn(value, 'scripts') || Object.hasOwn(value, 'defaultSteps'));
 }
 
+function fakeSettlement(conclusion: string): AttemptSettlement {
+  return deepFreeze({
+    conclusion,
+    acceptanceEligible: true,
+    artifact: { artifactRevision: 'fake-observed', changedPaths: [] },
+  });
+}
+
+function normalizeFakeSettlement(value: AttemptSettlement, outcome: string, index: number): AttemptSettlement {
+  if (typeof value !== 'object' || value === null || typeof value.conclusion !== 'string' || value.conclusion.length === 0 || value.conclusion !== outcome || typeof value.acceptanceEligible !== 'boolean' || typeof value.artifact !== 'object' || value.artifact === null || typeof value.artifact.artifactRevision !== 'string' || value.artifact.artifactRevision.length === 0 || !Array.isArray(value.artifact.changedPaths)) {
+    throw new TypeError(`fake script settlement ${index} is invalid`);
+  }
+  if (value.artifact.changedPaths.length > 256 || value.artifact.changedPaths.some((path) => typeof path !== 'string' || path.length === 0 || path.length > 256)) throw new TypeError(`fake script settlement ${index} has invalid changedPaths`);
+  if (value.artifact.diffRef !== undefined && (typeof value.artifact.diffRef !== 'string' || value.artifact.diffRef.length === 0 || value.artifact.diffRef.length > 256)) throw new TypeError(`fake script settlement ${index} has invalid diffRef`);
+  if (value.failureCode !== undefined && !SETTLEMENT_FAILURE_CODES.includes(value.failureCode)) throw new TypeError(`fake script settlement ${index} has unknown failureCode`);
+  if (value.reason !== undefined && (typeof value.reason !== 'string' || value.reason.length === 0 || value.reason.length > 160)) throw new TypeError(`fake script settlement ${index} has invalid reason`);
+  if (!value.acceptanceEligible && (value.failureCode === undefined || value.reason === undefined)) throw new TypeError(`fake script settlement ${index} must explain ineligibility`);
+  return deepFreeze({
+    conclusion: value.conclusion,
+    acceptanceEligible: value.acceptanceEligible,
+    artifact: {
+      artifactRevision: value.artifact.artifactRevision,
+      ...(value.artifact.diffRef === undefined ? {} : { diffRef: value.artifact.diffRef }),
+      changedPaths: [...value.artifact.changedPaths],
+    },
+    ...(value.failureCode === undefined ? {} : { failureCode: value.failureCode }),
+    ...(value.reason === undefined ? {} : { reason: value.reason }),
+  });
+}
+
 function copySteps(steps: readonly FakeExecutorStep[]): readonly FakeExecutorStep[] {
   return Object.freeze(steps.map((step, index) => {
     if (step.status === 'pending') {
@@ -157,6 +220,6 @@ function copySteps(steps: readonly FakeExecutorStep[]): readonly FakeExecutorSte
     if (step.status !== 'settled' || asNonEmptyString(step.outcome) === undefined) {
       throw new TypeError(`fake script step ${index} must settle with a non-empty outcome`);
     }
-    return { status: 'settled' as const, outcome: step.outcome };
+    return { status: 'settled' as const, outcome: step.outcome, settlement: normalizeFakeSettlement(step.settlement ?? fakeSettlement(step.outcome), step.outcome, index) };
   }));
 }
