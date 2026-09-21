@@ -1,9 +1,9 @@
-# 架构（S5：验证环、Orchestration Gate 与 Scheduler 纯核）
+# 架构（S6：机械集成、验证环、Orchestration Gate 与 Scheduler 纯核）
 
 ## 控制面 / 执行面分离
 
-- **控制面（已实现）**：`Catalog`、`planDispatch`、Task Contract 校验、Orchestration Gate、九态状态机、`TaskGraph`、`Scheduler`、S5 机械验证与 reviewer brief。它们都是内存纯核，无 I/O、网络、进程、worktree、终端或模型调用副作用。
-- **执行面（S3/S5 仅接口）**：`ExecutorPort` 是任务执行边界，`FakeExecutor` 是离线测试 fake；S5 的 `VerificationRunner` 是命令执行边界。它们不创建真实资源；Pi/herdr/进程/命令适配器仍是后续边界。
+- **控制面（已实现）**：`Catalog`、`planDispatch`、Task Contract 校验、Orchestration Gate、九态状态机、`TaskGraph`、`Scheduler`、S5 机械验证与 reviewer brief、S6 机械集成报告与升级契约。它们都是内存纯核，无 I/O、网络、进程、worktree、终端或模型调用副作用。
+- **执行面（S3/S5/S6 仅接口）**：`ExecutorPort` 是任务执行边界，`FakeExecutor` 是离线测试 fake；S5 的 `VerificationRunner` 和 S6 的 `IntegrationRunner` 是命令/Git 执行边界。它们不创建真实资源；Pi/herdr/进程/命令/Git 适配器仍是后续边界。
 - 角色的 tools/capabilities 仍只是策略数据，**不是**沙箱；真正的运行时权限强制必须在执行面另行实现和测试。
 
 ## Task Contract
@@ -45,7 +45,23 @@ S5 是对 S4 规划的纯核消费，不改 S4 路由或 S3 Scheduler 行为：
 - `validateReviewVerdict` 只接受 `outcome: 'passed' | 'rejected'`、非空 `reasons` 和非空 `artifactRevision`。`decideFinalVerdict` 的矩阵是：机械 rejected → rejected；机械 passed 且 Gate 不要求 reviewer → passed；机械 passed 且 Gate 要求但尚无 review → needs_review；review rejected → rejected；review passed 只有在 revision 与机械 verdict 相同才通过。最终只把 `passed/rejected` 映射为 S2 的 verdict 输入，`settled` 仍停在 `VERIFYING`。公开的 `s2VerdictInput` 会在运行时拒绝 `needs_review` 等非 S2 值。
 - S5 标识符有界：`taskId` 复用 S2 的 64 字符上限；`attemptId` 为 128 字符，足以容纳 S3 的 `${taskId}:attempt-${counter}`；`artifactRevision` 为 256 字符，覆盖 commit/diff hash 与适配器引用。超限统一结构化拒绝。
 
+## S6 机械集成纯核
+
+S6 增加 `src/core/integration.ts`，但不改 S2–S5 的行为。`IntegrationUnit` 绑定 `taskId`、branch、revision 和 S5 `VerificationVerdict`；只有 artifactRevision 匹配且 verdict 为 `passed` 的 unit 才能进入 `MergePlan`。`planIntegration(units, options)` 对 unknown 输入执行 plain-object、exact-fields、Symbol/非枚举字段、稀疏数组和数组方法覆盖检查；base/branch/revision 使用 S5 的 256 字符 revision 上界。
+
+顺序规则是确定性的：没有依赖时使用输入顺序，`options.order` 可提供给定顺序；声明依赖时使用 Kahn 拓扑排序，给定顺序只作为同层节点的稳定 tie-breaker，依赖边优先。未知依赖、自依赖、重复依赖和环都 fail closed。计划同时复制最终验证命令，不执行它们。
+
+`runIntegration(plan, runner, { clock })` 只调用注入的 `IntegrationRunner`：每个 unit 依次 rebase、merge，然后调用 command runner 做最终验证，再查询冲突和 status。每个阶段失败即止；成功 Git 操作若缺少非空 revision 不被视为成功，而是 `runner_error`。冲突报告 `outcome: 'conflict'`，验证失败报告 `verification_failed`，全通过报告 `merged`，runner 异常/畸形返回报告为 `runner_error` 并带 `IntegrationError` 结构（code/message/path/available）。没有 `Date.now()` / `Math.random()`，时钟只来自注入 `clock`；步骤详情和输出摘要有界，报告和最终 evidence/verdict 深度冻结。
+
+`IntegrationReport.finalVerification` 是 S5 接线点：集成 runner 的 command 结果先组装成 S5 `EvidenceBundle`，再交给 S5 `decideVerdict`，报告同时保留 evidence 和 revision-bound `VerificationVerdict`。它不会把合并成功等同于任务验收。
+
+`decideEscalation` 先重算 report 的关键一致性（outcome、steps、conflicts、finalVerification 和 error），包括用 S5 `decideVerdict` 从 evidence 重算 final verdict，拒绝伪造的 report，再按矩阵返回：`merged -> none`；`verification_failed -> mechanical-retry`（可参数化剩余次数）；`conflict -> integration-agent`；`runner_error -> human`。步骤必须遵守每个 unit 一次 rebase → merge，随后 verification → conflict-check → status 的严格前缀管线，禁止重复或重排。命令条目和冲突路径超过 256 UTF-16 code units 直接结构化拒绝；这是本切片选择的 fail-closed 边界策略，不做截断。Integration Agent 只定义 `assembleIntegrationAgentBrief` 的输入契约：冲突文件、base/unit revisions、双方 diff 摘要；不接模型。
+
+S6 测试全部使用 fake runner，未启动真实 git、命令、agent、worktree 或网络。未来 S8 的 Pi/herdr worktree 回收与真实 Git/VerificationRunner 适配可复用这些端口，但适配器必须留在纯核之外。
+
 ## 架构不变式
+
+- **deterministic mechanism first, LLM escalation second**：默认先走机械 rebase/merge/验证/冲突检查；只有冲突、机械验证失败或 runner/结构错误才进入声明的升级矩阵。
 
 - **single-agent first**：简单任务不过 DAG，不因“可编排”就默认编排。
 - **reviewer 按需**：fresh reviewer 只在中高复杂度、计划路由或验证结果失败/不确定时进入门槛。

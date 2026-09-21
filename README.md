@@ -1,6 +1,6 @@
 # agent-orchestrator
 
-面向 Pi / herdr 的独立 orchestration 核心。当前处于**第五阶段（S5）：验证环纯核**，不含任何真实进程、worktree、终端、持久化、模型调用或网络副作用。
+面向 Pi / herdr 的独立 orchestration 核心。当前处于**第六阶段（S6）：机械集成纯核**，不含任何真实进程、git、worktree、终端、持久化、模型调用或网络副作用。
 
 ## 目标
 
@@ -24,13 +24,14 @@
 - `planRoute` / `needsFreshReview`：S4 规则版 Orchestration Gate，运行时复用 S2 校验 Task Contract，并按范围文件、验收标准、验证命令、契约体量和依赖数确定 single/plan 路由；输出命中信号、理由、Scheduler 建议和 reviewer 门槛；不调用模型、不执行验证、不创建 DAG。
 - `MechanicalVerifier` / `decideVerdict`：S5 机械验证纯核；只调用注入的 `runner` 和 `clock`，记录有界输出证据，所有 verdict 绑定 `artifactRevision`，不创建进程。
 - `assembleReviewerBrief` / `validateReviewVerdict` / `decideFinalVerdict`：S5 fresh-context reviewer 契约；brief 只包含 spec、revision-bound diff 引用和 evidence 摘要，不包含 worker 转录或完整日志；不接真实模型。
-- 任务 ID 最长 64 个字符，用于约束图键、错误路径和事件中的 task/attempt 标识；`outcome/reason` 等事件 payload 不截断。
+- `planIntegration` / `runIntegration` / `decideEscalation`：S6 确定性机械集成；按拓扑/给定顺序执行注入式 rebase、merge、验证和冲突检查，失败止步并产出冻结报告；冲突只组装 Integration Agent brief，不调用模型。
+- 任务 ID 最长 64 个字符，用于约束图键、错误路径和事件中的 task/attempt 标识；`artifactRevision`、分支和 base revision 与 S5 一致限制为 256 字符；`outcome/reason` 等事件 payload 不截断。
 
 ## 明确未实现
 
 - 不接 Pi / herdr，不创建进程、pane 或 worktree；`FakeExecutor` 不是生产执行器。
 - 无任务持久化或 S7 事件日志；Scheduler 的事件目前只在内存中提供给调用方。
-- 不接真实 runner、进程或模型：S5 只定义注入式机械验证和 fresh reviewer 输入/输出契约；生产执行适配器与真实模型调用仍属后续边界。
+- 不接真实 runner、git、进程或模型：S5/S6 只定义注入式机械验证、集成 runner 和 fresh reviewer / Integration Agent 输入输出契约；测试全用 fake，生产适配器与真实模型调用仍属后续边界。
 - 不验证模型在线可用性或认证；不执行任何 OS 级权限/沙箱强制；不接 Pi / herdr。
 
 ## 安装与检查
@@ -56,6 +57,7 @@ src/core/scheduler.ts       # 注入时钟/RNG 的纯核调度器与事件流
 src/core/gate.ts            # S4 复杂度路由、reviewer 门槛与消融开关
 src/core/verification.ts   # S5 注入 runner 的机械验证、证据与 verdict
 src/core/reviewer-brief.ts # S5 fresh-context brief、review verdict 与最终合并
+src/core/integration.ts   # S6 rebase/merge/验证/冲突检查纯核与升级 brief
 tests/                    # node:test + assert，全部离线，无真实模型/Agent
 ```
 
@@ -82,7 +84,15 @@ console.log({ mode: routePlan.mode, complexity: routePlan.complexity, reviewer }
 EOF
 ```
 
-S4 的架构不变式是 **single-agent first**：小任务默认 `single`，不因形式完整就创建 DAG；mechanical verification 的规划永远保留。`reviewer` 只在 `plan` / `complex` 或验证失败、不确定时启用，且可用 `reviewer: 'always' | 'never'` 做消融。`mode: 'auto' | 'force-single' | 'force-plan'` 可绕过路由估计，结果仍记录 `forced`、估计复杂度、信号 `reasons` 与路由 `decisionReasons`。Gate 输出的 `maxConcurrency` 与 `expectedTaskCount` 是供 S3 Scheduler / 后续 S5 消费的建议，不会改变 S3 行为。
+S4 的架构不变式是 **single-agent first**：小任务默认 `single`，不因形式完整就创建 DAG；mechanical verification 的规划永远保留。
+
+## S6 机械集成边界
+
+S6 的架构不变式是 **deterministic mechanism first, LLM escalation second**：默认路径只执行纯核可描述的 rebase → merge → final verification → conflict/status check。`IntegrationRunner` 的 `gitOps` 与 `commandRunner` 全部由调用方注入；本项目不启动真 git/命令，不创建 worktree，不接模型。成功 rebase/merge 缺少非空 revision 会进入 `runner_error`，不会被当作合并成功。`IntegrationReport.finalVerification` 复用 S5 的 `EvidenceBundle` 与 artifactRevision-bound `VerificationVerdict`，最终裁决仍由 S5 `decideVerdict` 规则产生。
+
+`decideEscalation` 矩阵固定为：`merged → none`；`verification_failed → mechanical-retry`（可传剩余次数）；`conflict → integration-agent`；runner/结构错误 → `human`。report 校验会用 S5 `decideVerdict` 从 evidence 重算 verdict，并要求严格的 rebase → merge → verification → conflict-check → status 管线，拒绝重复或重排步骤。命令条目和冲突路径超过 256 UTF-16 code units 直接拒绝（fail closed，不截断）。Integration Agent 当前只有纯数据契约：冲突文件、base/unit revisions 和双方 diff 摘要；它不是模型调用授权，也不会改变 S2–S5 行为。S6 只写内存冻结快照，不持久化报告。未来 S8 的 Pi/herdr worktree 回收与真实 Git/VerificationRunner 适配可复用这一端口，但适配器必须留在核心之外。
+
+`reviewer` 只在 `plan` / `complex` 或验证失败、不确定时启用，且可用 `reviewer: 'always' | 'never'` 做消融。`mode: 'auto' | 'force-single' | 'force-plan'` 可绕过路由估计，结果仍记录 `forced`、估计复杂度、信号 `reasons` 与路由 `decisionReasons`。Gate 输出的 `maxConcurrency` 与 `expectedTaskCount` 是供 S3 Scheduler / 后续 S5 消费的建议，不会改变 S3 行为。
 
 模型 profile / 账号属于部署数据，不入库、不入测试（测试仅用 fixture 字符串）。
 
