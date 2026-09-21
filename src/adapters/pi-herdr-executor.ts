@@ -71,6 +71,7 @@ export interface PiHerdrTerminalResult {
   readonly attemptId: string;
   readonly sessionId: string;
   readonly workspacePath: string;
+  readonly branch: string;
   readonly baseRevision: string;
   readonly artifactRevision: string;
   readonly diffRef?: string;
@@ -359,6 +360,7 @@ function attemptKey(taskId: string, attemptId: string): string {
 export class PiHerdrExecutor implements ExecutorPort {
   private readonly options: PiHerdrExecutorOptions;
   private readonly pendingCleanup = new Map<string, WorkspaceLease>();
+  private readonly retainedArtifacts = new Map<string, WorkspaceLease>();
 
   constructor(options: PiHerdrExecutorOptions) {
     try {
@@ -449,6 +451,24 @@ export class PiHerdrExecutor implements ExecutorPort {
     return this.makeHandle(state, lease, context);
   }
 
+  /** Release a successful artifact only after verification/review/integration finish. */
+  finalizeArtifact(taskId: string, attemptId: string): WorktreeCleanup {
+    const key = attemptKey(boundedString(taskId, 'taskId', MAX_TASK_ID_LENGTH), boundedString(attemptId, 'attemptId', MAX_ATTEMPT_ID_LENGTH));
+    const lease = this.retainedArtifacts.get(key);
+    if (lease === undefined) return deepFreeze({ ok: false as const, error: { code: 'OWNERSHIP_MISMATCH' as const, message: 'no retained artifact for attempt', path: 'artifact', available: [] } });
+    const result = invokeCleanup(this.options.workspace, this.options.worktreePort, lease);
+    if (result.ok) {
+      this.retainedArtifacts.delete(key);
+      this.pendingCleanup.delete(key);
+    } else this.pendingCleanup.set(key, lease);
+    return result;
+  }
+
+  /** Lookup trusted host provenance for a retained artifact. */
+  artifactLease(taskId: string, attemptId: string): WorkspaceLease | undefined {
+    return this.retainedArtifacts.get(attemptKey(taskId, attemptId));
+  }
+
   /** Retry only a previously failed lease cleanup; never starts a transport. */
   retryPendingCleanup(taskId: string, attemptId: string): { readonly ok: true } | { readonly ok: false; readonly error: ExecutorAdapterError } {
     const checkedTaskId = boundedString(taskId, 'taskId', MAX_TASK_ID_LENGTH);
@@ -459,6 +479,7 @@ export class PiHerdrExecutor implements ExecutorPort {
     const failure = cleanupError(invokeCleanup(this.options.workspace, this.options.worktreePort, lease), checkedTaskId, checkedAttemptId, lease.workspacePath);
     if (failure) return deepFreeze({ ok: false as const, error: failure });
     this.pendingCleanup.delete(key);
+    this.retainedArtifacts.delete(key);
     return deepFreeze({ ok: true as const });
   }
 
@@ -532,7 +553,8 @@ export class PiHerdrExecutor implements ExecutorPort {
     const finishTerminal = (): AttemptPollResult => {
       if (terminal === undefined) return { status: 'pending' };
       if (!closeTransport()) throw boundaryError!;
-      if (!release()) throw boundaryError!;
+      if (terminal.settlement.acceptanceEligible) this.retainedArtifacts.set(attemptKey(state.taskId, state.attemptId), lease);
+      else if (!release()) throw boundaryError!;
       return { status: 'settled', outcome: terminal.outcome, settlement: terminal.settlement };
     };
     const handle: AdapterHandle = {
@@ -544,8 +566,8 @@ export class PiHerdrExecutor implements ExecutorPort {
         try { raw = this.options.herdr.poll(state.sessionId); }
         catch {
           const reason = 'transport poll failed';
-          const settlement: AttemptSettlement = deepFreeze({ conclusion: reason, acceptanceEligible: false, artifact: deepFreeze({ artifactRevision: 'unavailable', changedPaths: Object.freeze([]) }), failureCode: 'TRANSPORT_FAILED', reason });
-          terminal = deepFreeze({ taskId: state.taskId, attemptId: state.attemptId, sessionId: state.sessionId, workspacePath: state.workspacePath, baseRevision: state.baseRevision, artifactRevision: 'unavailable', changedPaths: Object.freeze([]), scopeAllowed: false, outcome: reason, settlement });
+          const settlement: AttemptSettlement = deepFreeze({ conclusion: reason, acceptanceEligible: false, artifact: deepFreeze({ artifactRevision: 'unavailable', workspacePath: state.workspacePath, branch: state.branch, changedPaths: Object.freeze([]) }), failureCode: 'TRANSPORT_FAILED', reason });
+          terminal = deepFreeze({ taskId: state.taskId, attemptId: state.attemptId, sessionId: state.sessionId, workspacePath: state.workspacePath, branch: state.branch, baseRevision: state.baseRevision, artifactRevision: 'unavailable', changedPaths: Object.freeze([]), scopeAllowed: false, outcome: reason, settlement });
           return finishTerminal();
         }
         let observed: ReturnType<typeof normalizeTransportPoll>;
@@ -553,8 +575,8 @@ export class PiHerdrExecutor implements ExecutorPort {
           observed = normalizeTransportPoll(raw);
         } catch (error) {
           const reason = 'malformed transport result';
-          const settlement: AttemptSettlement = deepFreeze({ conclusion: reason, acceptanceEligible: false, artifact: deepFreeze({ artifactRevision: 'unavailable', changedPaths: Object.freeze([]) }), failureCode: 'MALFORMED_TRANSPORT', reason });
-          terminal = deepFreeze({ taskId: state.taskId, attemptId: state.attemptId, sessionId: state.sessionId, workspacePath: state.workspacePath, baseRevision: state.baseRevision, artifactRevision: 'unavailable', changedPaths: Object.freeze([]), scopeAllowed: false, outcome: reason, settlement });
+          const settlement: AttemptSettlement = deepFreeze({ conclusion: reason, acceptanceEligible: false, artifact: deepFreeze({ artifactRevision: 'unavailable', workspacePath: state.workspacePath, branch: state.branch, changedPaths: Object.freeze([]) }), failureCode: 'MALFORMED_TRANSPORT', reason });
+          terminal = deepFreeze({ taskId: state.taskId, attemptId: state.attemptId, sessionId: state.sessionId, workspacePath: state.workspacePath, branch: state.branch, baseRevision: state.baseRevision, artifactRevision: 'unavailable', changedPaths: Object.freeze([]), scopeAllowed: false, outcome: reason, settlement });
           return finishTerminal();
         }
         if (observed.kind === 'pending') return observed.activity === undefined ? { status: 'pending' } : { status: 'pending', activity: observed.activity };
@@ -564,25 +586,28 @@ export class PiHerdrExecutor implements ExecutorPort {
         catch (error) { inspectionError = new ExecutorAdapterError({ code: 'WORKSPACE_FAILURE', message: `workspace inspection failed: ${errorMessage(error)}`, path: 'workspace.inspectChangedPaths', available: [], taskId: state.taskId, attemptId: state.attemptId, leaseRef: state.workspacePath }); }
         const artifact: AttemptArtifact = inspection === undefined
           ? { artifactRevision: 'unavailable', changedPaths: [] }
-          : { artifactRevision: inspection.artifactRevision, ...(inspection.diffRef === undefined ? {} : { diffRef: inspection.diffRef }), changedPaths: inspection.changedPaths };
+          : { artifactRevision: inspection.artifactRevision, ...(inspection.diffRef === undefined ? {} : { diffRef: inspection.diffRef }), changedPaths: inspection.changedPaths, ...(inspection.clean === undefined ? {} : { clean: inspection.clean }), ...(inspection.commitsAhead === undefined ? {} : { commitsAhead: inspection.commitsAhead }) };
         const scope = inspection === undefined ? undefined : validateChangedPaths(inspection.changedPaths, state.filesInScope);
         const scopeAllowed = scope?.allowed === true;
+        const artifactClean = inspection?.clean === undefined || inspection.clean;
+        const artifactCommitted = inspection?.commitsAhead === undefined || inspection.commitsAhead > 0;
+        const artifactFailure = !artifactClean ? 'artifact worktree is dirty' : !artifactCommitted ? 'artifact has no commits ahead of base' : undefined;
         const failureCode: SettlementFailureCode | undefined = inspectionError?.code === 'WORKSPACE_FAILURE'
           ? 'INSPECTION_FAILED'
-          : observed.failureCode ?? (scopeAllowed ? undefined : 'SCOPE_VIOLATION');
+          : observed.failureCode ?? (scopeAllowed ? (artifactFailure === undefined ? undefined : 'INSPECTION_FAILED') : 'SCOPE_VIOLATION');
         const outcome = inspectionError === undefined
-          ? (scopeAllowed ? observed.outcome : truncateForMessage(`scope violation: ${scope?.violations.join(', ') ?? 'artifact inspection unavailable'}`))
+          ? (scopeAllowed && artifactFailure === undefined ? observed.outcome : truncateForMessage(artifactFailure ?? `scope violation: ${scope?.violations.join(', ') ?? 'artifact inspection unavailable'}`))
           : 'artifact inspection failed';
-        const eligible = inspectionError === undefined && observed.failureCode === undefined && scopeAllowed;
-        const reason = inspectionError?.message ?? (failureCode === undefined ? undefined : (observed.reason ?? (failureCode === 'SCOPE_VIOLATION' ? 'changed paths exceed filesInScope' : outcome)));
+        const eligible = inspectionError === undefined && observed.failureCode === undefined && scopeAllowed && artifactClean && artifactCommitted;
+        const reason = inspectionError?.message ?? (failureCode === undefined ? undefined : (observed.reason ?? (artifactFailure ?? (failureCode === 'SCOPE_VIOLATION' ? 'changed paths exceed filesInScope' : outcome))));
         const settlement: AttemptSettlement = deepFreeze({
           conclusion: outcome,
           acceptanceEligible: eligible,
-          artifact: deepFreeze({ artifactRevision: artifact.artifactRevision, ...(artifact.diffRef === undefined ? {} : { diffRef: artifact.diffRef }), changedPaths: Object.freeze([...artifact.changedPaths]) }),
+          artifact: deepFreeze({ artifactRevision: artifact.artifactRevision, workspacePath: state.workspacePath, branch: state.branch, ...(artifact.diffRef === undefined ? {} : { diffRef: artifact.diffRef }), changedPaths: Object.freeze([...artifact.changedPaths]), ...(artifact.clean === undefined ? {} : { clean: artifact.clean }), ...(artifact.commitsAhead === undefined ? {} : { commitsAhead: artifact.commitsAhead }) }),
           ...(failureCode === undefined ? {} : { failureCode }),
           ...(reason === undefined ? {} : { reason: truncateForMessage(reason) }),
         });
-        terminal = deepFreeze({ taskId: state.taskId, attemptId: state.attemptId, sessionId: state.sessionId, workspacePath: state.workspacePath, baseRevision: state.baseRevision, artifactRevision: artifact.artifactRevision, ...(artifact.diffRef === undefined ? {} : { diffRef: artifact.diffRef }), changedPaths: artifact.changedPaths, scopeAllowed, outcome, settlement });
+        terminal = deepFreeze({ taskId: state.taskId, attemptId: state.attemptId, sessionId: state.sessionId, workspacePath: state.workspacePath, branch: state.branch, baseRevision: state.baseRevision, artifactRevision: artifact.artifactRevision, ...(artifact.diffRef === undefined ? {} : { diffRef: artifact.diffRef }), changedPaths: artifact.changedPaths, scopeAllowed, outcome, settlement });
         return finishTerminal();
       },
       cancel: (reason: string) => {
@@ -599,7 +624,8 @@ export class PiHerdrExecutor implements ExecutorPort {
       },
       close: () => {
         const closed = closeTransport();
-        const cleaned = closed && release();
+        const shouldRelease = terminal === undefined || terminal.settlement.acceptanceEligible === false;
+        const cleaned = closed && (!shouldRelease || release());
         if (!closed || !cleaned) throw boundaryError!;
       },
       terminalResult: () => terminal,

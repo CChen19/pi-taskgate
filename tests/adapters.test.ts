@@ -53,6 +53,8 @@ class FakeWorktree implements WorktreePort {
   failRemove = false;
   changedPaths: readonly string[] = ['src/adapters/pi-herdr-executor.ts'];
   artifactRevision = 'observed-revision';
+  clean = true;
+  commitsAhead = 1;
 
   create(request: unknown): unknown {
     this.creates.push(request);
@@ -73,7 +75,7 @@ class FakeWorktree implements WorktreePort {
   }
   inspectChangedPaths(request: unknown): unknown {
     this.inspections.push(request);
-    return { changedPaths: [...this.changedPaths], artifactRevision: this.artifactRevision, diffRef: 'diff://observed' };
+    return { changedPaths: [...this.changedPaths], artifactRevision: this.artifactRevision, diffRef: 'diff://observed', clean: this.clean, commitsAhead: this.commitsAhead };
   }
   verifyOwnership(request: unknown): unknown {
     const value = request as Record<string, unknown>;
@@ -278,18 +280,22 @@ describe('S8 Pi/herdr ExecutorPort adapter', () => {
     fixture.herdr.nextPoll = { status: 'idle' };
     assert.deepEqual(handle.poll(), { status: 'pending' });
     fixture.herdr.nextPoll = { status: 'settled', outcome: 'worker claimed revision forged-by-worker' };
-    const settled = handle.poll() as { status: string; outcome: string; settlement: { artifact: { artifactRevision: string } } };
+    const settled = handle.poll() as { status: string; outcome: string; settlement: { artifact: { artifactRevision: string; workspacePath: string; branch: string } } };
     assert.equal(settled.status, 'settled');
     assert.equal(settled.outcome, 'worker claimed revision forged-by-worker');
     assert.equal(settled.settlement.artifact.artifactRevision, 'observed-revision');
+    assert.ok(settled.settlement.artifact.workspacePath.startsWith('/workspaces/'));
+    assert.match(settled.settlement.artifact.branch, /^orchestrator\//);
     const terminal = handle.terminalResult() as Record<string, unknown>;
     assert.equal(terminal.artifactRevision, 'observed-revision');
     assert.equal(terminal.scopeAllowed, true);
-    assert.equal(fixture.port.removals.length, 1);
+    assert.equal(fixture.port.removals.length, 0);
     const repeated = handle.poll() as { status: string; settlement: unknown };
     assert.equal(repeated.status, 'settled');
     assert.ok(repeated.settlement);
     handle.close();
+    assert.equal(fixture.port.removals.length, 0);
+    assert.equal(fixture.executor.finalizeArtifact('Tadapter', 'Tadapter:attempt-1').ok, true);
     assert.equal(fixture.port.removals.length, 1);
 
     const out = executorFixture();
@@ -345,6 +351,33 @@ describe('S8 Pi/herdr ExecutorPort adapter', () => {
     assert.deepEqual(reattached.poll(), { status: 'pending' });
   });
 
+  it('retains artifacts through cleanup failure and deletes retained state after retry', () => {
+    const fixture = executorFixture();
+    const handle = fixture.executor.start(startRequest());
+    fixture.herdr.nextPoll = { status: 'settled', outcome: 'done' };
+    assert.equal((handle.poll() as { status: string }).status, 'settled');
+    fixture.port.failRemove = true;
+    assert.equal(fixture.executor.finalizeArtifact('Tadapter', 'Tadapter:attempt-1').ok, false);
+    assert.ok(fixture.executor.artifactLease('Tadapter', 'Tadapter:attempt-1'));
+    fixture.port.failRemove = false;
+    assert.deepEqual(fixture.executor.retryPendingCleanup('Tadapter', 'Tadapter:attempt-1'), { ok: true });
+    assert.equal(fixture.executor.artifactLease('Tadapter', 'Tadapter:attempt-1'), undefined);
+  });
+
+  it('rejects dirty and no-commit terminal artifacts and cleans them', () => {
+    for (const change of [{ clean: false, commitsAhead: 2 }, { clean: true, commitsAhead: 0 }]) {
+      const fixture = executorFixture();
+      fixture.port.clean = change.clean;
+      fixture.port.commitsAhead = change.commitsAhead;
+      const handle = fixture.executor.start(startRequest());
+      fixture.herdr.nextPoll = { status: 'settled', outcome: 'done' };
+      const settled = handle.poll() as { settlement: { acceptanceEligible: boolean; failureCode: string } };
+      assert.equal(settled.settlement.acceptanceEligible, false);
+      assert.equal(settled.settlement.failureCode, 'INSPECTION_FAILED');
+      assert.equal(fixture.port.removals.length, 1);
+    }
+  });
+
   it('runs an end-to-end fake contract → dispatch → worktree → spawn → poll → scope gate flow', () => {
     const fixture = executorFixture();
     const handle = fixture.executor.start(startRequest()) as unknown as { poll(): unknown; terminalResult(): Record<string, unknown> };
@@ -357,6 +390,8 @@ describe('S8 Pi/herdr ExecutorPort adapter', () => {
     assert.equal(handle.terminalResult().scopeAllowed, true);
     assert.equal(fixture.port.creates.length, 1);
     assert.equal(fixture.port.inspections.length, 1);
+    assert.equal(fixture.port.removals.length, 0);
+    assert.equal(fixture.executor.finalizeArtifact('Tadapter', 'Tadapter:attempt-1').ok, true);
     assert.equal(fixture.port.removals.length, 1);
   });
 });

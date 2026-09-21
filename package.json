@@ -2,7 +2,7 @@
   "name": "agent-orchestrator",
   "version": "0.1.0",
   "private": true,
-  "description": "A policy-driven orchestration core for Pi agents, with a planned herdr adapter.",
+  "description": "A policy-driven orchestration core with injectable and P0 real Pi/herdr/git host adapters.",
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -10,7 +10,8 @@
   "scripts": {
     "test": "node --test tests/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "host:doctor": "node src/host/cli.ts doctor"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

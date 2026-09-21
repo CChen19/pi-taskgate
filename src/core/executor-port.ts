@@ -34,6 +34,13 @@ export interface AttemptArtifact {
   readonly artifactRevision: string;
   readonly diffRef?: string;
   readonly changedPaths: readonly string[];
+  /** Trusted host provenance; optional for legacy/non-host executors. */
+  readonly workspacePath?: string;
+  readonly branch?: string;
+  /** Present for real git hosts; omitted by legacy test doubles. */
+  readonly clean?: boolean;
+  /** Number of commits reachable from HEAD but not the configured base. */
+  readonly commitsAhead?: number;
 }
 
 export interface AttemptSettlement {
@@ -193,6 +200,9 @@ function normalizeFakeSettlement(value: AttemptSettlement, outcome: string, inde
   }
   if (value.artifact.changedPaths.length > 256 || value.artifact.changedPaths.some((path) => typeof path !== 'string' || path.length === 0 || path.length > 256)) throw new TypeError(`fake script settlement ${index} has invalid changedPaths`);
   if (value.artifact.diffRef !== undefined && (typeof value.artifact.diffRef !== 'string' || value.artifact.diffRef.length === 0 || value.artifact.diffRef.length > 256)) throw new TypeError(`fake script settlement ${index} has invalid diffRef`);
+  for (const [name, field] of [['workspacePath', value.artifact.workspacePath], ['branch', value.artifact.branch]] as const) if (field !== undefined && (typeof field !== 'string' || field.length === 0 || field.length > 256)) throw new TypeError(`fake script settlement ${index} has invalid ${name}`);
+  if (value.artifact.clean !== undefined && typeof value.artifact.clean !== 'boolean') throw new TypeError(`fake script settlement ${index} has invalid clean`);
+  if (value.artifact.commitsAhead !== undefined && (typeof value.artifact.commitsAhead !== 'number' || !Number.isInteger(value.artifact.commitsAhead) || value.artifact.commitsAhead < 0)) throw new TypeError(`fake script settlement ${index} has invalid commitsAhead`);
   if (value.failureCode !== undefined && !SETTLEMENT_FAILURE_CODES.includes(value.failureCode)) throw new TypeError(`fake script settlement ${index} has unknown failureCode`);
   if (value.reason !== undefined && (typeof value.reason !== 'string' || value.reason.length === 0 || value.reason.length > 160)) throw new TypeError(`fake script settlement ${index} has invalid reason`);
   if (!value.acceptanceEligible && (value.failureCode === undefined || value.reason === undefined)) throw new TypeError(`fake script settlement ${index} must explain ineligibility`);
@@ -201,8 +211,12 @@ function normalizeFakeSettlement(value: AttemptSettlement, outcome: string, inde
     acceptanceEligible: value.acceptanceEligible,
     artifact: {
       artifactRevision: value.artifact.artifactRevision,
+      ...(value.artifact.workspacePath === undefined ? {} : { workspacePath: value.artifact.workspacePath }),
+      ...(value.artifact.branch === undefined ? {} : { branch: value.artifact.branch }),
       ...(value.artifact.diffRef === undefined ? {} : { diffRef: value.artifact.diffRef }),
       changedPaths: [...value.artifact.changedPaths],
+      ...(value.artifact.clean === undefined ? {} : { clean: value.artifact.clean }),
+      ...(value.artifact.commitsAhead === undefined ? {} : { commitsAhead: value.artifact.commitsAhead }),
     },
     ...(value.failureCode === undefined ? {} : { failureCode: value.failureCode }),
     ...(value.reason === undefined ? {} : { reason: value.reason }),

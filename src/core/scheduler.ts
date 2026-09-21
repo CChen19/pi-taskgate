@@ -1009,19 +1009,27 @@ function validateSettlement(value: unknown, outcome: string):
   const eligible = ownValue(value, 'acceptanceEligible');
   if (typeof eligible !== 'boolean') return { ok: false, message: 'settlement.acceptanceEligible must be boolean', path: 'executor.poll.return.settlement.acceptanceEligible', available: ['true', 'false'] };
   const artifact = ownValue(value, 'artifact');
-  if (!isPlainObject(artifact) || !hasExactFields(artifact, ['artifactRevision', 'diffRef', 'changedPaths'])) return { ok: false, message: 'settlement.artifact is malformed', path: 'executor.poll.return.settlement.artifact', available: ['artifactRevision', 'diffRef', 'changedPaths'] };
+  if (!isPlainObject(artifact) || !hasExactFields(artifact, ['artifactRevision', 'workspacePath', 'branch', 'diffRef', 'changedPaths', 'clean', 'commitsAhead'])) return { ok: false, message: 'settlement.artifact is malformed', path: 'executor.poll.return.settlement.artifact', available: ['artifactRevision', 'workspacePath', 'branch', 'diffRef', 'changedPaths', 'clean', 'commitsAhead'] };
   const artifactRevision = ownValue(artifact, 'artifactRevision');
   if (typeof artifactRevision !== 'string' || asNonEmptyString(artifactRevision) === undefined || artifactRevision.length > 256) return { ok: false, message: 'artifactRevision must be bounded', path: 'executor.poll.return.settlement.artifact.artifactRevision', available: ['artifactRevision'] };
+  const workspacePath = ownValue(artifact, 'workspacePath');
+  if (workspacePath !== undefined && (typeof workspacePath !== 'string' || asNonEmptyString(workspacePath) === undefined || workspacePath.length > 256)) return { ok: false, message: 'workspacePath must be bounded', path: 'executor.poll.return.settlement.artifact.workspacePath', available: ['workspacePath'] };
+  const branch = ownValue(artifact, 'branch');
+  if (branch !== undefined && (typeof branch !== 'string' || asNonEmptyString(branch) === undefined || branch.length > 256)) return { ok: false, message: 'branch must be bounded', path: 'executor.poll.return.settlement.artifact.branch', available: ['branch'] };
   const diffRef = ownValue(artifact, 'diffRef');
   if (diffRef !== undefined && (typeof diffRef !== 'string' || asNonEmptyString(diffRef) === undefined || diffRef.length > 256)) return { ok: false, message: 'diffRef must be bounded', path: 'executor.poll.return.settlement.artifact.diffRef', available: ['diffRef'] };
   const changedPaths = ownValue(artifact, 'changedPaths');
   if (!Array.isArray(changedPaths) || changedPaths.length > 256 || changedPaths.some((entry) => typeof entry !== 'string' || entry.length === 0 || entry.length > 256)) return { ok: false, message: 'changedPaths must be a bounded string array', path: 'executor.poll.return.settlement.artifact.changedPaths', available: ['changedPaths'] };
+  const clean = ownValue(artifact, 'clean');
+  if (clean !== undefined && typeof clean !== 'boolean') return { ok: false, message: 'clean must be boolean', path: 'executor.poll.return.settlement.artifact.clean', available: ['true', 'false'] };
+  const commitsAhead = ownValue(artifact, 'commitsAhead');
+  if (commitsAhead !== undefined && (typeof commitsAhead !== 'number' || !Number.isInteger(commitsAhead) || commitsAhead < 0)) return { ok: false, message: 'commitsAhead must be a non-negative integer', path: 'executor.poll.return.settlement.artifact.commitsAhead', available: ['commitsAhead'] };
   const failureCode = ownValue(value, 'failureCode');
   if (failureCode !== undefined && (typeof failureCode !== 'string' || !SETTLEMENT_FAILURE_CODES.includes(failureCode as (typeof SETTLEMENT_FAILURE_CODES)[number]))) return { ok: false, message: 'failureCode is unknown', path: 'executor.poll.return.settlement.failureCode', available: SETTLEMENT_FAILURE_CODES };
   const reason = ownValue(value, 'reason');
   if (reason !== undefined && (typeof reason !== 'string' || asNonEmptyString(reason) === undefined || reason.length > 160)) return { ok: false, message: 'reason must be bounded', path: 'executor.poll.return.settlement.reason', available: ['reason'] };
   if (!eligible && (failureCode === undefined || reason === undefined)) return { ok: false, message: 'ineligible settlement requires failureCode and reason', path: 'executor.poll.return.settlement', available: ['failureCode', 'reason'] };
-  return { ok: true, value: deepFreeze({ conclusion, acceptanceEligible: eligible, artifact: deepFreeze({ artifactRevision, ...(diffRef === undefined ? {} : { diffRef }), changedPaths: Object.freeze([...changedPaths]) }), ...(failureCode === undefined ? {} : { failureCode: failureCode as (typeof SETTLEMENT_FAILURE_CODES)[number] }), ...(reason === undefined ? {} : { reason: reason as string }) }) };
+  return { ok: true, value: deepFreeze({ conclusion, acceptanceEligible: eligible, artifact: deepFreeze({ artifactRevision, ...(workspacePath === undefined ? {} : { workspacePath }), ...(branch === undefined ? {} : { branch }), ...(diffRef === undefined ? {} : { diffRef }), changedPaths: Object.freeze([...changedPaths]), ...(clean === undefined ? {} : { clean }), ...(commitsAhead === undefined ? {} : { commitsAhead }) }), ...(failureCode === undefined ? {} : { failureCode: failureCode as (typeof SETTLEMENT_FAILURE_CODES)[number] }), ...(reason === undefined ? {} : { reason: reason as string }) }) };
 }
 
 function schedulerError(error: TaskGraphError): SchedulerError {

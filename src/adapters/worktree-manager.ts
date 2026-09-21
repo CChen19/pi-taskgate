@@ -12,6 +12,9 @@ export const MAX_BRANCH_LENGTH = 256;
 
 export interface WorktreeCreateRequest {
   readonly repoRoot: string;
+  /** Included so a host ledger can persist identity before session binding. */
+  readonly taskId?: string;
+  readonly attemptId?: string;
   readonly workspacePath: string;
   readonly branch: string;
   readonly baseRevision: string;
@@ -37,6 +40,8 @@ export interface WorktreeInspectResult {
   readonly changedPaths: readonly string[];
   readonly artifactRevision: string;
   readonly diffRef?: string;
+  readonly clean?: boolean;
+  readonly commitsAhead?: number;
 }
 
 export interface WorktreeRemoveRequest {
@@ -131,7 +136,7 @@ export class WorktreeManagerError extends Error implements WorktreeErrorData {
 }
 
 const CREATE_FIELDS = ['workspacePath', 'branch', 'ownershipToken', 'managedMarker', 'baseRevision'] as const;
-const INSPECT_FIELDS = ['changedPaths', 'artifactRevision', 'diffRef'] as const;
+const INSPECT_FIELDS = ['changedPaths', 'artifactRevision', 'diffRef', 'clean', 'commitsAhead'] as const;
 const BINDING_FIELDS = ['taskId', 'attemptId', 'sessionId', 'roleId', 'modelProfileId', 'filesInScope', 'baseRevision', 'workspacePath', 'branch', 'ownershipToken', 'managedMarker'] as const;
 const VERIFY_FIELDS = ['owned', ...BINDING_FIELDS] as const;
 const LEASE_FIELDS = ['taskId', 'attemptId', 'baseRevision', 'workspacePath', 'branch', 'ownershipToken', 'managedMarker'] as const;
@@ -318,7 +323,11 @@ function normalizeInspectResult(value: unknown): WorkspaceInspection {
   const artifactRevision = stringValue(ownValue(raw, 'artifactRevision'), 'worktree.inspectChangedPaths.return.artifactRevision', MAX_ARTIFACT_REVISION_LENGTH);
   const diffRefValue = ownValue(raw, 'diffRef');
   if (diffRefValue !== undefined && (typeof diffRefValue !== 'string' || diffRefValue.length === 0 || diffRefValue.length > MAX_ARTIFACT_REVISION_LENGTH)) fail('INVALID_PORT_RESULT', 'worktree.inspectChangedPaths.return.diffRef', 'diffRef must be bounded when present');
-  return deepFreeze({ changedPaths: checked.changedPaths, artifactRevision, ...(diffRefValue === undefined ? {} : { diffRef: diffRefValue as string }) });
+  const cleanValue = ownValue(raw, 'clean');
+  if (cleanValue !== undefined && typeof cleanValue !== 'boolean') fail('INVALID_PORT_RESULT', 'worktree.inspectChangedPaths.return.clean', 'clean must be boolean');
+  const commitsAheadValue = ownValue(raw, 'commitsAhead');
+  if (commitsAheadValue !== undefined && (typeof commitsAheadValue !== 'number' || !Number.isInteger(commitsAheadValue) || commitsAheadValue < 0)) fail('INVALID_PORT_RESULT', 'worktree.inspectChangedPaths.return.commitsAhead', 'commitsAhead must be a non-negative integer');
+  return deepFreeze({ changedPaths: checked.changedPaths, artifactRevision, ...(diffRefValue === undefined ? {} : { diffRef: diffRefValue as string }), ...(cleanValue === undefined ? {} : { clean: cleanValue }), ...(commitsAheadValue === undefined ? {} : { commitsAhead: commitsAheadValue }) });
 }
 
 /** Per-attempt deterministic ownership manager over an injected WorktreePort. */
@@ -359,7 +368,7 @@ export class WorktreeManager {
       branch = `orchestrator/${baseName}-${suffix}`;
     }
     safeWorkspacePath(this.workspaceRoot, this.repoRoot, workspacePath);
-    const expected: WorktreeCreateRequest = { repoRoot: this.repoRoot, workspacePath, branch, baseRevision, ownershipToken: token };
+    const expected: WorktreeCreateRequest = { repoRoot: this.repoRoot, taskId, attemptId, workspacePath, branch, baseRevision, ownershipToken: token };
     try {
       const created = normalizeCreateResult(port.create(deepFreeze({ ...expected })), expected, this.workspaceRoot, this.repoRoot);
       const lease = deepFreeze({ taskId, attemptId, baseRevision, workspacePath: created.workspacePath, branch: created.branch, ownershipToken: created.ownershipToken, managedMarker: created.managedMarker });

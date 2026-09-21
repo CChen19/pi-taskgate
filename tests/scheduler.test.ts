@@ -32,6 +32,21 @@ function pass(scheduler: Scheduler, taskId: string): void {
 }
 
 describe('Scheduler', () => {
+  it('preserves trusted artifact workspace and branch provenance in settlement events', () => {
+    const graph = new TaskGraph();
+    add(graph, contract('Tartifact'));
+    const executor = new FakeExecutor({
+      Tartifact: [{ status: 'settled', outcome: 'done', settlement: { conclusion: 'done', acceptanceEligible: true, artifact: { artifactRevision: 'rev-1', workspacePath: '/workspace/t-artifact', branch: 'orchestrator/t-artifact', changedPaths: [], clean: true, commitsAhead: 1 } } }],
+    });
+    const scheduler = new Scheduler(graph, executor, { concurrency: 1, clock: () => 0 });
+    const events = scheduler.tick();
+    const settled = events.find((event) => event.type === 'attempt_settled');
+    assert.ok(settled && settled.type === 'attempt_settled');
+    assert.equal(settled.settlement.artifact.workspacePath, '/workspace/t-artifact');
+    assert.equal(settled.settlement.artifact.branch, 'orchestrator/t-artifact');
+    assert.equal(Object.isFrozen(settled.settlement.artifact), true);
+  });
+
   it('honors the concurrency limit while selecting READY tasks', () => {
     const graph = new TaskGraph();
     for (const id of ['Ta', 'Tb', 'Tc', 'Td', 'Te']) add(graph, contract(id));

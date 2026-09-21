@@ -3,7 +3,7 @@
 ## 控制面 / 执行面分离
 
 - **控制面（已实现）**：`Catalog`、`planDispatch`、Task Contract 校验、Orchestration Gate、九态状态机、`TaskGraph`、`Scheduler`、S5 机械验证与 reviewer brief、S6 机械集成报告与升级契约、S7 durable event/projection/recovery 纯核。它们都是内存纯核，无 I/O、网络、进程、worktree、终端、数据库/文件系统或模型调用副作用。
-- **执行面（S3/S5/S6/S8 端口）**：`ExecutorPort` 是任务执行边界，`FakeExecutor` 是离线测试 fake；S5 的 `VerificationRunner` 和 S6 的 `IntegrationRunner` 是命令/Git 执行边界。S8 增加 `PiHerdrExecutor`、`WorktreeManager` 和 scoped-context，但它们仍只调用注入端口，不创建真实进程、pane、git、worktree 或网络资源。生产宿主 transport 尚未接线。
+- **执行面（S3/S5/S6/S8 端口）**：`ExecutorPort` 是任务执行边界，`FakeExecutor` 是离线测试 fake；S5 的 `VerificationRunner` 和 S6 的 `IntegrationRunner` 是命令/Git 执行边界。S8 增加 `PiHerdrExecutor`、`WorktreeManager` 和 scoped-context；P0 `src/host/` 将它们接到公开 herdr CLI、系统 git worktree 和 allowlisted verification process。完整 Planner/DAG、reviewer 模型与 integration coordinator 仍未接线。
 - 角色的 tools/capabilities 仍只是策略数据，**不是**沙箱；真正的运行时权限强制必须在执行面另行实现和测试。
 
 ## Task Contract
@@ -57,7 +57,7 @@ S6 增加 `src/core/integration.ts`，但不改 S2–S5 的行为。`Integration
 
 `decideEscalation` 先重算 report 的关键一致性（outcome、steps、conflicts、finalVerification 和 error），包括用 S5 `decideVerdict` 从 evidence 重算 final verdict，拒绝伪造的 report，再按矩阵返回：`merged -> none`；`verification_failed -> mechanical-retry`（可参数化剩余次数）；`conflict -> integration-agent`；`runner_error -> human`。步骤必须遵守每个 unit 一次 rebase → merge，随后 verification → conflict-check → status 的严格前缀管线，禁止重复或重排。命令条目和冲突路径超过 256 UTF-16 code units 直接结构化拒绝；这是本切片选择的 fail-closed 边界策略，不做截断。Integration Agent 只定义 `assembleIntegrationAgentBrief` 的输入契约：冲突文件、base/unit revisions、双方 diff 摘要；不接模型。
 
-S6 测试全部使用 fake runner，未启动真实 git、命令、agent、worktree 或网络。S8 的 Pi/herdr/worktree production-shaped adapter 可复用这些端口，但适配器仍留在纯核之外，且本项目不提供 host transport。
+S6 纯核测试全部使用 fake runner，未启动真实 git、命令、agent、worktree 或网络。P0 host adapters 位于 `src/host/`，不改变这些纯核契约；完整 acceptance vertical slice 尚未接线。
 
 ## S7 Durable State：日志权威、快照缓存
 
@@ -150,27 +150,28 @@ baseMs * 2^(attemptsRecorded - 1) + rng() * jitterMs
 
 - 没有真实数据库/文件系统持久化 adapter，也没有跨进程锁；S7 只定义端口与 `InMemoryDurableStore` fake，CAS 语义由后续 adapter 实现。
 - S7 不直接 hydrate `TaskGraph`，不启动/重启/取消/reattach executor；恢复只返回 projection 与冻结 action。
-- 无真实 Pi/herdr Executor transport 或 VerificationRunner；S8 只有注入端口适配器，不创建进程、pane、worktree、终端、命令或网络连接。
+- P0 `src/host/` 已提供真实 Pi/herdr CLI、git/worktree 与 allowlisted verification transport；acceptance coordinator、Planner/DAG、reviewer 模型和 integration coordinator 尚未接线。
 - S4 Gate 仍只做规则估计、路由建议和 reviewer 门槛；S5 不接真实模型，reviewer 只消费隔离 brief 并返回结构化契约。
 - 不验证模型在线可用性、认证或 OS 级工具沙箱；Catalog capability 声明不是安全边界。
 
-## S8：production-shaped adapter seams
+## S8 adapters + P0 real host seams
 
-S8 的适配器位于 `src/adapters/`，不改变 S3 的 `ExecutorPort` 语义，也不声称已经连接真实 Pi/herdr/git：
+S8 的纯适配器位于 `src/adapters/`，不改变 S3 的 `ExecutorPort` 语义；P0 real host 位于 `src/host/`，只调用公开 CLI/系统 git，不 import pier 私有源码。真实 schema/lifecycle 约束包括 strict JSON envelope、generation cancellation、safe env allowlist 和 artifact workspace/branch provenance：
 
 - `assembleScopedContext` 只复制 task identity/objective/acceptance criteria/files_in_scope/verification commands、S1 preflight 产生的 worker role/model、base/artifact revision 和有界 evidence/reference summaries。exact-fields 会拒绝 `workerTranscript`、`fullLog`、`secrets`、`env` 等字段；输出和 deterministic prompt 都有单字段、总量、160 UTF-16 摘要边界，并深度冻结。
 - `validateChangedPaths` 把 `src/` 这样的 scope 作为目录、其他条目作为精确文件匹配；它不使用字符串前缀猜测，拒绝 absolute、`..`、NUL、反斜杠逃逸和 `.git`。
-- `WorktreePort` 是唯一 worktree/git host seam：`create(...)`、`bindSession({ taskId, attemptId, sessionId, roleId, modelProfileId, filesInScope, baseRevision, workspacePath, branch, ownershipToken, managedMarker })`、`verifyOwnership(...)`、`inspectChangedPaths(...)`、`remove(...)`。`WorktreeManager` 只生成绝对 containment 内的确定性、碰撞安全路径和 branch，并把每 attempt 绑定到冻结 `WorkspaceLease`。start 在 spawn 后写入 host binding ledger；恢复时 host 返回权威完整 binding，必须同时匹配 task/attempt/session/role/model/scope/revision/path/branch/token/marker，之后才注册 lease。恢复失败不 inspect/remove/spawn。只有本 manager 的 lease 才能 cleanup。remove 失败保留 active lease，适配器公开 `retryPendingCleanup`，未成功前不标记 released。没有真实 filesystem 检查，marker 必须由 port 返回并验证。
+- `WorktreePort` 是唯一 worktree/git host seam：`create(...)`、`bindSession({ taskId, attemptId, sessionId, roleId, modelProfileId, filesInScope, baseRevision, workspacePath, branch, ownershipToken, managedMarker })`、`verifyOwnership(...)`、`inspectChangedPaths(...)`、`remove(...)`。`WorktreeManager` 只生成绝对 containment 内的确定性、碰撞安全路径和 branch，并把每 attempt 绑定到冻结 `WorkspaceLease`。P0 `GitWorktreePort` 使用 `git worktree add -b ...`, NUL diff/status、HEAD/commit-count，并在 workspace 控制目录维护 0600 atomic ownership ledger；remove 会重新验证、拒绝 dirty worktree 且不使用 `--force`。成功 terminal 的 lease 由 `PiHerdrExecutor.finalizeArtifact` 显式释放。
 - `HerdrSubagentPort` 是版本隔离 seam：`spawn` 接收 `cwd=lease.workspacePath`、明确 role/model、S2 contract 和 scoped prompt/context；`poll` 稳定映射 `running | idle | settled | failed | cancelled | lost`；另有 `interrupt`/`close`。transport 的 credentials、环境和全局 transcript 不会进入 payload，宿主可在端口内部按 capability 处理。
 - terminal poll 先由 worktree port 观察 changed paths、artifact revision 和 diffRef，再做 scope gate；worker 自报 revision 不参与权威判断。越界、worker/transport/inspect failure 都产出带稳定 failure code 的 non-eligible settlement，Scheduler 权威阻断 acceptance；只有 eligible settlement 才进入 `VERIFYING`。terminal poll 重复返回同一冻结结果。
 - `serializeHandle`/`restoreHandle` 校验 version、attempt/session、role/model、完整 `filesInScope` 和 lease 字段，但只做结构 codec；start 写入完整 host binding，`reattach` 必须由 host ledger 验证实际 task/attempt/session/role/model/scope/revision/path/branch/token/marker 后才注册并轮询已有 session。cleanup/close 失败保留公开 `lastError` 与 lease 引用，后续 poll/close 或 `retryPendingCleanup` 可重试。
 
-一个宿主接线函数应类似 README 的 `wireS8(catalog, graph, host)` 示例：host 提供 `HerdrSubagentPort`、`WorktreePort`、注入 `clock/idSource`，catalog 仍通过既有 `planDispatch` 做 role/model fail-closed 校验。此仓库没有可直接启动 Pi/herdr/进程的 transport。
+下一步 runner 可使用 `src/host/index.ts` 的 `createRealHost(...)`，再按 README 的 `wireS8(catalog, graph, host)` 形状把真实 ports 接到既有 Scheduler；coordinator 应按 artifact workspace 创建 verifier。catalog 仍通过既有 `planDispatch` 做 role/model fail-closed 校验。P0 host 可启动进程/pane/worktree，但本仓库尚未提供完整 Planner/DAG。
 
-S7 的 durable adapter（真实数据库/文件系统、跨进程 CAS）仍未实现；S8 的 handle codec 只是恢复边界数据，不是 durable store。
+S7 的 durable adapter（真实数据库/文件系统、跨进程 CAS）仍未实现；P0 host ledger 只负责 worktree ownership，不替代 S7 durable store；S8 的 handle codec 只是恢复边界数据。
 
 ## 后续路线
 
-1. **Host transports**：在宿主中实现 Pi/herdr 与 git/worktree port，并单独测试其权限/生命周期。
+1. **Planner/DAG runner**：把 P0 real host ports 接入任务规划、Scheduler 和验收编排。
 2. **真实 reviewer 适配**：在保留 brief 隔离与 revision 绑定的前提下接入模型调用。
+3. **Durable adapter**：实现真实数据库/文件系统 durable event adapter，保留 S7 日志权威语义。
 3. **Durable adapter**：实现真实数据库/文件系统 adapter，保留 S7 日志权威和 recovery 不盲目重启规则。
