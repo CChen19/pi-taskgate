@@ -62,6 +62,12 @@ describe('validateTaskContract', () => {
     assert.equal(Object.isFrozen(result.error.issues), true);
   });
 
+  it('bounds stable IDs to keep graph keys and event identifiers finite', () => {
+    const result = validateTaskContract({ ...validInput(), id: `T${'a'.repeat(64)}` });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.ok(result.error.issues.some((entry) => entry.path === 'contract.id' && /at most 64/.test(entry.message)));
+  });
+
   it('rejects invalid IDs, empty strings, duplicate dependencies, and self-reference', () => {
     const input = validInput();
     input['objective'] = '';

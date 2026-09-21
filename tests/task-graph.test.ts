@@ -173,6 +173,35 @@ describe('TaskGraph', () => {
     assert.deepEqual(graph.readySet(), ['Td']);
   });
 
+  it('rejects non-string task IDs without throwing from graph transitions', () => {
+    const graph = new TaskGraph();
+    add(graph, contract('Tid'));
+    for (const value of [null, 42, {}, '']) {
+      assert.doesNotThrow(() => {
+        const result = graph.transitionTask(value as string, { type: 'ready' });
+        assert.equal(result.ok, false);
+        if (!result.ok) {
+          assert.equal(result.error.code, 'INVALID_TASK_ID');
+          assert.equal(result.error.path, 'taskId');
+          assert.ok(Array.isArray(result.error.available));
+        }
+      });
+    }
+  });
+
+  it('propagates duplicate start and settle errors without bypassing the state machine', () => {
+    const graph = new TaskGraph();
+    add(graph, contract('Tduplicate'));
+    assert.equal(graph.transitionTask('Tduplicate', { type: 'start', attemptId: 'a-1' }).ok, true);
+    const duplicateStart = graph.transitionTask('Tduplicate', { type: 'start', attemptId: 'a-2' });
+    assert.equal(duplicateStart.ok, false);
+    if (!duplicateStart.ok) assert.equal(duplicateStart.error.code, 'INVALID_STATE_TRANSITION');
+    assert.equal(graph.transitionTask('Tduplicate', { type: 'settle', attemptId: 'a-1', outcome: 'done' }).ok, true);
+    const duplicateSettle = graph.transitionTask('Tduplicate', { type: 'settle', attemptId: 'a-1', outcome: 'again' });
+    assert.equal(duplicateSettle.ok, false);
+    if (!duplicateSettle.ok) assert.equal(duplicateSettle.error.code, 'INVALID_STATE_TRANSITION');
+  });
+
   it('passes structured state errors, including from/to and event availability, through the graph', () => {
     const graph = new TaskGraph();
     add(graph, contract('Ta'));
@@ -181,7 +210,7 @@ describe('TaskGraph', () => {
     assert.equal(unknown.ok, false);
     if (!unknown.ok) {
       assert.equal(unknown.error.code, 'INVALID_TRANSITION_EVENT');
-      assert.deepEqual(unknown.error.available, ['ready', 'start', 'settle', 'verdict', 'block', 'cancel']);
+      assert.deepEqual(unknown.error.available, ['ready', 'start', 'settle', 'verdict', 'timeout', 'executor_error', 'block', 'cancel']);
       assert.equal(unknown.error.from, 'READY');
     }
 

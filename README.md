@@ -1,6 +1,6 @@
 # agent-orchestrator
 
-面向 Pi / herdr 的独立 orchestration 核心。当前处于**第二阶段（S2）：纯核心注册表、派发前校验、Task Contract 与动态任务图**，不含任何进程、worktree、终端、持久化或网络副作用。
+面向 Pi / herdr 的独立 orchestration 核心。当前处于**第三阶段（S3）：纯核调度器**，不含任何真实进程、worktree、终端、持久化或网络副作用。
 
 ## 目标
 
@@ -19,14 +19,17 @@
 - `validateTaskContract`：对 `unknown` Task Contract 做 exact-fields、格式、依赖形状、预算与重试校验；`depends_on` 引用存在性在图层拒绝（契约层只查形状）；错误聚合为 `INVALID_CONTRACT`，成功返回深度冻结副本。
 - `task-state`：九态状态机与合法转移表；`max_attempts` 是总 attempt 上限，`0` 表示仅首次；任意 attempt 结束（包括 `BLOCKED` / `CANCELLED`）都会计入预算，执行结果先进入 `VERIFYING`，验证裁决才决定 `PASSED` / `RETRYING` / `FAILED`。
 - `TaskGraph`：内存纯核，支持严格前置依赖、环检测、ready/blocked 查询、动态子任务插入、重试与取消阻塞传播。
+- `ExecutorPort` + `FakeExecutor`：执行器是轮询接口；S3 只提供按脚本返回结果、记录 start/cancel/close 的内存 fake，不创建真实执行资源。
+- `Scheduler`：唯一调度权威；按并发上限选择 READY 任务，驱动 start/settle/verdict，支持注入时钟与 RNG 的 backoff、超时、一次性 stuck 报告、取消和冻结结构化事件流。每次 tick 对账外部图变更，撤销已非 RUNNING 的 handle；执行器协议错误和连续 start 失败均结构化处置。任务状态只由 `TaskGraph`/状态机持有。
+- 任务 ID 最长 64 个字符，用于约束图键、错误路径和事件中的 task/attempt 标识；`outcome/reason` 等事件 payload 不截断。
 
 ## 明确未实现
 
-- 不接 Pi / herdr，不创建进程、pane 或 worktree。
-- 无 ExecutorPort、Scheduler、任务持久化、并发、时间/超时策略；S2 的状态推进必须由调用方提交结构化事件。
-- `verification` 只存契约中的命令字符串，本阶段不执行命令，也没有 S5 验证器/Gate 本体；Agent settled 仍不等于 accepted。
+- 不接 Pi / herdr，不创建进程、pane 或 worktree；`FakeExecutor` 不是生产执行器。
+- 无任务持久化或 S7 事件日志；Scheduler 的事件目前只在内存中提供给调用方。
+- 无 S5 验证器/Gate：执行器 settled 只进入 `VERIFYING`，调用方仍须显式提交 verdict；settled 不等于 accepted。
 - 不验证模型在线可用性或认证；不执行任何 OS 级权限/沙箱强制；不接 Pi / herdr。
-- 无事件日志（S7），无证据绑定 artifact revision 的安全验收实现。
+- 无证据绑定 artifact revision 的安全验收实现。
 
 ## 安装与检查
 
@@ -45,7 +48,9 @@ src/core/defaults.ts    # 默认角色定义（coordinator + 三种 worker）
 src/core/preflight.ts      # planDispatch：派发前校验，产出 DispatchPlan
 src/core/task-contract.ts  # Task Contract 运行时校验与冻结快照
 src/core/task-state.ts    # 九态任务状态机与 Attempt 记录
-src/core/task-graph.ts    # 动态任务图纯核
+src/core/task-graph.ts      # 动态任务图纯核
+src/core/executor-port.ts   # ExecutorPort、轮询 AttemptHandle 与 FakeExecutor
+src/core/scheduler.ts       # 注入时钟/RNG 的纯核调度器与事件流
 tests/                    # node:test + assert，全部离线，无真实模型/Agent
 ```
 
@@ -72,3 +77,5 @@ if (result.ok) {
 ```
 
 模型 profile / 账号属于部署数据，不入库、不入测试（测试仅用 fixture 字符串）。
+
+S3 的 backoff 公式为 `baseMs * 2^(attemptsRecorded - 1) + rng() * jitterMs`；显式 backoff 必须提供正整数 `baseMs`，`jitterMs` 缺省为 0，`maxMs` 缺省为不封顶，配置 `maxMs` 时截断。`maxStartFailures` 默认 3 次，达到上限转 `FAILED`。显式 options 必须是 exact plain object；options 为 `undefined` 时使用离线默认值（单并发、`clock: () => 0`、无延迟），`null` 和未知字段拒绝。时间始终来自注入的 `clock()`，不会直接调用 `Date.now()` 或 `Math.random()`；错误消息回显经 `truncateForMessage` 有界，issues/available/事件 payload 保留完整数据。

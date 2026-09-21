@@ -172,7 +172,7 @@ describe('task state machine', () => {
     assert.equal(unknown.ok, false);
     if (!unknown.ok) {
       assert.equal(unknown.error.code, 'INVALID_TRANSITION_EVENT');
-      assert.deepEqual(unknown.error.available, ['ready', 'start', 'settle', 'verdict', 'block', 'cancel']);
+      assert.deepEqual(unknown.error.available, ['ready', 'start', 'settle', 'verdict', 'timeout', 'executor_error', 'block', 'cancel']);
     }
     const missingAttempt = transitionTaskState(current, { type: 'start' });
     assert.equal(missingAttempt.ok, false);

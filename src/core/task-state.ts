@@ -28,6 +28,8 @@ export const TASK_TRANSITION_TYPES = [
   'start',
   'settle',
   'verdict',
+  'timeout',
+  'executor_error',
   'block',
   'cancel',
 ] as const;
@@ -57,7 +59,7 @@ export interface TaskRuntime {
 export const LEGAL_STATE_TRANSITIONS: Readonly<{ [K in TaskState]: readonly TaskState[] }> = deepFreeze({
   PENDING: ['READY', 'BLOCKED', 'CANCELLED'],
   READY: ['RUNNING', 'BLOCKED', 'CANCELLED'],
-  RUNNING: ['VERIFYING', 'BLOCKED', 'CANCELLED'],
+  RUNNING: ['VERIFYING', 'RETRYING', 'FAILED', 'BLOCKED', 'CANCELLED'],
   VERIFYING: ['PASSED', 'RETRYING', 'FAILED', 'BLOCKED', 'CANCELLED'],
   PASSED: [],
   FAILED: [],
@@ -71,6 +73,8 @@ export type TaskTransition =
   | { readonly type: 'start'; readonly attemptId: string }
   | { readonly type: 'settle'; readonly attemptId: string; readonly outcome: string }
   | { readonly type: 'verdict'; readonly verdict: 'passed' | 'rejected' }
+  | { readonly type: 'timeout'; readonly attemptId: string; readonly outcome?: string; readonly terminal?: boolean }
+  | { readonly type: 'executor_error'; readonly attemptId: string; readonly outcome: string; readonly terminal?: boolean }
   | { readonly type: 'block'; readonly blocker: string }
   | { readonly type: 'cancel'; readonly reason?: string };
 
@@ -314,6 +318,65 @@ export function transitionTaskState(
         withAttemptStatus(attempt, canRetry ? 'REJECTED' : 'FAILED'),
       );
       return nextRuntime(runtime, target, attempts);
+    }
+    case 'timeout': {
+      const attemptId = ownValue(transition, 'attemptId');
+      if (typeof attemptId !== 'string' || asNonEmptyString(attemptId) === undefined) {
+        return failure(runtime, 'timeout.attemptId must be a non-empty string', undefined, 'INVALID_TRANSITION_INPUT', 'transition.attemptId', ['attemptId']);
+      }
+      const rawOutcome = ownValue(transition, 'outcome');
+      if (Object.hasOwn(transition, 'outcome') && (typeof rawOutcome !== 'string' || asNonEmptyString(rawOutcome) === undefined)) {
+        return failure(runtime, 'timeout.outcome must be a non-empty string', undefined, 'INVALID_TRANSITION_INPUT', 'transition.outcome', ['outcome']);
+      }
+      const rawTerminal = ownValue(transition, 'terminal');
+      if (Object.hasOwn(transition, 'terminal') && typeof rawTerminal !== 'boolean') {
+        return failure(runtime, 'timeout.terminal must be boolean', undefined, 'INVALID_TRANSITION_INPUT', 'transition.terminal', ['terminal']);
+      }
+      const attempt = latestAttempt(runtime);
+      if (runtime.state !== 'RUNNING' || attempt?.attemptId !== attemptId || attempt.status !== 'RUNNING') {
+        return failure(runtime, 'timeout must reference the current RUNNING attempt', undefined, 'INVALID_TRANSITION_INPUT', 'transition.attemptId', ['attemptId']);
+      }
+      const limit = attemptLimit(runtime.maxAttempts);
+      const target: TaskState = rawTerminal === true || runtime.attempts.length >= limit ? 'FAILED' : 'RETRYING';
+      const attempts = runtime.attempts.slice(0, -1).concat(
+        withAttemptStatus(attempt, 'CANCELLED', rawOutcome === undefined ? 'timeout' : rawOutcome as string),
+      );
+      return nextRuntime(
+        runtime,
+        target,
+        attempts,
+        undefined,
+        target === 'FAILED' ? `attempt timed out: retry budget exhausted after ${limit} attempt(s)` : undefined,
+      );
+    }
+    case 'executor_error': {
+      const attemptId = ownValue(transition, 'attemptId');
+      if (typeof attemptId !== 'string' || asNonEmptyString(attemptId) === undefined) {
+        return failure(runtime, 'executor_error.attemptId must be a non-empty string', undefined, 'INVALID_TRANSITION_INPUT', 'transition.attemptId', ['attemptId']);
+      }
+      const outcome = ownValue(transition, 'outcome');
+      if (typeof outcome !== 'string' || asNonEmptyString(outcome) === undefined) {
+        return failure(runtime, 'executor_error.outcome must be a non-empty string', undefined, 'INVALID_TRANSITION_INPUT', 'transition.outcome', ['outcome']);
+      }
+      const rawTerminal = ownValue(transition, 'terminal');
+      if (Object.hasOwn(transition, 'terminal') && typeof rawTerminal !== 'boolean') {
+        return failure(runtime, 'executor_error.terminal must be boolean', undefined, 'INVALID_TRANSITION_INPUT', 'transition.terminal', ['terminal']);
+      }
+      const attempt = latestAttempt(runtime);
+      if (runtime.state !== 'RUNNING' || attempt?.attemptId !== attemptId || attempt.status !== 'RUNNING') {
+        return failure(runtime, 'executor_error must reference the current RUNNING attempt', undefined, 'INVALID_TRANSITION_INPUT', 'transition.attemptId', ['attemptId']);
+      }
+      const limit = attemptLimit(runtime.maxAttempts);
+      const hasBudget = runtime.attempts.length < limit;
+      const target: TaskState = rawTerminal === true || !hasBudget ? 'FAILED' : 'RETRYING';
+      const attempts = runtime.attempts.slice(0, -1).concat(withAttemptStatus(attempt, 'CANCELLED', outcome));
+      return nextRuntime(
+        runtime,
+        target,
+        attempts,
+        undefined,
+        target === 'FAILED' ? `executor error: ${outcome}` : undefined,
+      );
     }
     case 'block': {
       const target: TaskState = 'BLOCKED';

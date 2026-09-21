@@ -16,6 +16,8 @@ import {
 
 /** Stable task ID format: `T` followed by lowercase alphanumeric segments. */
 export const TASK_ID_PATTERN = /^T[a-z0-9]+(?:-[a-z0-9]+)*$/;
+/** Bounds event keys and graph error paths while leaving payloads untruncated. */
+export const MAX_TASK_ID_LENGTH = 64;
 
 export interface TaskContract {
   readonly id: string;
@@ -218,6 +220,13 @@ export function validateTaskContract(input: unknown): ContractValidationResult {
     if (Object.hasOwn(raw, 'id')) {
       issue(issues, 'INVALID_FIELD', 'contract.id', 'contract.id must be a non-empty string');
     }
+  } else if (id.length > MAX_TASK_ID_LENGTH) {
+    issue(
+      issues,
+      'INVALID_FIELD',
+      'contract.id',
+      `contract.id must be at most ${MAX_TASK_ID_LENGTH} characters`,
+    );
   } else if (!TASK_ID_PATTERN.test(id)) {
     issue(
       issues,

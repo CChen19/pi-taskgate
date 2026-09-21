@@ -25,7 +25,7 @@ import {
   type TaskRuntime,
   type TaskState,
 } from './task-state.ts';
-import { deepFreeze, isPlainObject, ownValue, truncateForMessage } from './validate.ts';
+import { asNonEmptyString, deepFreeze, isPlainObject, ownValue, truncateForMessage } from './validate.ts';
 
 export interface TaskSnapshot {
   readonly id: string;
@@ -57,6 +57,7 @@ export type TaskGraphErrorCode =
   | 'INVALID_CONTRACT'
   | 'TASK_ALREADY_EXISTS'
   | 'UNKNOWN_TASK'
+  | 'INVALID_TASK_ID'
   | 'UNKNOWN_DEPENDENCY'
   | 'DUPLICATE_DEPENDENCY'
   | 'CYCLE_DETECTED'
@@ -167,6 +168,10 @@ export class TaskGraph {
 
   /** Add `from -> to`, meaning from must pass before to can become ready. */
   addDependency(from: string, to: string): TaskGraphResult {
+    const validFrom = this.validateTaskId(from, 'dependency.from');
+    if (!validFrom.ok) return validFrom;
+    const validTo = this.validateTaskId(to, 'dependency.to');
+    if (!validTo.ok) return validTo;
     const fromRecord = this.tasks.get(from);
     const toRecord = this.tasks.get(to);
     if (fromRecord === undefined || toRecord === undefined) {
@@ -219,6 +224,8 @@ export class TaskGraph {
     input: TaskContract,
     options: { readonly reblockDependents?: boolean } = {},
   ): TaskGraphResult {
+    const validParent = this.validateTaskId(parentTaskId, 'parentTaskId');
+    if (!validParent.ok) return validParent;
     if (!this.tasks.has(parentTaskId)) {
       return graphError('UNKNOWN_TASK', `unknown parent task "${truncateForMessage(parentTaskId)}"`, 'parentTaskId', this.taskIds());
     }
@@ -243,6 +250,8 @@ export class TaskGraph {
 
   /** Apply one state-machine event and refresh graph-derived dependents. */
   transitionTask(taskId: string, transition: unknown): TaskGraphResult {
+    const validTask = this.validateTaskId(taskId, 'taskId');
+    if (!validTask.ok) return validTask;
     if (isPlainObject(transition) && ownValue(transition, 'type') === 'cancel') return this.cancelTask(taskId);
     const record = this.tasks.get(taskId);
     if (record === undefined) {
@@ -265,6 +274,8 @@ export class TaskGraph {
 
   /** Cancel one task and block its descendants; never auto-cancels them. */
   cancelTask(taskId: string): TaskGraphResult {
+    const validTask = this.validateTaskId(taskId, 'taskId');
+    if (!validTask.ok) return validTask;
     const record = this.tasks.get(taskId);
     if (record === undefined) {
       return graphError('UNKNOWN_TASK', `unknown task "${truncateForMessage(taskId)}"`, 'taskId', this.taskIds());
@@ -333,6 +344,19 @@ export class TaskGraph {
 
   private invalidContract(error: ContractValidationError): TaskGraphResult {
     return graphError('INVALID_CONTRACT', error.message, error.path, this.taskIds(), { issues: error.issues });
+  }
+
+  private validateTaskId(taskId: unknown, path: string): { readonly ok: true } | { readonly ok: false; readonly error: TaskGraphError } {
+    if (asNonEmptyString(taskId) !== undefined) return { ok: true };
+    return {
+      ok: false,
+      error: deepFreeze({
+        code: 'INVALID_TASK_ID' as const,
+        message: `${path} must be a non-empty string`,
+        path,
+        available: this.taskIds(),
+      }),
+    };
   }
 
   private taskIds(): string[] {
