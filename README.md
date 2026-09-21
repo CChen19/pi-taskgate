@@ -1,6 +1,6 @@
 # agent-orchestrator
 
-面向 Pi / herdr 的独立 orchestration 核心。当前处于**第六阶段（S6）：机械集成纯核**，不含任何真实进程、git、worktree、终端、持久化、模型调用或网络副作用。
+面向 Pi / herdr 的独立 orchestration 核心。当前处于**第七阶段（S7）：Durable State 纯核**，不含任何真实进程、git、worktree、终端、数据库/文件系统、模型调用或网络副作用。
 
 ## 目标
 
@@ -25,12 +25,14 @@
 - `MechanicalVerifier` / `decideVerdict`：S5 机械验证纯核；只调用注入的 `runner` 和 `clock`，记录有界输出证据，所有 verdict 绑定 `artifactRevision`，不创建进程。
 - `assembleReviewerBrief` / `validateReviewVerdict` / `decideFinalVerdict`：S5 fresh-context reviewer 契约；brief 只包含 spec、revision-bound diff 引用和 evidence 摘要，不包含 worker 转录或完整日志；不接真实模型。
 - `planIntegration` / `runIntegration` / `decideEscalation`：S6 确定性机械集成；按拓扑/给定顺序执行注入式 rebase、merge、验证和冲突检查，失败止步并产出冻结报告；冲突只组装 Integration Agent brief，不调用模型。
-- 任务 ID 最长 64 个字符，用于约束图键、错误路径和事件中的 task/attempt 标识；`artifactRevision`、分支和 base revision 与 S5 一致限制为 256 字符；`outcome/reason` 等事件 payload 不截断。
+- `durable-state` / `recovery`：S7 append-only 事件 envelope、schema 校验、事件日志与快照端口、CAS/原子 batch、幂等 replay、带完整性标记的 projection snapshot，以及不启动 executor 的崩溃恢复对账规划。`InMemoryDurableStore` 仅为测试 fake；日志权威，快照只是缓存。
+- 任务 ID 最长 64 个字符，用于约束图键、错误路径和事件中的 task/attempt 标识；`artifactRevision`、分支和 base revision 与 S5 一致限制为 256 字符；`outcome/reason` 等有界字段超限直接拒绝，不截断。
 
 ## 明确未实现
 
 - 不接 Pi / herdr，不创建进程、pane 或 worktree；`FakeExecutor` 不是生产执行器。
-- 无任务持久化或 S7 事件日志；Scheduler 的事件目前只在内存中提供给调用方。
+- S7 不直接 hydrate `TaskGraph` 实例，也不启动、重启、cancel 或 reattach executor；它只恢复 canonical projection 并输出确定性 reconciliation actions。
+- 没有真实数据库或文件系统 adapter；S7 只提供同步端口和 `InMemoryDurableStore` fake。Scheduler/S5/S6 的事件需要由适配层转换为受控 durable envelope 后写入日志。
 - 不接真实 runner、git、进程或模型：S5/S6 只定义注入式机械验证、集成 runner 和 fresh reviewer / Integration Agent 输入输出契约；测试全用 fake，生产适配器与真实模型调用仍属后续边界。
 - 不验证模型在线可用性或认证；不执行任何 OS 级权限/沙箱强制；不接 Pi / herdr。
 
@@ -58,6 +60,8 @@ src/core/gate.ts            # S4 复杂度路由、reviewer 门槛与消融开�
 src/core/verification.ts   # S5 注入 runner 的机械验证、证据与 verdict
 src/core/reviewer-brief.ts # S5 fresh-context brief、review verdict 与最终合并
 src/core/integration.ts   # S6 rebase/merge/验证/冲突检查纯核与升级 brief
+src/core/durable-state.ts # S7 事件 envelope、CAS store/snapshot port、replay/projection
+src/core/recovery.ts      # S7 纯函数崩溃恢复对账与审计 action
 tests/                    # node:test + assert，全部离线，无真实模型/Agent
 ```
 
@@ -85,6 +89,14 @@ EOF
 ```
 
 S4 的架构不变式是 **single-agent first**：小任务默认 `single`，不因形式完整就创建 DAG；mechanical verification 的规划永远保留。
+
+## S7 Durable State 边界
+
+S7 把控制面状态拆成 **append-only event log → canonical projection → optional snapshot cache**。`DurableEvent` 固定 `schemaVersion=1`、`runId`、从 1 连续递增的 `sequence`、`eventId`、`idempotencyKey`、注入时钟产生的 `occurredAt`、受控 `kind/payload`；未知版本、gap/out-of-order、Symbol/非枚举字段、稀疏/方法篡改数组、超长标识和完整 transcript/log 都 fail closed。Scheduler、TaskGraph 生命周期、S5 evidence/verdict 与 S6 integration 只保存有界摘要和 reference，不保存完整日志。
+
+`EventStorePort.append(runId, expectedSequence, events)` 是 CAS 且原子 all-or-nothing；并发 writer 的旧 sequence 返回结构化 conflict。幂等只接受完整 envelope（包括相同 `sequence`）的 event identity 重放；同 identity 的其他 sequence 或内容、以及空 batch 的 stale CAS 都拒绝。`SnapshotStorePort.saveSnapshot` 同时比较 sequence/schema version，snapshot 带 projection integrity marker（非密码学签名，只用于检测普通篡改）；恢复永远 replay `lastSequence + 1` 的 tail，不能让 snapshot 覆盖日志权威。canonical projection 严格校验 contract/task、合法 S2 from/current/to、attempt start/settle 唯一性、evidence/verdict 的 task/attempt/artifactRevision 绑定以及 PASSED verdict 前置条件；scheduler/recovery 事件仅作审计，不绕过这些 helper。projection 含任务 contract/state/attempt、依赖、证据/裁决/集成的有界引用；它是恢复计划数据，不是假装已经恢复了 S2 `TaskGraph` 实例。replay 使用 accumulator + Map/Set，snapshot 与 tail 合计最多 100,000 个事件。
+
+`planRecovery` / `reconcileRecovery` 只比较持久化 attempt 与 observed executor state：RUNNING + running → `reattach`，+ terminal → `settle`，+ missing → 默认 `mark-lost`（也可只记录 `retry-scheduler`，最终由 S3 budget 决定），terminal + running → `cancel-stale`，无对应日志的 observed → `cancel-orphan`。start-intent 已落盘但未启动、已启动但 started event 丢失、completion 已发生但 settlement 丢失，都通过事件/对账动作留痕；默认绝不盲目重启。真实 DB/fs/executor adapter 属于 S8。
 
 ## S6 机械集成边界
 

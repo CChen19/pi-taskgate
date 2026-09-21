@@ -1,8 +1,8 @@
-# 架构（S6：机械集成、验证环、Orchestration Gate 与 Scheduler 纯核）
+# 架构（S7：Durable State、机械集成、验证环、Orchestration Gate 与 Scheduler 纯核）
 
 ## 控制面 / 执行面分离
 
-- **控制面（已实现）**：`Catalog`、`planDispatch`、Task Contract 校验、Orchestration Gate、九态状态机、`TaskGraph`、`Scheduler`、S5 机械验证与 reviewer brief、S6 机械集成报告与升级契约。它们都是内存纯核，无 I/O、网络、进程、worktree、终端或模型调用副作用。
+- **控制面（已实现）**：`Catalog`、`planDispatch`、Task Contract 校验、Orchestration Gate、九态状态机、`TaskGraph`、`Scheduler`、S5 机械验证与 reviewer brief、S6 机械集成报告与升级契约、S7 durable event/projection/recovery 纯核。它们都是内存纯核，无 I/O、网络、进程、worktree、终端、数据库/文件系统或模型调用副作用。
 - **执行面（S3/S5/S6 仅接口）**：`ExecutorPort` 是任务执行边界，`FakeExecutor` 是离线测试 fake；S5 的 `VerificationRunner` 和 S6 的 `IntegrationRunner` 是命令/Git 执行边界。它们不创建真实资源；Pi/herdr/进程/命令/Git 适配器仍是后续边界。
 - 角色的 tools/capabilities 仍只是策略数据，**不是**沙箱；真正的运行时权限强制必须在执行面另行实现和测试。
 
@@ -58,6 +58,16 @@ S6 增加 `src/core/integration.ts`，但不改 S2–S5 的行为。`Integration
 `decideEscalation` 先重算 report 的关键一致性（outcome、steps、conflicts、finalVerification 和 error），包括用 S5 `decideVerdict` 从 evidence 重算 final verdict，拒绝伪造的 report，再按矩阵返回：`merged -> none`；`verification_failed -> mechanical-retry`（可参数化剩余次数）；`conflict -> integration-agent`；`runner_error -> human`。步骤必须遵守每个 unit 一次 rebase → merge，随后 verification → conflict-check → status 的严格前缀管线，禁止重复或重排。命令条目和冲突路径超过 256 UTF-16 code units 直接结构化拒绝；这是本切片选择的 fail-closed 边界策略，不做截断。Integration Agent 只定义 `assembleIntegrationAgentBrief` 的输入契约：冲突文件、base/unit revisions、双方 diff 摘要；不接模型。
 
 S6 测试全部使用 fake runner，未启动真实 git、命令、agent、worktree 或网络。未来 S8 的 Pi/herdr worktree 回收与真实 Git/VerificationRunner 适配可复用这些端口，但适配器必须留在纯核之外。
+
+## S7 Durable State：日志权威、快照缓存
+
+S7 增加 `src/core/durable-state.ts` 与 `src/core/recovery.ts`，但不改 S2–S6 的状态/调度行为。`DurableEvent` 的 schema version 当前只接受 `1`；envelope 固定包含 `runId`、从 1 连续递增的 `sequence`、`eventId`、`idempotencyKey`、注入 `clock` 的 `occurredAt`、`kind` 和受控 payload。event/run/attempt ID 上限为 128，task ID 沿用 S2 的 64，reference/revision 上限为 256，摘要与最终结构化错误 message 上限为 160 UTF-16 code units。unknown future version、未知字段（含 Symbol/非枚举）、稀疏/方法篡改/额外属性数组、gap/out-of-order、runId 不一致均 fail closed。
+
+payload 只允许六类受控数据：Scheduler 事件摘要、TaskGraph lifecycle/attempt 投影、S5 evidence 引用与有界摘要、artifact-bound verdict、S6 integration report 引用与摘要、recovery action。完整 worker transcript、命令输出、终端日志不进入事件或 projection。canonical projection 严格校验 contract.id/taskId、合法 S2 from/current/to、attempt start/settle 的存在性与唯一性、evidence/verdict 的 task/attempt/artifactRevision binding，以及 PASSED 必须有同 revision 的 passed verdict 且无 active attempt；scheduler/recovery 事件仅保留审计，不直接改变 canonical task。`DurableProjectionState` 保存任务 contract/state/attempt、依赖、subtask、证据/裁决/集成摘要和 event identity index；它是恢复所需的 canonical durable projection，不是一个已 hydrate 的 `TaskGraph` 实例。
+
+`EventStorePort.append(runId, expectedSequence, events)` 是唯一写入入口，使用 sequence CAS；一次 batch 先完整校验再提交，保证 all-or-nothing。旧 expected sequence 返回结构化 `SEQUENCE_CONFLICT`，空 batch 也不能绕过 stale CAS。幂等只接受完整 envelope（包括相同 `sequence`）的 eventId/idempotencyKey 重放；同 identity 的其他 sequence 或内容返回 conflict。`SnapshotStorePort.saveSnapshot` 同时校验 expected sequence/schema version；snapshot 带 integrity marker（非密码学签名，只用于普通篡改检测），篡改或 lastSequence 不一致拒绝。`recoverRun(snapshot, tail)` 只从 `snapshot.lastSequence + 1` replay，快照永远不能覆盖日志权威；snapshot 与 tail 合计最多 100,000 个事件，replay 使用 O(n) accumulator + Map/Set。`InMemoryDurableStore` 是复制/冻结的离线 fake，不是数据库或文件系统 adapter。
+
+`planRecovery` / `reconcileRecovery` 是纯函数，不启动 executor：persisted RUNNING + observed running → `reattach`；+ terminal → `settle`（保留 outcome/resultRef）；+ missing → 默认 `mark-lost`，也可只记录 `retry-scheduler`，最终 attempt budget 仍由 S3 决定；persisted terminal + executor running → `cancel-stale`；无对应 persisted attempt 的 observed → `cancel-orphan`。稳定按 task/attempt 排序并要求 revision/attempt binding。start intent 已落盘但 executor 未启动、executor 已启动但 started event 未落盘、completion 已发生但 settlement 未落盘，都只能通过事件和 reconciliation action 留痕，**不得默认重启**。
 
 ## 架构不变式
 
@@ -130,7 +140,7 @@ baseMs * 2^(attemptsRecorded - 1) + rng() * jitterMs
 - `attempt_cancelled`、`task_cancelled`
 - `executor_error { code, phase, message, path, available }`、`scheduler_error { code, message, path, available }`
 
-任务 ID 限制为不超过 64 个字符：这是事件键、attempt ID 组合和图错误路径的工程上界；因此 `taskId/attemptId` 标识符有界。错误消息回显经 `truncateForMessage` 有界；`issues`、`available`、事件 payload（包括完整的 `outcome/reason`）保留完整数据，属设计选择。事件流是 S7 事件日志的输入形状，但 S3 不持久化它。错误还带 `code/message/path/available`，状态错误带 `from/to`，不把模型声明、终端输出或完成文字当作工作流状态。
+任务 ID 限制为不超过 64 个字符：这是事件键、attempt ID 组合和图错误路径的工程上界；因此 `taskId/attemptId` 标识符有界。错误消息回显经 `truncateForMessage` 有界；事件 payload 的 `outcome/reason` 也有界，超限直接拒绝而不截断；`issues`、`available` 保留完整数据，属设计选择。事件流是 S7 事件日志的输入形状，但 S3 不持久化它。错误还带 `code/message/path/available`，状态错误带 `from/to`，不把模型声明、终端输出或完成文字当作工作流状态。
 
 ## S3/S4 已实现 / 未实现边界
 
@@ -138,13 +148,13 @@ baseMs * 2^(attemptsRecorded - 1) + rng() * jitterMs
 
 明确未实现：
 
-- 无持久化、恢复、跨进程并发协调或 S7 事件日志。
+- 没有真实数据库/文件系统持久化 adapter，也没有跨进程锁；S7 只定义端口与 `InMemoryDurableStore` fake，CAS 语义由后续 adapter 实现。
+- S7 不直接 hydrate `TaskGraph`，不启动/重启/取消/reattach executor；恢复只返回 projection 与冻结 action。
 - 无真实 Executor 或 VerificationRunner；不接 Pi/herdr，不创建进程、pane、worktree、终端、命令或网络连接。
 - S4 Gate 仍只做规则估计、路由建议和 reviewer 门槛；S5 不接真实模型，reviewer 只消费隔离 brief 并返回结构化契约。
 - 不验证模型在线可用性、认证或 OS 级工具沙箱；Catalog capability 声明不是安全边界。
 
 ## 后续路线
 
-1. **事件日志（S7）**：持久化 Scheduler 事件、任务图快照和 S5 evidence，支持恢复与审计。
-2. **Pi/herdr 适配（S8）**：在不污染纯核的前提下实现真实 ExecutorPort、VerificationRunner、进程和工作区策略。
-3. **真实 reviewer 适配**：在保留 brief 隔离与 revision 绑定的前提下接入模型调用。
+1. **Pi/herdr 适配（S8）**：在不污染纯核的前提下实现真实 DurableStore、ExecutorPort、VerificationRunner、进程和工作区策略。
+2. **真实 reviewer 适配**：在保留 brief 隔离与 revision 绑定的前提下接入模型调用。
