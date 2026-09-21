@@ -1,6 +1,6 @@
 # agent-orchestrator
 
-面向 Pi / herdr 的独立 orchestration 核心。当前处于**第四阶段（S4）：Orchestration Gate 纯核**，不含任何真实进程、worktree、终端、持久化或网络副作用。
+面向 Pi / herdr 的独立 orchestration 核心。当前处于**第五阶段（S5）：验证环纯核**，不含任何真实进程、worktree、终端、持久化、模型调用或网络副作用。
 
 ## 目标
 
@@ -22,15 +22,16 @@
 - `ExecutorPort` + `FakeExecutor`：执行器是轮询接口；S3 只提供按脚本返回结果、记录 start/cancel/close 的内存 fake，不创建真实执行资源。
 - `Scheduler`：唯一调度权威；按并发上限选择 READY 任务，驱动 start/settle/verdict，支持注入时钟与 RNG 的 backoff、超时、一次性 stuck 报告、取消和冻结结构化事件流。每次 tick 对账外部图变更，撤销已非 RUNNING 的 handle；执行器协议错误和连续 start 失败均结构化处置。任务状态只由 `TaskGraph`/状态机持有。
 - `planRoute` / `needsFreshReview`：S4 规则版 Orchestration Gate，运行时复用 S2 校验 Task Contract，并按范围文件、验收标准、验证命令、契约体量和依赖数确定 single/plan 路由；输出命中信号、理由、Scheduler 建议和 reviewer 门槛；不调用模型、不执行验证、不创建 DAG。
+- `MechanicalVerifier` / `decideVerdict`：S5 机械验证纯核；只调用注入的 `runner` 和 `clock`，记录有界输出证据，所有 verdict 绑定 `artifactRevision`，不创建进程。
+- `assembleReviewerBrief` / `validateReviewVerdict` / `decideFinalVerdict`：S5 fresh-context reviewer 契约；brief 只包含 spec、revision-bound diff 引用和 evidence 摘要，不包含 worker 转录或完整日志；不接真实模型。
 - 任务 ID 最长 64 个字符，用于约束图键、错误路径和事件中的 task/attempt 标识；`outcome/reason` 等事件 payload 不截断。
 
 ## 明确未实现
 
 - 不接 Pi / herdr，不创建进程、pane 或 worktree；`FakeExecutor` 不是生产执行器。
 - 无任务持久化或 S7 事件日志；Scheduler 的事件目前只在内存中提供给调用方。
-- 无 S5 验证器：执行器 settled 只进入 `VERIFYING`，调用方仍须显式提交 verdict；S4 Gate 只规划 mechanical verification 与 fresh reviewer 门槛，不运行命令或产生证据，settled 不等于 accepted。
+- 不接真实 runner、进程或模型：S5 只定义注入式机械验证和 fresh reviewer 输入/输出契约；生产执行适配器与真实模型调用仍属后续边界。
 - 不验证模型在线可用性或认证；不执行任何 OS 级权限/沙箱强制；不接 Pi / herdr。
-- 无证据绑定 artifact revision 的安全验收实现。
 
 ## 安装与检查
 
@@ -53,6 +54,8 @@ src/core/task-graph.ts      # 动态任务图纯核
 src/core/executor-port.ts   # ExecutorPort、轮询 AttemptHandle 与 FakeExecutor
 src/core/scheduler.ts       # 注入时钟/RNG 的纯核调度器与事件流
 src/core/gate.ts            # S4 复杂度路由、reviewer 门槛与消融开关
+src/core/verification.ts   # S5 注入 runner 的机械验证、证据与 verdict
+src/core/reviewer-brief.ts # S5 fresh-context brief、review verdict 与最终合并
 tests/                    # node:test + assert，全部离线，无真实模型/Agent
 ```
 
@@ -82,5 +85,13 @@ EOF
 S4 的架构不变式是 **single-agent first**：小任务默认 `single`，不因形式完整就创建 DAG；mechanical verification 的规划永远保留。`reviewer` 只在 `plan` / `complex` 或验证失败、不确定时启用，且可用 `reviewer: 'always' | 'never'` 做消融。`mode: 'auto' | 'force-single' | 'force-plan'` 可绕过路由估计，结果仍记录 `forced`、估计复杂度、信号 `reasons` 与路由 `decisionReasons`。Gate 输出的 `maxConcurrency` 与 `expectedTaskCount` 是供 S3 Scheduler / 后续 S5 消费的建议，不会改变 S3 行为。
 
 模型 profile / 账号属于部署数据，不入库、不入测试（测试仅用 fixture 字符串）。
+
+## S5 验证环边界
+
+S5 把“验收”拆成两个显式阶段：`MechanicalVerifier` 通过调用方注入的 `runner` 执行 S4 规划的命令，并通过注入的 `clock` 记录开始/结束时间；runner 返回退出码、超时和有界输出摘要/引用。测试只使用 fake runner，绝不启动真实进程。`decideVerdict` 仅在所有命令成功且满足 `minimumCommands` 等期望时返回 `verdict: 'passed'`，否则返回 artifact-bound `rejected`；缺少 `artifactRevision` 直接结构化拒绝。
+
+`assembleReviewerBrief` 的 fresh-context 输入严格只有 `spec`、revision-bound `diff` 和 evidence 摘要。worker 会话转录、prompt 历史和完整日志既不进入 brief，也不作为 reviewer 状态来源；多余字段（包括 `workerTranscript`）按 exact-fields 规则拒绝。reviewer 只定义 `passed/rejected` 契约，不调用模型。`decideFinalVerdict` 的矩阵是：机械 rejected → rejected；机械 passed 且 Gate 不需 reviewer → passed；机械 passed 且需 reviewer、尚未收到裁决 → needs_review；收到 rejected review → rejected；通过的 review 必须匹配同一 artifact revision 才能 passed。
+
+S5 只产出可映射到 S2 的 `verdict: 'passed' | 'rejected'` 输入；`settled` 仍只是 `VERIFYING`，不会自动变成 `PASSED`。`taskId` 复用 S2 的 64 字符上限；`attemptId` 限制为 128 字符（容纳最长 S2 task ID、S3 的 `:attempt-` 前缀和计数器）；`artifactRevision` 限制为 256 字符（容纳 commit/diff hash 及适配器引用）。`s2VerdictInput` 对运行时输入再次校验，只允许 `passed/rejected`。S4 的 `mechanicalVerification.required/commands` 与 `needsFreshReview` 行为不被 S5 改写。
 
 S3 的 backoff 公式为 `baseMs * 2^(attemptsRecorded - 1) + rng() * jitterMs`；显式 backoff 必须提供正整数 `baseMs`，`jitterMs` 缺省为 0，`maxMs` 缺省为不封顶，配置 `maxMs` 时截断。`maxStartFailures` 默认 3 次，达到上限转 `FAILED`。显式 options 必须是 exact plain object；options 为 `undefined` 时使用离线默认值（单并发、`clock: () => 0`、无延迟），`null` 和未知字段拒绝。时间始终来自注入的 `clock()`，不会直接调用 `Date.now()` 或 `Math.random()`；错误消息回显经 `truncateForMessage` 有界，issues/available/事件 payload 保留完整数据。

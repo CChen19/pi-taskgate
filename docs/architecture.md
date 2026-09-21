@@ -1,9 +1,9 @@
-# 架构（S4：Orchestration Gate 与 Scheduler 纯核）
+# 架构（S5：验证环、Orchestration Gate 与 Scheduler 纯核）
 
 ## 控制面 / 执行面分离
 
-- **控制面（已实现）**：`Catalog`、`planDispatch`、Task Contract 校验、Orchestration Gate、九态状态机、`TaskGraph` 与 `Scheduler`。它们都是内存纯核，无 I/O、网络、进程、worktree 或终端副作用。
-- **执行面（S3 仅接口）**：`ExecutorPort` 是执行器边界，`FakeExecutor` 是离线测试 fake。它们不创建真实资源；Pi/herdr/进程适配器仍是后续切片。
+- **控制面（已实现）**：`Catalog`、`planDispatch`、Task Contract 校验、Orchestration Gate、九态状态机、`TaskGraph`、`Scheduler`、S5 机械验证与 reviewer brief。它们都是内存纯核，无 I/O、网络、进程、worktree、终端或模型调用副作用。
+- **执行面（S3/S5 仅接口）**：`ExecutorPort` 是任务执行边界，`FakeExecutor` 是离线测试 fake；S5 的 `VerificationRunner` 是命令执行边界。它们不创建真实资源；Pi/herdr/进程/命令适配器仍是后续边界。
 - 角色的 tools/capabilities 仍只是策略数据，**不是**沙箱；真正的运行时权限强制必须在执行面另行实现和测试。
 
 ## Task Contract
@@ -13,7 +13,7 @@
 - exact-fields、稳定 ID、非空目标、字符串数组、重复/自引用依赖、验收标准、预算和重试参数都 fail closed；问题聚合为 `INVALID_CONTRACT`，包含 `code/message/path/issues`。
 - `depends_on` 在契约层只校验形状，不要求引用已存在；引用存在性由图层检查。
 - 成功结果是深度冻结副本；数组会复制，调用方输入不会被修改或冻结。
-- `verification` 只作为命令字符串存储，本阶段绝不执行。它可以为空，表示没有机械验证，仍须 S4 Gate/后续裁决逻辑决定如何处理；命令字符串不是执行授权。
+- `verification` 在 S2 Contract 中只作为命令字符串存储，S2 本身绝不执行。S4 将其复制为 mechanical verification 规划；S5 只有在调用方显式提供 runner 时才执行，并将结果绑定到 artifact revision；命令字符串本身不是执行授权。
 
 ## S4 Orchestration Gate
 
@@ -34,6 +34,16 @@
 `mode: 'auto' | 'force-single' | 'force-plan'` 用于 S9 对照实验。`force-*` 绕过路由选择，结果仍保留规则估计的 `complexity`、`forced` 标记、信号对应的 `reasons` 和路由解释 `decisionReasons`。所有返回的 `RoutePlan` 与 reviewer 决策都是深度冻结快照。
 
 `needsFreshReview` 只做门槛决策，运行时严格校验传入的 `RoutePlan` 形状（plain object、exact-fields、枚举和嵌套 mechanical verification）；调用方必须传入未篡改的 `planRoute` 产物。形状合法不等于可证明来源，Gate 不提供对象 provenance 或执行授权。
+
+## S5 验证环
+
+S5 是对 S4 规划的纯核消费，不改 S4 路由或 S3 Scheduler 行为：
+
+- `MechanicalVerifier.run(commands, ctx)` 只接受验证命令和包含 `taskId`、`attemptId`、`artifactRevision`、注入 `clock`/`runner` 的上下文。它逐条调用 runner，记录 `exitCode`、注入时钟测得的 `durationMs`、`timedOut` 和有界 `output`/`outputRef`，返回深度冻结的 `EvidenceBundle`。核心不调用 `Date.now()`、`Math.random()`，也不自行启动进程；测试 runner 是 fake。
+- `decideVerdict(bundle, expectations)` 先验证 evidence 形状和 revision 绑定。所有命令 `exitCode === 0` 且未超时、并满足 `minimumCommands` 时返回 `{ verdict: 'passed', artifactRevision, reasons }`；任意非零/超时或期望未满足返回 artifact-bound `rejected`。bundle 缺 revision 是结构化 fail-closed 错误，不产生无绑定 verdict。输出摘要复用 `truncateForMessage` 的 160 UTF-16 code-unit 上界。
+- `assembleReviewerBrief` 只复制 `spec.objective/acceptance_criteria/files_in_scope`、`diff.artifactRevision` 与可选有界 patch、以及 evidence 摘要。它用 exact-fields 拒绝额外的 `workerTranscript`、prompt 历史和完整日志字段，保持 fresh-context 隔离；不调用模型。
+- `validateReviewVerdict` 只接受 `outcome: 'passed' | 'rejected'`、非空 `reasons` 和非空 `artifactRevision`。`decideFinalVerdict` 的矩阵是：机械 rejected → rejected；机械 passed 且 Gate 不要求 reviewer → passed；机械 passed 且 Gate 要求但尚无 review → needs_review；review rejected → rejected；review passed 只有在 revision 与机械 verdict 相同才通过。最终只把 `passed/rejected` 映射为 S2 的 verdict 输入，`settled` 仍停在 `VERIFYING`。公开的 `s2VerdictInput` 会在运行时拒绝 `needs_review` 等非 S2 值。
+- S5 标识符有界：`taskId` 复用 S2 的 64 字符上限；`attemptId` 为 128 字符，足以容纳 S3 的 `${taskId}:attempt-${counter}`；`artifactRevision` 为 256 字符，覆盖 commit/diff hash 与适配器引用。超限统一结构化拒绝。
 
 ## 架构不变式
 
@@ -113,12 +123,12 @@ baseMs * 2^(attemptsRecorded - 1) + rng() * jitterMs
 明确未实现：
 
 - 无持久化、恢复、跨进程并发协调或 S7 事件日志。
-- 无真实 Executor；不接 Pi/herdr，不创建进程、pane、worktree、终端或网络连接。
-- S4 Gate 只做规则估计、路由建议和 reviewer 门槛；无 S5 验证器、命令执行或 artifact revision 证据绑定，verdict 仍由调用方提交。
+- 无真实 Executor 或 VerificationRunner；不接 Pi/herdr，不创建进程、pane、worktree、终端、命令或网络连接。
+- S4 Gate 仍只做规则估计、路由建议和 reviewer 门槛；S5 不接真实模型，reviewer 只消费隔离 brief 并返回结构化契约。
 - 不验证模型在线可用性、认证或 OS 级工具沙箱；Catalog capability 声明不是安全边界。
 
 ## 后续路线
 
-1. **验证与证据（S5）**：执行 S4 规划的 mechanical verification，将 verdict 绑定到具体 artifact revision，并实现证据验收。
-2. **事件日志（S7）**：持久化 Scheduler 事件和任务图快照，支持恢复与审计。
-3. **Pi/herdr 适配（S8）**：在不污染纯核的前提下实现真实 ExecutorPort、进程和工作区策略。
+1. **事件日志（S7）**：持久化 Scheduler 事件、任务图快照和 S5 evidence，支持恢复与审计。
+2. **Pi/herdr 适配（S8）**：在不污染纯核的前提下实现真实 ExecutorPort、VerificationRunner、进程和工作区策略。
+3. **真实 reviewer 适配**：在保留 brief 隔离与 revision 绑定的前提下接入模型调用。
