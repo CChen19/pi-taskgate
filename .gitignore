@@ -1,0 +1,8 @@
+node_modules/
+coverage/
+dist/
+.orchestrator/
+.env
+.env.*
+!.env.example
+*.log
