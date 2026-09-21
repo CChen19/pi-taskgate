@@ -1,6 +1,6 @@
 # agent-orchestrator
 
-面向 Pi / herdr 的独立 orchestration 核心。当前处于**第三阶段（S3）：纯核调度器**，不含任何真实进程、worktree、终端、持久化或网络副作用。
+面向 Pi / herdr 的独立 orchestration 核心。当前处于**第四阶段（S4）：Orchestration Gate 纯核**，不含任何真实进程、worktree、终端、持久化或网络副作用。
 
 ## 目标
 
@@ -21,13 +21,14 @@
 - `TaskGraph`：内存纯核，支持严格前置依赖、环检测、ready/blocked 查询、动态子任务插入、重试与取消阻塞传播。
 - `ExecutorPort` + `FakeExecutor`：执行器是轮询接口；S3 只提供按脚本返回结果、记录 start/cancel/close 的内存 fake，不创建真实执行资源。
 - `Scheduler`：唯一调度权威；按并发上限选择 READY 任务，驱动 start/settle/verdict，支持注入时钟与 RNG 的 backoff、超时、一次性 stuck 报告、取消和冻结结构化事件流。每次 tick 对账外部图变更，撤销已非 RUNNING 的 handle；执行器协议错误和连续 start 失败均结构化处置。任务状态只由 `TaskGraph`/状态机持有。
+- `planRoute` / `needsFreshReview`：S4 规则版 Orchestration Gate，运行时复用 S2 校验 Task Contract，并按范围文件、验收标准、验证命令、契约体量和依赖数确定 single/plan 路由；输出命中信号、理由、Scheduler 建议和 reviewer 门槛；不调用模型、不执行验证、不创建 DAG。
 - 任务 ID 最长 64 个字符，用于约束图键、错误路径和事件中的 task/attempt 标识；`outcome/reason` 等事件 payload 不截断。
 
 ## 明确未实现
 
 - 不接 Pi / herdr，不创建进程、pane 或 worktree；`FakeExecutor` 不是生产执行器。
 - 无任务持久化或 S7 事件日志；Scheduler 的事件目前只在内存中提供给调用方。
-- 无 S5 验证器/Gate：执行器 settled 只进入 `VERIFYING`，调用方仍须显式提交 verdict；settled 不等于 accepted。
+- 无 S5 验证器：执行器 settled 只进入 `VERIFYING`，调用方仍须显式提交 verdict；S4 Gate 只规划 mechanical verification 与 fresh reviewer 门槛，不运行命令或产生证据，settled 不等于 accepted。
 - 不验证模型在线可用性或认证；不执行任何 OS 级权限/沙箱强制；不接 Pi / herdr。
 - 无证据绑定 artifact revision 的安全验收实现。
 
@@ -51,30 +52,34 @@ src/core/task-state.ts    # 九态任务状态机与 Attempt 记录
 src/core/task-graph.ts      # 动态任务图纯核
 src/core/executor-port.ts   # ExecutorPort、轮询 AttemptHandle 与 FakeExecutor
 src/core/scheduler.ts       # 注入时钟/RNG 的纯核调度器与事件流
+src/core/gate.ts            # S4 复杂度路由、reviewer 门槛与消融开关
 tests/                    # node:test + assert，全部离线，无真实模型/Agent
 ```
 
-## 短用例
+## S4 可运行短用例
 
-```ts
-import { createCatalog } from './src/core/catalog.ts';
-import { planDispatch } from './src/core/preflight.ts';
+在项目根目录逐字运行以下命令即可；示例自备合法 Task Contract，不依赖未定义的部署配置：
 
-const catalog = createCatalog(configFromDeployment); // 无效配置在此直接抛错
-const result = planDispatch(catalog, {
-  description: 'Add a README section',
-  instructions: 'Write the section under docs/.',
-  roleId: 'implementer',
-  // modelProfileId: 'profile-fast', // 可选任务级 override
-});
-if (result.ok) {
-  result.plan.model;        // 实际使用的 profile（含完整斜杠模型 ID）
-  result.plan.routingReason; // 'role-default' | 'task-override'
-} else {
-  result.error.code;        // 如 'UNKNOWN_ROLE' / 'MODEL_PROFILE_NOT_ALLOWED'
-  result.error.available;   // 相关可选 ID，便于恢复
-}
+```sh
+node --input-type=module <<'EOF'
+import { needsFreshReview, planRoute } from './src/core/gate.ts';
+
+const taskContract = {
+  id: 'Treadme-gate-example',
+  objective: 'Add a short S4 explanation to the README',
+  depends_on: [],
+  files_in_scope: ['README.md'],
+  acceptance_criteria: ['The README explains the route and reviewer decision'],
+  verification: ['npm run check'],
+};
+
+const routePlan = planRoute(taskContract); // 只接受经 S2 校验的契约；不执行命令
+const reviewer = needsFreshReview(routePlan, { status: 'passed' });
+console.log({ mode: routePlan.mode, complexity: routePlan.complexity, reviewer });
+EOF
 ```
+
+S4 的架构不变式是 **single-agent first**：小任务默认 `single`，不因形式完整就创建 DAG；mechanical verification 的规划永远保留。`reviewer` 只在 `plan` / `complex` 或验证失败、不确定时启用，且可用 `reviewer: 'always' | 'never'` 做消融。`mode: 'auto' | 'force-single' | 'force-plan'` 可绕过路由估计，结果仍记录 `forced`、估计复杂度、信号 `reasons` 与路由 `decisionReasons`。Gate 输出的 `maxConcurrency` 与 `expectedTaskCount` 是供 S3 Scheduler / 后续 S5 消费的建议，不会改变 S3 行为。
 
 模型 profile / 账号属于部署数据，不入库、不入测试（测试仅用 fixture 字符串）。
 

@@ -1,8 +1,8 @@
-# 架构（S3：Scheduler 内核纯核）
+# 架构（S4：Orchestration Gate 与 Scheduler 纯核）
 
 ## 控制面 / 执行面分离
 
-- **控制面（已实现）**：`Catalog`、`planDispatch`、Task Contract 校验、九态状态机、`TaskGraph` 与 `Scheduler`。它们都是内存纯核，无 I/O、网络、进程、worktree 或终端副作用。
+- **控制面（已实现）**：`Catalog`、`planDispatch`、Task Contract 校验、Orchestration Gate、九态状态机、`TaskGraph` 与 `Scheduler`。它们都是内存纯核，无 I/O、网络、进程、worktree 或终端副作用。
 - **执行面（S3 仅接口）**：`ExecutorPort` 是执行器边界，`FakeExecutor` 是离线测试 fake。它们不创建真实资源；Pi/herdr/进程适配器仍是后续切片。
 - 角色的 tools/capabilities 仍只是策略数据，**不是**沙箱；真正的运行时权限强制必须在执行面另行实现和测试。
 
@@ -13,7 +13,34 @@
 - exact-fields、稳定 ID、非空目标、字符串数组、重复/自引用依赖、验收标准、预算和重试参数都 fail closed；问题聚合为 `INVALID_CONTRACT`，包含 `code/message/path/issues`。
 - `depends_on` 在契约层只校验形状，不要求引用已存在；引用存在性由图层检查。
 - 成功结果是深度冻结副本；数组会复制，调用方输入不会被修改或冻结。
-- `verification` 只作为命令字符串存储，本阶段绝不执行。它可以为空，表示没有机械验证，仍须后续 Gate/裁决逻辑决定是否接受。
+- `verification` 只作为命令字符串存储，本阶段绝不执行。它可以为空，表示没有机械验证，仍须 S4 Gate/后续裁决逻辑决定如何处理；命令字符串不是执行授权。
+
+## S4 Orchestration Gate
+
+`planRoute(taskContract, gateOptions?)` 是规则版、可解释、可复现的路由估计器：不调用模型、不调 LLM、不创建 `TaskGraph`。它运行时先复用 S2 `validateTaskContract`，因此只接受经校验的 Task Contract；非法契约统一抛出带 `code/message/path/available`（并保留 issues）的结构化错误。它观察五类信号：
+
+- `files_in_scope` 数量：默认 2 个进入 medium、5 个进入 complex；
+- `acceptance_criteria` 数量：默认 3 / 6；
+- `verification` 命令数量：0 个表示验证不确定并贡献 medium 信号，4 个进入 complex；
+- 契约字符串总量（objective、context、files、criteria、verification、depends_on 的 UTF-16 字符数）：默认 500 / 2,000；
+- `depends_on` 数量：默认 1 / 3。
+
+每个 medium 信号计 1 分、complex 信号计 2 分；任一 complex 信号或达到默认 3 分即为 `complex`，有信号但未达到 complex 为 `medium`，否则为 `simple`。所有阈值和计划建议可通过 exact-fields 的 `GateConfig.thresholds` 覆盖，未知字段、Symbol、非 plain object、`null` 和无效枚举/整数均 fail closed。
+
+路由是不变式而不是执行命令：`simple -> single`（一个 worker，机械验证规划始终保留）；`medium -> plan`（预计 2 个任务、并发建议 1）；`complex -> plan`（预计 4 个任务、并发建议 2）。`RoutePlan.maxConcurrency` 和 `expectedTaskCount` 只是 S3 Scheduler / 后续 S5 的消费建议，`complexScore` 与 `score` 会随计划保留以便 reviewer 门槛重算并校验跨字段一致性；S4 不修改 S3 行为、不自动拆 DAG。
+
+`needsFreshReview` 的默认门槛是：`plan` 或 `complex` 必须 fresh review；`single + simple` 默认不需要；机械验证 `failed` 或 `uncertain` 时需要。`reviewer: 'always' | 'never'` 是同一结果中的消融开关；关闭 reviewer 不关闭 mechanical verification 规划。
+
+`mode: 'auto' | 'force-single' | 'force-plan'` 用于 S9 对照实验。`force-*` 绕过路由选择，结果仍保留规则估计的 `complexity`、`forced` 标记、信号对应的 `reasons` 和路由解释 `decisionReasons`。所有返回的 `RoutePlan` 与 reviewer 决策都是深度冻结快照。
+
+`needsFreshReview` 只做门槛决策，运行时严格校验传入的 `RoutePlan` 形状（plain object、exact-fields、枚举和嵌套 mechanical verification）；调用方必须传入未篡改的 `planRoute` 产物。形状合法不等于可证明来源，Gate 不提供对象 provenance 或执行授权。
+
+## 架构不变式
+
+- **single-agent first**：简单任务不过 DAG，不因“可编排”就默认编排。
+- **reviewer 按需**：fresh reviewer 只在中高复杂度、计划路由或验证结果失败/不确定时进入门槛。
+- **机制可关闭**：路由与 reviewer 都有明确的 auto/force 开关，为 S9 消融保留可复现对照。
+- **完成不等于验收**：Gate 只决定路由与门槛，不执行验证，也不把 agent/执行器完成文字当作 accepted。
 
 ## 九态状态机与 Attempt
 
@@ -79,7 +106,7 @@ baseMs * 2^(attemptsRecorded - 1) + rng() * jitterMs
 
 任务 ID 限制为不超过 64 个字符：这是事件键、attempt ID 组合和图错误路径的工程上界；因此 `taskId/attemptId` 标识符有界。错误消息回显经 `truncateForMessage` 有界；`issues`、`available`、事件 payload（包括完整的 `outcome/reason`）保留完整数据，属设计选择。事件流是 S7 事件日志的输入形状，但 S3 不持久化它。错误还带 `code/message/path/available`，状态错误带 `from/to`，不把模型声明、终端输出或完成文字当作工作流状态。
 
-## S3 已实现 / 未实现边界
+## S3/S4 已实现 / 未实现边界
 
 已实现：轮询式 `ExecutorPort` 与离线 `FakeExecutor`、READY 选择、并发上限、依赖门控、settle/verdict 驱动、参数化 retry/backoff、注入时间和 RNG、超时处置、只报告的 stuck 检测、取消在飞 attempt、重试耗尽和冻结结构化事件流。
 
@@ -87,11 +114,11 @@ baseMs * 2^(attemptsRecorded - 1) + rng() * jitterMs
 
 - 无持久化、恢复、跨进程并发协调或 S7 事件日志。
 - 无真实 Executor；不接 Pi/herdr，不创建进程、pane、worktree、终端或网络连接。
-- 无 S5 验证器/Gate，也没有 artifact revision 证据绑定；verdict 仍由调用方提交。
+- S4 Gate 只做规则估计、路由建议和 reviewer 门槛；无 S5 验证器、命令执行或 artifact revision 证据绑定，verdict 仍由调用方提交。
 - 不验证模型在线可用性、认证或 OS 级工具沙箱；Catalog capability 声明不是安全边界。
 
 ## 后续路线
 
-1. **验证与证据（S5）**：将 verdict 绑定到具体 artifact revision，并实现 Gate。
+1. **验证与证据（S5）**：执行 S4 规划的 mechanical verification，将 verdict 绑定到具体 artifact revision，并实现证据验收。
 2. **事件日志（S7）**：持久化 Scheduler 事件和任务图快照，支持恢复与审计。
 3. **Pi/herdr 适配（S8）**：在不污染纯核的前提下实现真实 ExecutorPort、进程和工作区策略。
