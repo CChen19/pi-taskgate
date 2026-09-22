@@ -1,0 +1,118 @@
+/**
+ * Prompt text handed to Pier subagents, and parsing of the reviewer's reply.
+ *
+ * Briefs are advisory text for the child agent. Nothing a child writes back is
+ * trusted except the reviewer verdict line, which is validated, bound to a
+ * one-time review id, and bound to the exact candidate revision.
+ */
+import type { TaskContract } from '../core/task-contract.ts';
+import { validateReviewVerdict, type ReviewBrief, type ReviewVerdict } from '../core/reviewer-brief.ts';
+
+export interface WorkerBriefInput {
+  readonly contract: TaskContract;
+  readonly attemptId: string;
+  readonly workspacePath: string;
+  readonly branch: string;
+  readonly baseRevision: string;
+  readonly feedback?: readonly string[];
+}
+
+export function renderWorkerBrief(input: WorkerBriefInput): string {
+  const { contract } = input;
+  const lines = [
+    `You are implementing task ${contract.id} (attempt ${input.attemptId}).`,
+    '',
+    `Working directory: ${input.workspacePath}`,
+    `Branch: ${input.branch} (created from ${input.baseRevision})`,
+    '',
+    'Objective:',
+    contract.objective,
+    '',
+    'Acceptance criteria:',
+    ...contract.acceptance_criteria.map((entry, index) => `${index + 1}. ${entry}`),
+    '',
+    'Files in scope (a trailing slash means a directory). Changing any other path fails the task:',
+    ...(contract.files_in_scope ?? []).map((entry) => `- ${entry}`),
+  ];
+  if (contract.context !== undefined && contract.context.length > 0) {
+    lines.push('', 'Context to read first:', ...contract.context.map((entry) => `- ${entry}`));
+  }
+  if (input.feedback !== undefined && input.feedback.length > 0) {
+    lines.push('', 'Feedback from the previous attempt (fix these):', ...input.feedback.map((entry) => `- ${entry}`));
+  }
+  lines.push(
+    '',
+    'The host will run these verification commands itself in this worktree after you finish:',
+    ...contract.verification.map((entry) => `- ${entry}`),
+    '',
+    'Rules:',
+    '- Work only inside the working directory above. Do not touch the main checkout.',
+    '- Commit your finished work to the current branch. Leave no uncommitted or untracked files.',
+    '- Never push, never merge, never rebase onto other branches.',
+    '- Your own claims (done, revision, tests passed) are not evidence; the host inspects git and runs verification.',
+    '- Finish with a short summary of what you changed and anything the coordinator should know.',
+  );
+  return lines.join('\n');
+}
+
+export const REVIEW_VERDICT_TAG = 'REVIEW_VERDICT';
+
+export function renderReviewerPrompt(brief: ReviewBrief, reviewId: string, taskId: string): string {
+  const evidence = brief.evidence.commands.map((command, index) => {
+    const outcome = brief.evidence.outcomes[index];
+    return `- \`${command.command}\` → exit ${outcome?.exitCode ?? '?'}${outcome?.timedOut === true ? ' (timed out)' : ''}`;
+  });
+  return [
+    `You are a fresh, independent reviewer for task ${taskId}. You did not write this change.`,
+    'Review the artifact below against the objective and acceptance criteria. Do not modify any file.',
+    'You may read files in the working directory to understand context.',
+    '',
+    `Artifact revision: ${brief.diff.artifactRevision}`,
+    '',
+    'Objective:',
+    brief.spec.objective,
+    '',
+    'Acceptance criteria:',
+    ...brief.spec.acceptance_criteria.map((entry, index) => `${index + 1}. ${entry}`),
+    '',
+    'Files in scope:',
+    ...brief.spec.files_in_scope.map((entry) => `- ${entry}`),
+    '',
+    'Host-run mechanical verification (already passed):',
+    ...evidence,
+    '',
+    'Patch (base...artifact):',
+    '```diff',
+    brief.diff.patch ?? '(patch unavailable)',
+    '```',
+    '',
+    'End your final message with exactly one line in this form and nothing after it:',
+    `${REVIEW_VERDICT_TAG} ${reviewId} {"outcome":"passed"|"rejected","reasons":["..."],"artifactRevision":"${brief.diff.artifactRevision}"}`,
+    'Use "rejected" if any acceptance criterion is unmet or the change is unsafe. Reasons must be concrete.',
+  ].join('\n');
+}
+
+export type ParsedReview =
+  | { readonly ok: true; readonly verdict: ReviewVerdict }
+  | { readonly ok: false; readonly reason: string };
+
+/** Parse the last verdict line of a reviewer's closing text. */
+export function parseReviewerOutcome(text: string, reviewId: string): ParsedReview {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.startsWith(`${REVIEW_VERDICT_TAG} `));
+  const line = lines[lines.length - 1];
+  if (line === undefined) return { ok: false, reason: `reviewer output has no ${REVIEW_VERDICT_TAG} line` };
+  const match = /^REVIEW_VERDICT\s+(\S+)\s+(\{.*\})$/.exec(line);
+  if (match === null) return { ok: false, reason: `${REVIEW_VERDICT_TAG} line is malformed` };
+  if (match[1] !== reviewId) return { ok: false, reason: 'review id does not match the issued brief' };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(match[2]!);
+  } catch {
+    return { ok: false, reason: 'verdict JSON is invalid' };
+  }
+  try {
+    return { ok: true, verdict: validateReviewVerdict(parsed) };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : 'verdict is invalid' };
+  }
+}

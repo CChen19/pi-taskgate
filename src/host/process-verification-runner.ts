@@ -54,3 +54,42 @@ export class ProcessVerificationRunner implements VerificationRunner {
   }
 }
 
+
+export interface AsyncVerificationRunner {
+  run(command: VerificationCommand): Promise<VerificationRunnerResult>;
+}
+
+/**
+ * Async twin of ProcessVerificationRunner for hosts that must keep their event
+ * loop alive (the Pi main session): same exact-match allowlist, minimal env,
+ * redaction, and bounded output.
+ */
+export class ProcessAsyncVerificationRunner implements AsyncVerificationRunner {
+  private readonly options: ProcessVerificationRunnerOptions;
+
+  constructor(options: ProcessVerificationRunnerOptions) {
+    if (options.allowedCommands.length === 0) throw new TypeError('verification runner requires an allowlist');
+    this.options = options;
+  }
+
+  async run(command: VerificationCommand): Promise<VerificationRunnerResult> {
+    if (!this.options.allowedCommands.includes(command.command)) throw new Error('verification command is not authorized');
+    const env = minimalProcessEnv(this.options.env);
+    const timeoutMs = command.timeoutMs ?? this.options.defaultTimeoutMs;
+    const result = await this.options.commandRunner.runAsync({
+      command: 'bash',
+      args: ['-lc', command.command],
+      cwd: command.cwd ?? this.options.cwd,
+      env,
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      ...(this.options.maxOutputBytes === undefined ? {} : { maxOutputBytes: this.options.maxOutputBytes }),
+    }).promise;
+    const output = redact([result.stdout, result.stderr].filter((part) => part.length > 0).join('\n'), this.options.env ?? {});
+    return {
+      exitCode: result.exitCode === null ? 1 : result.exitCode,
+      timedOut: result.timedOut,
+      output,
+      outputRef: `verification:${createHash('sha256').update(command.command, 'utf8').digest('hex').slice(0, 32)}`,
+    };
+  }
+}

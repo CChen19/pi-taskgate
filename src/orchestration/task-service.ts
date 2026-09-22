@@ -1,0 +1,573 @@
+/**
+ * Deterministic orchestration primitives for a Pi main agent.
+ *
+ * The main agent decides what to do next; this service supplies ground truth
+ * and enforces invariants. It never spawns agents (Pier does that), never
+ * trusts a worker's claims, and never lets completion imply acceptance:
+ *
+ *   start (host-owned worktree) → worker runs in a Pier pane → verify
+ *   (host git inspection + scope + allowlisted commands) → optional fresh
+ *   review bound to the exact revision → PASSED.
+ *
+ * Every mutation is a TaskBoard event. An event is trial-applied to a replayed
+ * board before it is persisted, so a refused operation leaves state unchanged.
+ */
+import { randomBytes } from 'node:crypto';
+import { checkArtifact } from '../adapters/artifact-check.ts';
+import type { WorktreeManager, WorktreePort, WorkspaceLease, WorkspaceInspection, WorktreeSessionBinding } from '../adapters/worktree-manager.ts';
+import { assembleReviewerBrief, decideFinalVerdict } from '../core/reviewer-brief.ts';
+import { validateTaskContract, type TaskContract } from '../core/task-contract.ts';
+import { decideVerdict, validateEvidenceBundle, type EvidenceBundle, type VerificationCommand, type VerificationOutcome } from '../core/verification.ts';
+import { isPlainObject } from '../core/validate.ts';
+import type { AsyncVerificationRunner } from '../host/process-verification-runner.ts';
+import type { WorkerLedger } from '../host/pier-ledger.ts';
+import type { RoleCheck } from '../host/pier-roles.ts';
+import { parseReviewerOutcome, renderReviewerPrompt, renderWorkerBrief } from './briefs.ts';
+import { replayTaskBoard, TaskBoard, TaskBoardError, type AttemptRecord, type CandidateRecord, type CheckStage, type TaskEvent, type TaskView } from './task-board.ts';
+
+export interface TaskServiceSettings {
+  readonly verificationAllowlist: readonly string[];
+  readonly verificationTimeoutMs: number;
+  readonly reviewerRole: string;
+  readonly maxChecksPerAttempt: number;
+  readonly defaultMaxAttempts: number;
+}
+
+export interface TaskServicePorts {
+  readonly worktrees: WorktreeManager;
+  readonly worktreePort: WorktreePort;
+  /** Full object id of the main checkout HEAD, read by the host. */
+  headRevision(): string;
+  readDiff(workspacePath: string, baseRevision: string, artifactRevision: string): string;
+  readonly verifier: AsyncVerificationRunner;
+  readonly ledger: WorkerLedger;
+  checkReviewerRole(): RoleCheck;
+  clock(): number;
+  /** Durable sink (Pi session custom entry). Throwing aborts the operation. */
+  persist(event: TaskEvent): void;
+  randomId?(): string;
+}
+
+export type ServiceErrorCode =
+  | 'INVALID_INPUT'
+  | 'UNKNOWN_TASK'
+  | 'NOT_READY'
+  | 'INVALID_STATE'
+  | 'BUDGET_EXHAUSTED'
+  | 'LEASE_UNAVAILABLE'
+  | 'WORKER_UNBOUND'
+  | 'WORKER_NOT_FOUND'
+  | 'WORKER_RUNNING'
+  | 'INSPECTION_FAILED'
+  | 'VERIFICATION_ERROR'
+  | 'ROLE_NOT_READ_ONLY'
+  | 'REVIEW_NOT_REQUESTED'
+  | 'REVIEWER_INVALID'
+  | 'REVIEW_UNPARSEABLE'
+  | 'REVISION_MISMATCH'
+  | 'STATE_REJECTED';
+
+export class TaskServiceError extends Error {
+  readonly code: ServiceErrorCode;
+  constructor(code: ServiceErrorCode, message: string) {
+    super(message);
+    this.name = 'TaskServiceError';
+    this.code = code;
+  }
+}
+
+function fail(code: ServiceErrorCode, message: string): never {
+  throw new TaskServiceError(code, message);
+}
+
+export interface SpawnHint {
+  readonly description: string;
+  readonly cwd: string;
+  readonly role?: string;
+  readonly run_in_background: true;
+}
+
+export interface StartResult {
+  readonly taskId: string;
+  readonly state: string;
+  readonly attemptId?: string;
+  readonly workspacePath?: string;
+  readonly branch?: string;
+  readonly baseRevision?: string;
+  readonly reusedFrom?: string;
+  readonly prompt?: string;
+  readonly spawn?: SpawnHint;
+  readonly reason?: string;
+}
+
+export interface CommandReport {
+  readonly command: string;
+  readonly exitCode: number;
+  readonly timedOut: boolean;
+  readonly durationMs: number;
+  /** Last part of the (redacted) output; returned to the caller, never persisted. */
+  readonly outputTail: string;
+}
+
+export interface VerifyResult {
+  readonly taskId: string;
+  readonly attemptId: string;
+  readonly outcome: 'check_failed' | 'attempt_failed' | 'awaiting_review' | 'passed';
+  readonly state: string;
+  readonly revision?: string;
+  readonly changedPaths?: readonly string[];
+  readonly reasons: readonly string[];
+  readonly commands: readonly CommandReport[];
+  readonly checksUsed: number;
+  readonly checksAllowed: number;
+}
+
+export interface ReviewBriefResult {
+  readonly taskId: string;
+  readonly outcome: 'review_requested' | 'rejected';
+  readonly state: string;
+  readonly reviewId?: string;
+  readonly revision?: string;
+  readonly prompt?: string;
+  readonly spawn?: SpawnHint;
+  readonly reasons: readonly string[];
+}
+
+export interface ReviewRecordResult {
+  readonly taskId: string;
+  readonly state: string;
+  readonly verdict: 'passed' | 'rejected';
+  readonly revision: string;
+  readonly reasons: readonly string[];
+}
+
+const AGENT_ID = /^[A-Za-z0-9:._-]{1,128}$/;
+const FULL_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const OUTPUT_TAIL = 2000;
+
+function tail(value: string | undefined): string {
+  if (value === undefined) return '';
+  return value.length <= OUTPUT_TAIL ? value : `…${value.slice(-OUTPUT_TAIL)}`;
+}
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export class TaskService {
+  private board = new TaskBoard();
+  private readonly ports: TaskServicePorts;
+  private readonly settings: TaskServiceSettings;
+  /** Live lease objects owned by the WorktreeManager, keyed by ownership token. */
+  private readonly leases = new Map<string, WorkspaceLease>();
+  private readonly leaseErrors = new Map<string, string>();
+
+  constructor(ports: TaskServicePorts, settings: TaskServiceSettings) {
+    this.ports = ports;
+    this.settings = settings;
+  }
+
+  /** Rebuild from persisted events and re-adopt host-owned worktree leases. */
+  restore(events: readonly TaskEvent[]): { readonly tasks: number; readonly leaseErrors: readonly string[] } {
+    const board = replayTaskBoard(events);
+    this.board = board;
+    this.leaseErrors.clear();
+    for (const task of board.tasks()) {
+      for (const attempt of task.attemptRecords) {
+        const token = attempt.lease.ownershipToken;
+        if (this.leases.has(token) || this.leaseErrors.has(token)) continue;
+        try {
+          const adopted = this.ports.worktrees.adoptLease(this.ports.worktreePort, attempt.lease, this.binding(attempt.lease, task.contract));
+          this.leases.set(token, adopted);
+        } catch (error) {
+          this.leaseErrors.set(token, `${task.id}/${attempt.attemptId}: ${message(error)}`);
+        }
+      }
+    }
+    return { tasks: board.tasks().length, leaseErrors: [...this.leaseErrors.values()] };
+  }
+
+  status(): readonly TaskView[] {
+    return this.board.tasks();
+  }
+
+  task(taskId: string): TaskView {
+    const view = this.board.task(taskId);
+    if (view === undefined) fail('UNKNOWN_TASK', `unknown task ${taskId}; known: ${this.board.tasks().map((task) => task.id).join(', ') || '(none)'}`);
+    return view;
+  }
+
+  readySet(): readonly string[] {
+    return this.board.readySet();
+  }
+
+  /** Add tasks. Validates everything before any state changes. */
+  plan(inputs: unknown): readonly TaskView[] {
+    if (!Array.isArray(inputs) || inputs.length === 0) fail('INVALID_INPUT', 'tasks must be a non-empty array');
+    const parsed: { contract: TaskContract; reviewRequired: boolean }[] = [];
+    const problems: string[] = [];
+    for (const [index, raw] of inputs.entries()) {
+      if (!isPlainObject(raw)) { problems.push(`tasks[${index}] must be an object`); continue; }
+      const { review_required: reviewRaw, ...rest } = raw as Record<string, unknown>;
+      if (reviewRaw !== undefined && typeof reviewRaw !== 'boolean') problems.push(`tasks[${index}].review_required must be boolean`);
+      const candidate = rest.retry === undefined ? { ...rest, retry: { max_attempts: this.settings.defaultMaxAttempts } } : rest;
+      const validated = validateTaskContract(candidate);
+      if (!validated.ok) { problems.push(`tasks[${index}]: ${validated.error.message}`); continue; }
+      const contract = validated.contract;
+      if ((contract.files_in_scope ?? []).length === 0) problems.push(`${contract.id}: files_in_scope must list at least one path`);
+      if (contract.verification.length === 0) problems.push(`${contract.id}: verification must list at least one command`);
+      const unauthorized = contract.verification.filter((command) => !this.settings.verificationAllowlist.includes(command));
+      if (unauthorized.length > 0) problems.push(`${contract.id}: verification commands not in the host allowlist: ${unauthorized.join(' | ')} (allowed: ${this.settings.verificationAllowlist.join(' | ')})`);
+      parsed.push({ contract, reviewRequired: reviewRaw === undefined ? true : reviewRaw as boolean });
+    }
+    const ids = new Set<string>();
+    for (const { contract } of parsed) {
+      if (ids.has(contract.id) || this.board.has(contract.id)) problems.push(`${contract.id}: duplicate task id`);
+      ids.add(contract.id);
+    }
+    for (const { contract } of parsed) {
+      for (const dependency of contract.depends_on) {
+        if (!ids.has(dependency) && !this.board.has(dependency)) problems.push(`${contract.id}: unknown dependency ${dependency}`);
+      }
+    }
+    if (problems.length > 0) fail('INVALID_INPUT', problems.join('; '));
+    const ordered = this.topologicalOrder(parsed);
+    this.commit({ v: 1, type: 'plan', at: this.ports.clock(), tasks: ordered });
+    return ordered.map(({ contract }) => this.task(contract.id));
+  }
+
+  start(taskId: string, options: { readonly reuseWorktree?: boolean; readonly baseTask?: string } = {}): StartResult {
+    const task = this.task(taskId);
+    if (task.state !== 'READY' && task.state !== 'RETRYING') {
+      fail('NOT_READY', `${taskId} is ${task.state}${task.unmetDependencies.length > 0 ? `; waiting on ${task.unmetDependencies.join(', ')}` : ''}`);
+    }
+    if (task.unmetDependencies.length > 0) fail('NOT_READY', `${taskId} is waiting on ${task.unmetDependencies.join(', ')}`);
+    const limit = Math.max(1, task.contract.retry?.max_attempts ?? 0);
+    if (task.attemptRecords.length >= limit) {
+      if (task.state === 'RETRYING') {
+        // Let the state machine record budget exhaustion; no workspace is created.
+        this.commit({ v: 1, type: 'start', at: this.ports.clock(), taskId, attemptId: `${taskId}:attempt-${task.attemptRecords.length + 1}`, lease: task.attemptRecords[task.attemptRecords.length - 1]!.lease });
+        return { taskId, state: this.task(taskId).state, reason: `retry budget exhausted (${limit} attempts)` };
+      }
+      fail('BUDGET_EXHAUSTED', `${taskId} has used ${task.attemptRecords.length}/${limit} attempts`);
+    }
+    const attemptId = `${taskId}:attempt-${task.attemptRecords.length + 1}`;
+    const previous = task.attemptRecords[task.attemptRecords.length - 1];
+    let lease: WorkspaceLease;
+    let fresh = false;
+    let reusedFrom: string | undefined;
+    if (options.reuseWorktree === true) {
+      if (previous === undefined) fail('INVALID_INPUT', `${taskId} has no previous attempt to reuse`);
+      if (options.baseTask !== undefined) fail('INVALID_INPUT', 'base_task cannot be combined with reuse_worktree');
+      lease = this.liveLease(previous);
+      reusedFrom = previous.attemptId;
+    } else {
+      const base = this.resolveBase(task, options.baseTask);
+      try {
+        lease = this.ports.worktrees.acquire(this.ports.worktreePort, taskId, attemptId, base);
+        this.ports.worktrees.bindSession(this.ports.worktreePort, lease, this.binding(lease, task.contract));
+      } catch (error) {
+        fail('LEASE_UNAVAILABLE', `could not create worktree for ${taskId}: ${message(error)}`);
+      }
+      fresh = true;
+    }
+    try {
+      this.commit({ v: 1, type: 'start', at: this.ports.clock(), taskId, attemptId, lease, ...(reusedFrom === undefined ? {} : { reusedFrom }) });
+    } catch (error) {
+      if (fresh) this.ports.worktrees.cleanup(this.ports.worktreePort, lease);
+      throw error;
+    }
+    this.leases.set(lease.ownershipToken, lease);
+    const feedback = previous === undefined ? [] : this.feedbackFrom(previous);
+    return {
+      taskId,
+      state: this.task(taskId).state,
+      attemptId,
+      workspacePath: lease.workspacePath,
+      branch: lease.branch,
+      baseRevision: lease.baseRevision,
+      ...(reusedFrom === undefined ? {} : { reusedFrom }),
+      prompt: renderWorkerBrief({ contract: task.contract, attemptId, workspacePath: lease.workspacePath, branch: lease.branch, baseRevision: lease.baseRevision, feedback }),
+      spawn: { description: `${taskId}:impl`, cwd: lease.workspacePath, run_in_background: true },
+    };
+  }
+
+  /** Associate the Pier pane running the current attempt. Checked against Pier's ledger. */
+  bind(taskId: string, agentId: string): AttemptRecord {
+    if (typeof agentId !== 'string' || !AGENT_ID.test(agentId)) fail('INVALID_INPUT', 'agent_id must be a Pier pane id');
+    const task = this.task(taskId);
+    if (task.state !== 'RUNNING') fail('INVALID_STATE', `${taskId} is ${task.state}; bind requires RUNNING`);
+    const attempt = this.currentAttempt(task);
+    const row = this.ports.ledger.latest(attempt.lease.workspacePath, agentId);
+    if (row === undefined) fail('WORKER_NOT_FOUND', `Pier has no subagent ${agentId} launched in ${attempt.lease.workspacePath}; spawn it with cwd set to that path`);
+    if (row.kind === this.settings.reviewerRole) fail('INVALID_INPUT', `${agentId} runs the reviewer role and cannot implement`);
+    if (attempt.reusedFrom === undefined && row.createdAt < attempt.startedAt) fail('INVALID_INPUT', `${agentId} was launched before ${attempt.attemptId} started`);
+    this.commit({ v: 1, type: 'bind', at: this.ports.clock(), taskId, attemptId: attempt.attemptId, agentId });
+    return this.currentAttempt(this.task(taskId));
+  }
+
+  /** Host inspection + scope + allowlisted verification of the current attempt. */
+  async verify(taskId: string): Promise<VerifyResult> {
+    const task = this.task(taskId);
+    if (task.state !== 'RUNNING') fail('INVALID_STATE', `${taskId} is ${task.state}; verify requires RUNNING${task.state === 'VERIFYING' ? ' (already verified; request or record a review)' : ''}`);
+    const attempt = this.currentAttempt(task);
+    if (attempt.agentId === undefined) fail('WORKER_UNBOUND', `${taskId} has no bound worker; call task_bind with the Pier agent id first`);
+    const row = this.ports.ledger.latest(attempt.lease.workspacePath, attempt.agentId);
+    if (row === undefined) fail('WORKER_NOT_FOUND', `Pier ledger has no row for ${attempt.agentId} in ${attempt.lease.workspacePath}`);
+    if (row.status === 'running') fail('WORKER_RUNNING', `worker ${attempt.agentId} is still running; wait for its settlement notice`);
+    const lease = this.liveLease(attempt);
+    const inspection = this.inspect(lease);
+    const check = checkArtifact(inspection, task.contract.files_in_scope ?? []);
+    if (!check.ok) return this.checkFailed(task, attempt, 'artifact', check.reasons, inspection.artifactRevision, undefined, []);
+
+    const commands: VerificationCommand[] = task.contract.verification.map((command) => ({ command, cwd: lease.workspacePath, timeoutMs: this.settings.verificationTimeoutMs }));
+    const outcomes: VerificationOutcome[] = [];
+    const reports: CommandReport[] = [];
+    const startedAt = this.ports.clock();
+    for (const command of commands) {
+      const commandStartedAt = this.ports.clock();
+      let result: Awaited<ReturnType<AsyncVerificationRunner['run']>>;
+      try {
+        result = await this.ports.verifier.run(command);
+      } catch (error) {
+        fail('VERIFICATION_ERROR', `verification command could not run: ${message(error)}`);
+      }
+      const durationMs = Math.max(0, this.ports.clock() - commandStartedAt);
+      outcomes.push({ exitCode: result.exitCode, durationMs, timedOut: result.timedOut, ...(result.output === undefined ? {} : { output: result.output }), ...(result.outputRef === undefined ? {} : { outputRef: result.outputRef }) });
+      reports.push({ command: command.command, exitCode: result.exitCode, timedOut: result.timedOut, durationMs, outputTail: tail(result.output) });
+    }
+    let evidence: EvidenceBundle;
+    try {
+      evidence = validateEvidenceBundle({ taskId, attemptId: attempt.attemptId, artifactRevision: inspection.artifactRevision, commands, outcomes, startedAt, endedAt: Math.max(startedAt, this.ports.clock()) });
+    } catch (error) {
+      fail('VERIFICATION_ERROR', `verification evidence is invalid: ${message(error)}`);
+    }
+    const after = this.inspect(lease);
+    if (after.artifactRevision !== inspection.artifactRevision) {
+      return this.checkFailed(task, attempt, 'verification', [`HEAD moved during verification (${inspection.artifactRevision} → ${after.artifactRevision})`], after.artifactRevision, evidence, reports);
+    }
+    const verdict = decideVerdict(evidence, { minimumCommands: 1 });
+    if (verdict.verdict === 'rejected') return this.checkFailed(task, attempt, 'verification', verdict.reasons, inspection.artifactRevision, evidence, reports);
+
+    const candidate: CandidateRecord = { revision: inspection.artifactRevision, changedPaths: check.changedPaths, evidence, verdict };
+    this.commit({ v: 1, type: 'settle', at: this.ports.clock(), taskId, attemptId: attempt.attemptId, candidate });
+    if (!task.reviewRequired) {
+      this.commit({ v: 1, type: 'verdict', at: this.ports.clock(), taskId, attemptId: attempt.attemptId, verdict: 'passed', source: 'mechanical', reasons: ['mechanical verification passed; review not required'] });
+    }
+    const after2 = this.task(taskId);
+    return {
+      taskId,
+      attemptId: attempt.attemptId,
+      outcome: task.reviewRequired ? 'awaiting_review' : 'passed',
+      state: after2.state,
+      revision: candidate.revision,
+      changedPaths: candidate.changedPaths,
+      reasons: [],
+      commands: reports,
+      checksUsed: attempt.checks.length,
+      checksAllowed: this.settings.maxChecksPerAttempt,
+    };
+  }
+
+  /** Issue a fresh-review brief bound to the settled candidate revision. */
+  reviewBrief(taskId: string): ReviewBriefResult {
+    const task = this.task(taskId);
+    if (task.state !== 'VERIFYING') fail('INVALID_STATE', `${taskId} is ${task.state}; a review brief requires VERIFYING`);
+    if (!task.reviewRequired) fail('INVALID_STATE', `${taskId} does not require review`);
+    const attempt = this.currentAttempt(task);
+    const candidate = attempt.candidate;
+    if (candidate === undefined) fail('INVALID_STATE', `${taskId} has no settled candidate`);
+    const role = this.ports.checkReviewerRole();
+    if (!role.ok) fail('ROLE_NOT_READ_ONLY', `reviewer role refused: ${role.reason}`);
+    const lease = this.liveLease(attempt);
+    const guard = this.guardCandidate(task, attempt, lease, candidate);
+    if (guard !== undefined) return { taskId, outcome: 'rejected', state: this.task(taskId).state, reasons: guard };
+    let diff: string;
+    try {
+      diff = this.ports.readDiff(lease.workspacePath, lease.baseRevision, candidate.revision);
+    } catch (error) {
+      fail('INSPECTION_FAILED', `could not read the artifact diff: ${message(error)}`);
+    }
+    const brief = assembleReviewerBrief({ spec: { objective: task.contract.objective, acceptance_criteria: task.contract.acceptance_criteria, files_in_scope: task.contract.files_in_scope ?? [] }, artifactRevision: candidate.revision, diff, evidence: candidate.evidence });
+    const reviewId = this.ports.randomId?.() ?? randomBytes(8).toString('hex');
+    this.commit({ v: 1, type: 'review_requested', at: this.ports.clock(), taskId, attemptId: attempt.attemptId, reviewId, revision: candidate.revision });
+    return {
+      taskId,
+      outcome: 'review_requested',
+      state: this.task(taskId).state,
+      reviewId,
+      revision: candidate.revision,
+      prompt: renderReviewerPrompt(brief, reviewId, taskId),
+      spawn: { description: `${taskId}:review`, cwd: lease.workspacePath, role: this.settings.reviewerRole, run_in_background: true },
+      reasons: [],
+    };
+  }
+
+  /** Read the reviewer's closing text from Pier's ledger and apply the verdict. */
+  recordReview(taskId: string, agentId: string): ReviewRecordResult {
+    if (typeof agentId !== 'string' || !AGENT_ID.test(agentId)) fail('INVALID_INPUT', 'agent_id must be a Pier pane id');
+    const task = this.task(taskId);
+    if (task.state !== 'VERIFYING') fail('INVALID_STATE', `${taskId} is ${task.state}; recording a review requires VERIFYING`);
+    const attempt = this.currentAttempt(task);
+    const candidate = attempt.candidate;
+    const review = attempt.review;
+    if (candidate === undefined || review === undefined) fail('REVIEW_NOT_REQUESTED', `${taskId} has no outstanding review; call task_review_brief first`);
+    const implementers = new Set(task.attemptRecords.map((record) => record.agentId).filter((id): id is string => id !== undefined));
+    if (implementers.has(agentId)) fail('REVIEWER_INVALID', `${agentId} implemented ${taskId} and cannot review it`);
+    const row = this.ports.ledger.latest(attempt.lease.workspacePath, agentId);
+    if (row === undefined) fail('WORKER_NOT_FOUND', `Pier has no subagent ${agentId} launched in ${attempt.lease.workspacePath}`);
+    if (row.status === 'running') fail('WORKER_RUNNING', `reviewer ${agentId} is still running; wait for its settlement notice`);
+    if (row.kind !== this.settings.reviewerRole) fail('REVIEWER_INVALID', `${agentId} ran role "${row.kind}", not the read-only reviewer role "${this.settings.reviewerRole}"`);
+    if (row.revivedFrom !== null) fail('REVIEWER_INVALID', `${agentId} is a revived session, not a fresh reviewer`);
+    if (row.createdAt < review.issuedAt) fail('REVIEWER_INVALID', `${agentId} was launched before review ${review.reviewId} was issued`);
+    if (row.outcome === null || row.outcome.trim().length === 0) fail('REVIEW_UNPARSEABLE', `reviewer ${agentId} has no closing output in the ledger`);
+    const parsed = parseReviewerOutcome(row.outcome, review.reviewId);
+    if (!parsed.ok) fail('REVIEW_UNPARSEABLE', `${parsed.reason}; ask the reviewer (subagent send) to end with the required verdict line`);
+    if (parsed.verdict.artifactRevision !== candidate.revision) fail('REVISION_MISMATCH', `review is for ${parsed.verdict.artifactRevision}, candidate is ${candidate.revision}`);
+    const lease = this.liveLease(attempt);
+    const guard = this.guardCandidate(task, attempt, lease, candidate);
+    if (guard !== undefined) return { taskId, state: this.task(taskId).state, verdict: 'rejected', revision: candidate.revision, reasons: guard };
+    const final = decideFinalVerdict(candidate.verdict, parsed.verdict, true);
+    const verdict = final === 'passed' ? 'passed' : 'rejected';
+    this.commit({ v: 1, type: 'verdict', at: this.ports.clock(), taskId, attemptId: attempt.attemptId, verdict, source: 'review', reasons: [...parsed.verdict.reasons], reviewerAgentId: agentId, review: parsed.verdict });
+    return { taskId, state: this.task(taskId).state, verdict, revision: candidate.revision, reasons: parsed.verdict.reasons };
+  }
+
+  /** Main-agent decision to give up on the current attempt (retry budget applies). */
+  abandon(taskId: string, reason: string, terminal = false): TaskView {
+    if (typeof reason !== 'string' || reason.trim().length === 0) fail('INVALID_INPUT', 'reason is required');
+    const task = this.task(taskId);
+    const attempt = this.currentAttempt(task);
+    if (task.state === 'RUNNING') {
+      this.commit({ v: 1, type: 'attempt_failed', at: this.ports.clock(), taskId, attemptId: attempt.attemptId, reason, terminal });
+    } else if (task.state === 'VERIFYING') {
+      this.commit({ v: 1, type: 'verdict', at: this.ports.clock(), taskId, attemptId: attempt.attemptId, verdict: 'rejected', source: 'abandon', reasons: [reason] });
+    } else {
+      fail('INVALID_STATE', `${taskId} is ${task.state}; only RUNNING or VERIFYING attempts can be abandoned`);
+    }
+    return this.task(taskId);
+  }
+
+  cancel(taskId: string, reason: string): TaskView {
+    if (typeof reason !== 'string' || reason.trim().length === 0) fail('INVALID_INPUT', 'reason is required');
+    this.task(taskId);
+    this.commit({ v: 1, type: 'cancel', at: this.ports.clock(), taskId, reason });
+    return this.task(taskId);
+  }
+
+  // ── internals ──────────────────────────────────────────────────────
+
+  private commit(event: TaskEvent): void {
+    let trial: TaskBoard;
+    try {
+      trial = replayTaskBoard([...this.board.events(), event]);
+    } catch (error) {
+      if (error instanceof TaskBoardError) fail('STATE_REJECTED', error.message);
+      throw error;
+    }
+    this.ports.persist(event);
+    this.board = trial;
+  }
+
+  private checkFailed(task: TaskView, attempt: AttemptRecord, stage: CheckStage, reasons: readonly string[], revision: string | undefined, evidence: EvidenceBundle | undefined, commands: readonly CommandReport[]): VerifyResult {
+    this.commit({ v: 1, type: 'check_failed', at: this.ports.clock(), taskId: task.id, attemptId: attempt.attemptId, stage, reasons: [...reasons], ...(revision === undefined ? {} : { revision }), ...(evidence === undefined ? {} : { evidence }) });
+    const used = attempt.checks.length + 1;
+    let outcome: VerifyResult['outcome'] = 'check_failed';
+    if (used >= this.settings.maxChecksPerAttempt) {
+      this.commit({ v: 1, type: 'attempt_failed', at: this.ports.clock(), taskId: task.id, attemptId: attempt.attemptId, reason: `${used} failed checks in one attempt (limit ${this.settings.maxChecksPerAttempt})`, terminal: false });
+      outcome = 'attempt_failed';
+    }
+    return {
+      taskId: task.id,
+      attemptId: attempt.attemptId,
+      outcome,
+      state: this.task(task.id).state,
+      ...(revision === undefined ? {} : { revision }),
+      reasons: [...reasons],
+      commands,
+      checksUsed: used,
+      checksAllowed: this.settings.maxChecksPerAttempt,
+    };
+  }
+
+  /** Re-inspect before a review decision: the candidate must still be HEAD and clean. */
+  private guardCandidate(task: TaskView, attempt: AttemptRecord, lease: WorkspaceLease, candidate: CandidateRecord): readonly string[] | undefined {
+    const inspection = this.inspect(lease);
+    const reasons: string[] = [];
+    if (inspection.artifactRevision !== candidate.revision) reasons.push(`artifact changed after verification (${candidate.revision} → ${inspection.artifactRevision})`);
+    if (inspection.clean !== true) reasons.push('worktree became dirty after verification');
+    if (reasons.length === 0) return undefined;
+    this.commit({ v: 1, type: 'verdict', at: this.ports.clock(), taskId: task.id, attemptId: attempt.attemptId, verdict: 'rejected', source: 'guard', reasons });
+    return reasons;
+  }
+
+  private inspect(lease: WorkspaceLease): WorkspaceInspection {
+    try {
+      return this.ports.worktrees.inspect(this.ports.worktreePort, lease);
+    } catch (error) {
+      fail('INSPECTION_FAILED', `host inspection of ${lease.workspacePath} failed: ${message(error)}`);
+    }
+  }
+
+  private liveLease(attempt: AttemptRecord): WorkspaceLease {
+    const token = attempt.lease.ownershipToken;
+    const lease = this.leases.get(token);
+    if (lease !== undefined) return lease;
+    fail('LEASE_UNAVAILABLE', this.leaseErrors.get(token) ?? `worktree lease for ${attempt.attemptId} is not owned by this session`);
+  }
+
+  private currentAttempt(task: TaskView): AttemptRecord {
+    const attempt = task.attemptRecords[task.attemptRecords.length - 1];
+    if (attempt === undefined) fail('INVALID_STATE', `${task.id} has no attempt`);
+    return attempt;
+  }
+
+  private resolveBase(task: TaskView, baseTask: string | undefined): string {
+    if (baseTask === undefined) {
+      let head: string;
+      try { head = this.ports.headRevision().trim(); } catch (error) { fail('INSPECTION_FAILED', `could not read HEAD: ${message(error)}`); }
+      if (!FULL_OBJECT_ID.test(head)) fail('INSPECTION_FAILED', 'HEAD is not a full object id');
+      return head;
+    }
+    if (!task.contract.depends_on.includes(baseTask)) fail('INVALID_INPUT', `base_task ${baseTask} is not a dependency of ${task.id}`);
+    const base = this.task(baseTask);
+    const revision = base.state === 'PASSED' ? base.attemptRecords[base.attemptRecords.length - 1]?.candidate?.revision : undefined;
+    if (revision === undefined) fail('INVALID_INPUT', `base_task ${baseTask} has no accepted revision`);
+    return revision;
+  }
+
+  private feedbackFrom(previous: AttemptRecord): readonly string[] {
+    const reasons = [...(previous.verdict?.reasons ?? []), ...(previous.failure === undefined ? [] : [previous.failure.reason])];
+    const lastCheck = previous.checks[previous.checks.length - 1];
+    if (reasons.length === 0 && lastCheck !== undefined) reasons.push(...lastCheck.reasons);
+    return reasons.slice(0, 10);
+  }
+
+  private binding(lease: WorkspaceLease, contract: TaskContract): WorktreeSessionBinding {
+    return {
+      taskId: lease.taskId,
+      attemptId: lease.attemptId,
+      sessionId: lease.attemptId,
+      roleId: 'implementer',
+      modelProfileId: 'pier-managed',
+      filesInScope: contract.files_in_scope ?? [],
+      baseRevision: lease.baseRevision,
+      workspacePath: lease.workspacePath,
+      branch: lease.branch,
+      ownershipToken: lease.ownershipToken,
+      managedMarker: lease.managedMarker,
+    };
+  }
+
+  private topologicalOrder(items: readonly { contract: TaskContract; reviewRequired: boolean }[]): { contract: TaskContract; reviewRequired: boolean }[] {
+    const pending = new Map(items.map((item) => [item.contract.id, item]));
+    const ordered: { contract: TaskContract; reviewRequired: boolean }[] = [];
+    while (pending.size > 0) {
+      const next = [...pending.values()].find((item) => item.contract.depends_on.every((dependency) => !pending.has(dependency)));
+      if (next === undefined) fail('INVALID_INPUT', `dependency cycle among: ${[...pending.keys()].join(', ')}`);
+      ordered.push(next);
+      pending.delete(next.contract.id);
+    }
+    return ordered;
+  }
+}
