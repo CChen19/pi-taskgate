@@ -26,8 +26,39 @@ export interface CandidateRecord {
   readonly verdict: VerificationVerdict;
 }
 
+/** One accepted candidate entering an integration, pinned to its exact revision. */
+export interface IntegrationInput {
+  readonly taskId: string;
+  readonly revision: string;
+  /** Commits of base..revision, oldest first; these are what gets cherry-picked. */
+  readonly commits: readonly string[];
+  /** Where the acceptance evidence came from ("this session" or a session file path). */
+  readonly source: string;
+  readonly implementerAgentIds: readonly string[];
+  readonly reviewerAgentId: string;
+  readonly reviewId: string;
+}
+
+export interface IntegrationSpec {
+  readonly baseRevision: string;
+  readonly inputs: readonly IntegrationInput[];
+}
+
+export interface AppliedCommit {
+  readonly source: string;
+  readonly integrated: string;
+}
+
+export interface IntegrationRecord {
+  readonly applied: readonly AppliedCommit[];
+  readonly revision?: string;
+  readonly conflict?: { readonly input: string; readonly commit: string; readonly paths: readonly string[]; readonly detail: string };
+}
+
 export type TaskEvent =
-  | { readonly v: 1; readonly type: 'plan'; readonly at: number; readonly tasks: readonly { readonly contract: TaskContract; readonly reviewRequired: boolean }[] }
+  | { readonly v: 1; readonly type: 'plan'; readonly at: number; readonly tasks: readonly { readonly contract: TaskContract; readonly reviewRequired: boolean; readonly integration?: IntegrationSpec }[] }
+  | { readonly v: 1; readonly type: 'integration_applied'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly applied: readonly AppliedCommit[]; readonly revision: string }
+  | { readonly v: 1; readonly type: 'integration_conflict'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly applied: readonly AppliedCommit[]; readonly input: string; readonly commit: string; readonly paths: readonly string[]; readonly detail: string }
   | { readonly v: 1; readonly type: 'start'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly lease: WorkspaceLease; readonly reusedFrom?: string }
   | { readonly v: 1; readonly type: 'bind'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly agentId: string }
   | { readonly v: 1; readonly type: 'check_failed'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly stage: CheckStage; readonly reasons: readonly string[]; readonly revision?: string; readonly evidence?: EvidenceBundle }
@@ -65,10 +96,12 @@ export interface AttemptRecord {
   readonly review?: ReviewRecord;
   readonly verdict?: { readonly verdict: 'passed' | 'rejected'; readonly source: VerdictSource; readonly reasons: readonly string[]; readonly at: number };
   readonly failure?: { readonly reason: string; readonly terminal: boolean; readonly at: number };
+  readonly integration?: IntegrationRecord;
 }
 
 export interface TaskView extends TaskSnapshot {
   readonly reviewRequired: boolean;
+  readonly integration?: IntegrationSpec;
   readonly unmetDependencies: readonly string[];
   readonly attemptRecords: readonly AttemptRecord[];
   readonly cancelReason?: string;
@@ -95,10 +128,12 @@ interface MutableAttempt {
   review?: ReviewRecord;
   verdict?: NonNullable<AttemptRecord['verdict']>;
   failure?: NonNullable<AttemptRecord['failure']>;
+  integration?: IntegrationRecord;
 }
 
 interface TaskMeta {
   reviewRequired: boolean;
+  integration?: IntegrationSpec;
   attempts: MutableAttempt[];
   cancelReason?: string;
 }
@@ -120,9 +155,9 @@ export class TaskBoard {
         for (const { contract } of event.tasks) {
           if (this.meta.has(contract.id)) throw new TaskBoardError('TASK_ALREADY_EXISTS', `task ${contract.id} already exists`);
         }
-        for (const { contract, reviewRequired } of event.tasks) {
+        for (const { contract, reviewRequired, integration } of event.tasks) {
           graphOk(this.graph.addTask(contract), `plan ${contract.id}`);
-          this.meta.set(contract.id, { reviewRequired, attempts: [] });
+          this.meta.set(contract.id, { reviewRequired, ...(integration === undefined ? {} : { integration }), attempts: [] });
         }
         break;
       }
@@ -176,6 +211,21 @@ export class TaskBoard {
         attempt.failure = { reason: event.reason, terminal: event.terminal, at: event.at };
         break;
       }
+      case 'integration_applied': {
+        const attempt = this.requireCurrentAttempt(event.taskId, event.attemptId);
+        this.requireState(event.taskId, 'RUNNING');
+        if (this.requireMeta(event.taskId).integration === undefined) throw new TaskBoardError('INVALID_EVENT', `${event.taskId} is not an integration task`);
+        if (attempt.integration !== undefined) throw new TaskBoardError('INVALID_EVENT', `${event.attemptId} was already integrated`);
+        attempt.integration = { applied: [...event.applied], revision: event.revision };
+        break;
+      }
+      case 'integration_conflict': {
+        const attempt = this.requireCurrentAttempt(event.taskId, event.attemptId);
+        this.requireState(event.taskId, 'RUNNING');
+        if (this.requireMeta(event.taskId).integration === undefined) throw new TaskBoardError('INVALID_EVENT', `${event.taskId} is not an integration task`);
+        attempt.integration = { applied: [...event.applied], conflict: { input: event.input, commit: event.commit, paths: [...event.paths], detail: event.detail } };
+        break;
+      }
       case 'cancel': {
         const meta = this.requireMeta(event.taskId);
         graphOk(this.graph.cancelTask(event.taskId), `cancel ${event.taskId}`);
@@ -205,6 +255,7 @@ export class TaskBoard {
     return deepFreeze({
       ...snapshot,
       reviewRequired: meta.reviewRequired,
+      ...(meta.integration === undefined ? {} : { integration: structuredClone(meta.integration) }),
       unmetDependencies: unmet,
       attemptRecords: structuredClone(meta.attempts) as AttemptRecord[],
       ...(meta.cancelReason === undefined ? {} : { cancelReason: meta.cancelReason }),

@@ -42,13 +42,14 @@ export function renderWorkerBrief(input: WorkerBriefInput): string {
   }
   lines.push(
     '',
-    'The host will run these verification commands itself in this worktree after you finish:',
+    'After you finish, the host runs these verification commands itself in a fresh clean checkout of your committed revision (uncommitted, untracked, and ignored files such as build output are not used):',
     ...contract.verification.map((entry) => `- ${entry}`),
     '',
     'Rules:',
     '- Work only inside the working directory above. Do not touch the main checkout.',
     '- Commit your finished work to the current branch. Leave no uncommitted or untracked files.',
     '- Never push, never merge, never rebase onto other branches.',
+    '- Do not use assert() in test code: verification builds in Release (-DNDEBUG), which strips it; follow the repo\'s existing non-assert check pattern. New assert( lines in tests are rejected.',
     '- Your own claims (done, revision, tests passed) are not evidence; the host inspects git and runs verification.',
     '- Finish with a short summary of what you changed and anything the coordinator should know.',
   );
@@ -57,7 +58,7 @@ export function renderWorkerBrief(input: WorkerBriefInput): string {
 
 export const REVIEW_VERDICT_TAG = 'REVIEW_VERDICT';
 
-export function renderReviewerPrompt(brief: ReviewBrief, reviewId: string, taskId: string): string {
+export function renderReviewerPrompt(brief: ReviewBrief, reviewId: string, taskId: string, context: readonly string[] = []): string {
   const evidence = brief.evidence.commands.map((command, index) => {
     const outcome = brief.evidence.outcomes[index];
     return `- \`${command.command}\` → exit ${outcome?.exitCode ?? '?'}${outcome?.timedOut === true ? ' (timed out)' : ''}`;
@@ -78,7 +79,8 @@ export function renderReviewerPrompt(brief: ReviewBrief, reviewId: string, taskI
     'Files in scope:',
     ...brief.spec.files_in_scope.map((entry) => `- ${entry}`),
     '',
-    'Host-run mechanical verification (already passed):',
+    ...(context.length === 0 ? [] : [...context, '']),
+    'Host-run mechanical verification in a clean checkout (already passed):',
     ...evidence,
     '',
     'Patch (base...artifact):',

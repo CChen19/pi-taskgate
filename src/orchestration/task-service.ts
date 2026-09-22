@@ -13,7 +13,7 @@
  * board before it is persisted, so a refused operation leaves state unchanged.
  */
 import { randomBytes } from 'node:crypto';
-import { checkArtifact } from '../adapters/artifact-check.ts';
+import { checkArtifact, findAddedAsserts } from '../adapters/artifact-check.ts';
 import type { WorktreeManager, WorktreePort, WorkspaceLease, WorkspaceInspection, WorktreeSessionBinding } from '../adapters/worktree-manager.ts';
 import { assembleReviewerBrief, decideFinalVerdict } from '../core/reviewer-brief.ts';
 import { validateTaskContract, type TaskContract } from '../core/task-contract.ts';
@@ -21,10 +21,11 @@ import { decideVerdict, validateEvidenceBundle, type EvidenceBundle, type Verifi
 import { isPlainObject } from '../core/validate.ts';
 import type { AsyncVerificationRunner } from '../host/process-verification-runner.ts';
 import type { CleanRoomCheckout, CleanRoomPort } from '../host/clean-room.ts';
+import type { GitHistoryPort } from '../host/git-history.ts';
 import type { WorkerLedger } from '../host/pier-ledger.ts';
 import type { RoleCheck } from '../host/pier-roles.ts';
 import { parseReviewerOutcome, renderReviewerPrompt, renderWorkerBrief } from './briefs.ts';
-import { replayTaskBoard, TaskBoard, TaskBoardError, type AttemptRecord, type CandidateRecord, type CheckStage, type TaskEvent, type TaskView } from './task-board.ts';
+import { replayTaskBoard, TaskBoard, TaskBoardError, type AppliedCommit, type AttemptRecord, type CandidateRecord, type CheckStage, type IntegrationInput, type TaskEvent, type TaskView } from './task-board.ts';
 
 export interface TaskServiceSettings {
   readonly verificationAllowlist: readonly string[];
@@ -44,7 +45,9 @@ export interface TaskServicePorts {
   /** Fresh checkouts of exact revisions; verification never runs in a worker's worktree. */
   readonly cleanRoom: CleanRoomPort;
   readonly ledger: WorkerLedger;
-  checkReviewerRole(): RoleCheck;
+  /** Read-only check of a Pier role (default: the configured reviewer role). */
+  checkReviewerRole(role?: string): RoleCheck;
+  readonly history: GitHistoryPort;
   clock(): number;
   /** Durable sink (Pi session custom entry). Throwing aborts the operation. */
   persist(event: TaskEvent): void;
@@ -70,7 +73,9 @@ export type ServiceErrorCode =
   | 'REVIEWER_INVALID'
   | 'REVIEW_UNPARSEABLE'
   | 'REVISION_MISMATCH'
-  | 'STATE_REJECTED';
+  | 'STATE_REJECTED'
+  | 'NOT_ACCEPTED'
+  | 'INTEGRATION_FAILED';
 
 export class TaskServiceError extends Error {
   readonly code: ServiceErrorCode;
@@ -147,6 +152,32 @@ export interface ReviewRecordResult {
   readonly verdict: 'passed' | 'rejected';
   readonly revision: string;
   readonly reasons: readonly string[];
+}
+
+interface AcceptedCandidate {
+  readonly taskId: string;
+  readonly revision: string;
+  readonly baseRevision: string;
+  readonly workspacePath: string;
+  readonly changedPaths: readonly string[];
+  readonly verification: readonly string[];
+  readonly implementerAgentIds: readonly string[];
+  readonly reviewerAgentId: string;
+  readonly reviewId: string;
+  readonly source: string;
+}
+
+export interface IntegrateResult {
+  readonly taskId: string;
+  readonly state: string;
+  readonly baseRevision: string;
+  readonly branch: string;
+  readonly workspacePath: string;
+  readonly inputs: readonly IntegrationInput[];
+  readonly applied: readonly AppliedCommit[];
+  readonly integratedRevision?: string;
+  readonly conflict?: { readonly input: string; readonly commit: string; readonly paths: readonly string[]; readonly detail: string };
+  readonly reason?: string;
 }
 
 const AGENT_ID = /^[A-Za-z0-9:._-]{1,128}$/;
@@ -324,14 +355,20 @@ export class TaskService {
     const task = this.task(taskId);
     if (task.state !== 'RUNNING') fail('INVALID_STATE', `${taskId} is ${task.state}; verify requires RUNNING${task.state === 'VERIFYING' ? ' (already verified; request or record a review)' : ''}`);
     const attempt = this.currentAttempt(task);
-    if (attempt.agentId === undefined) fail('WORKER_UNBOUND', `${taskId} has no bound worker; call task_bind with the Pier agent id first`);
-    const row = this.ports.ledger.latest(attempt.lease.workspacePath, attempt.agentId);
-    if (row === undefined) fail('WORKER_NOT_FOUND', `Pier ledger has no row for ${attempt.agentId} in ${attempt.lease.workspacePath}`);
-    if (row.status === 'running') fail('WORKER_RUNNING', `worker ${attempt.agentId} is still running; wait for its settlement notice`);
+    if (task.integration === undefined) {
+      if (attempt.agentId === undefined) fail('WORKER_UNBOUND', `${taskId} has no bound worker; call task_bind with the Pier agent id first`);
+      const row = this.ports.ledger.latest(attempt.lease.workspacePath, attempt.agentId);
+      if (row === undefined) fail('WORKER_NOT_FOUND', `Pier ledger has no row for ${attempt.agentId} in ${attempt.lease.workspacePath}`);
+      if (row.status === 'running') fail('WORKER_RUNNING', `worker ${attempt.agentId} is still running; wait for its settlement notice`);
+    } else if (attempt.integration?.revision === undefined) {
+      fail('INVALID_STATE', `${taskId} has no integrated revision to verify`);
+    }
     const lease = this.liveLease(attempt);
     const inspection = this.inspect(lease);
     const check = checkArtifact(inspection, task.contract.files_in_scope ?? []);
     if (!check.ok) return this.checkFailed(task, attempt, 'artifact', check.reasons, inspection.artifactRevision, undefined, []);
+    const guard = this.artifactGuards(task, attempt, lease, inspection.artifactRevision);
+    if (guard.length > 0) return this.checkFailed(task, attempt, 'artifact', guard, inspection.artifactRevision, undefined, []);
 
     // Clean room: verify the exact candidate revision in a fresh checkout built from git
     // objects only, so nothing the worker left in its worktree (ignored build output,
@@ -426,7 +463,7 @@ export class TaskService {
       state: this.task(taskId).state,
       reviewId,
       revision: candidate.revision,
-      prompt: renderReviewerPrompt(brief, reviewId, taskId),
+      prompt: renderReviewerPrompt(brief, reviewId, taskId, this.integrationBriefLines(task, attempt)),
       spawn: { description: `${taskId}:review`, cwd: lease.workspacePath, role: this.settings.reviewerRole, run_in_background: true },
       reasons: [],
     };
@@ -441,7 +478,7 @@ export class TaskService {
     const candidate = attempt.candidate;
     const review = attempt.review;
     if (candidate === undefined || review === undefined) fail('REVIEW_NOT_REQUESTED', `${taskId} has no outstanding review; call task_review_brief first`);
-    const implementers = new Set(task.attemptRecords.map((record) => record.agentId).filter((id): id is string => id !== undefined));
+    const implementers = new Set([...task.attemptRecords.map((record) => record.agentId).filter((id): id is string => id !== undefined), ...(task.integration?.inputs.flatMap((input) => input.implementerAgentIds) ?? [])]);
     if (implementers.has(agentId)) fail('REVIEWER_INVALID', `${agentId} implemented ${taskId} and cannot review it`);
     const row = this.ports.ledger.latest(attempt.lease.workspacePath, agentId);
     if (row === undefined) fail('WORKER_NOT_FOUND', `Pier has no subagent ${agentId} launched in ${attempt.lease.workspacePath}`);
@@ -484,7 +521,198 @@ export class TaskService {
     return this.task(taskId);
   }
 
+  /**
+   * Integrate exact accepted candidate revisions onto an exact base in a new
+   * host-owned worktree. Only candidates that are PASSED with a passing fresh
+   * review bound to that revision (confirmed again in Pier's ledger) may enter.
+   * Commits are cherry-picked in the given order; a conflict aborts, is
+   * recorded, and fails the integration without any resolution attempt.
+   */
+  integrate(options: { readonly baseRevision: string; readonly revisions: readonly string[]; readonly evidence?: readonly { readonly source: string; readonly events: readonly TaskEvent[] }[] }): IntegrateResult {
+    const base = typeof options.baseRevision === 'string' ? options.baseRevision.trim() : '';
+    if (!FULL_OBJECT_ID.test(base)) fail('INVALID_INPUT', 'base_revision must be a full object id (not HEAD or a branch)');
+    const wanted = Array.isArray(options.revisions) ? options.revisions.map((revision) => String(revision).trim().toLowerCase()) : [];
+    if (wanted.length === 0) fail('INVALID_INPUT', 'revisions must list at least one accepted candidate revision');
+    if (wanted.some((revision) => !/^[0-9a-f]{7,64}$/.test(revision))) fail('INVALID_INPUT', 'revisions must be hex commit ids (at least 7 characters)');
+    const pool = [...this.acceptedCandidates(this.board, 'this session')];
+    for (const evidence of options.evidence ?? []) {
+      let replayed: TaskBoard;
+      try { replayed = replayTaskBoard(evidence.events); } catch (error) { fail('INVALID_INPUT', `evidence ${evidence.source} cannot be replayed: ${message(error)}`); }
+      pool.push(...this.acceptedCandidates(replayed, evidence.source));
+    }
+    const inputs: IntegrationInput[] = [];
+    const files = new Set<string>();
+    const verification: string[] = [];
+    const seen = new Set<string>();
+    for (const revision of wanted) {
+      const matches = [...new Map(pool.filter((candidate) => candidate.revision.startsWith(revision)).map((candidate) => [candidate.revision, candidate])).values()];
+      if (matches.length === 0) fail('NOT_ACCEPTED', `${revision} is not a PASSED candidate with a passing fresh review in this session or the supplied evidence`);
+      if (matches.length > 1) fail('INVALID_INPUT', `${revision} is ambiguous among accepted candidates`);
+      const candidate = matches[0]!;
+      if (seen.has(candidate.revision)) fail('INVALID_INPUT', `${candidate.revision} is listed twice`);
+      seen.add(candidate.revision);
+      if (candidate.baseRevision !== base) fail('NOT_ACCEPTED', `${candidate.taskId}@${candidate.revision} was built on ${candidate.baseRevision}, not ${base}`);
+      this.confirmReview(candidate);
+      const unauthorized = candidate.verification.filter((command) => !this.settings.verificationAllowlist.includes(command));
+      if (unauthorized.length > 0) fail('NOT_ACCEPTED', `${candidate.taskId} used verification commands outside the current allowlist: ${unauthorized.join(' | ')}`);
+      let commits: readonly string[];
+      try { commits = this.ports.history.commitRange(base, candidate.revision); } catch (error) { fail('NOT_ACCEPTED', `${candidate.revision}: ${message(error)}`); }
+      if (commits.length === 0) fail('NOT_ACCEPTED', `${candidate.revision} has no commits over ${base}`);
+      candidate.changedPaths.forEach((path) => files.add(path));
+      candidate.verification.forEach((command) => { if (!verification.includes(command)) verification.push(command); });
+      inputs.push({ taskId: candidate.taskId, revision: candidate.revision, commits: [...commits], source: candidate.source, implementerAgentIds: candidate.implementerAgentIds, reviewerAgentId: candidate.reviewerAgentId, reviewId: candidate.reviewId });
+    }
+    const taskId = this.nextIntegrationId();
+    const contract = {
+      id: taskId,
+      objective: `Integrate ${inputs.length} accepted candidate revision(s) onto ${base}: ${inputs.map((input) => `${input.taskId}@${input.revision.slice(0, 12)}`).join(', ')}`,
+      depends_on: [],
+      files_in_scope: [...files].sort(),
+      acceptance_criteria: [
+        'The integrated history is exactly the declared source commits, in the declared order, each cherry-picked with -x and patch-identical to its source',
+        'The combined diff contains only the union of the input changes; no unexpected files or edits',
+        'Cross-task interactions are correct: shared files (e.g. CMakeLists.txt) keep every input\'s additions, with no duplicate or clobbered targets/tests and correct include/link wiring',
+        'Every test added by an input is still built and registered with add_test',
+        'Full verification passes on the integrated revision in a clean checkout',
+      ],
+      verification,
+      retry: { max_attempts: 1 },
+    };
+    const validated = validateTaskContract(contract);
+    if (!validated.ok) fail('INVALID_INPUT', `integration contract is invalid: ${validated.error.message}`);
+    this.commit({ v: 1, type: 'plan', at: this.ports.clock(), tasks: [{ contract: validated.contract, reviewRequired: true, integration: { baseRevision: base, inputs } }] });
+    const attemptId = `${taskId}:attempt-1`;
+    let lease: WorkspaceLease;
+    try {
+      lease = this.ports.worktrees.acquire(this.ports.worktreePort, taskId, attemptId, base);
+      this.ports.worktrees.bindSession(this.ports.worktreePort, lease, this.binding(lease, validated.contract));
+    } catch (error) {
+      this.commit({ v: 1, type: 'cancel', at: this.ports.clock(), taskId, reason: `integration worktree could not be created: ${message(error)}` });
+      fail('LEASE_UNAVAILABLE', `could not create the integration worktree: ${message(error)}`);
+    }
+    const problem = this.ports.checkWorkerCwd?.(lease.workspacePath);
+    if (problem !== undefined) {
+      this.ports.worktrees.cleanup(this.ports.worktreePort, lease);
+      this.commit({ v: 1, type: 'cancel', at: this.ports.clock(), taskId, reason: problem });
+      fail('LEASE_UNAVAILABLE', problem);
+    }
+    this.commit({ v: 1, type: 'start', at: this.ports.clock(), taskId, attemptId, lease });
+    this.leases.set(lease.ownershipToken, lease);
+    const owner = new Map<string, string>();
+    inputs.forEach((input) => input.commits.forEach((commit) => owner.set(commit, input.revision)));
+    let applied;
+    try {
+      applied = this.ports.history.cherryPick(lease.workspacePath, inputs.flatMap((input) => input.commits));
+    } catch (error) {
+      this.commit({ v: 1, type: 'attempt_failed', at: this.ports.clock(), taskId, attemptId, reason: `integration could not run: ${message(error)}`, terminal: true });
+      return { taskId, state: this.task(taskId).state, baseRevision: base, branch: lease.branch, workspacePath: lease.workspacePath, inputs, applied: [], reason: message(error) };
+    }
+    if (!applied.ok) {
+      const input = owner.get(applied.commit) ?? 'unknown';
+      this.commit({ v: 1, type: 'integration_conflict', at: this.ports.clock(), taskId, attemptId, applied: applied.applied, input, commit: applied.commit, paths: applied.paths, detail: applied.detail });
+      this.commit({ v: 1, type: 'attempt_failed', at: this.ports.clock(), taskId, attemptId, reason: `conflict cherry-picking ${applied.commit} (candidate ${input}) in ${applied.paths.join(', ') || '(no conflicted paths reported)'}`, terminal: true });
+      return { taskId, state: this.task(taskId).state, baseRevision: base, branch: lease.branch, workspacePath: lease.workspacePath, inputs, applied: applied.applied, conflict: { input, commit: applied.commit, paths: applied.paths, detail: applied.detail } };
+    }
+    this.commit({ v: 1, type: 'integration_applied', at: this.ports.clock(), taskId, attemptId, applied: applied.applied, revision: applied.revision });
+    return { taskId, state: this.task(taskId).state, baseRevision: base, branch: lease.branch, workspacePath: lease.workspacePath, inputs, applied: applied.applied, integratedRevision: applied.revision };
+  }
+
   // ── internals ──────────────────────────────────────────────────────
+
+  /** Candidates that are PASSED through a passing fresh review bound to the exact revision. */
+  private acceptedCandidates(board: TaskBoard, source: string): AcceptedCandidate[] {
+    const accepted: AcceptedCandidate[] = [];
+    for (const task of board.tasks()) {
+      if (task.state !== 'PASSED' || task.integration !== undefined || !task.reviewRequired) continue;
+      const attempt = task.attemptRecords[task.attemptRecords.length - 1];
+      const candidate = attempt?.candidate;
+      const review = attempt?.review;
+      if (attempt === undefined || candidate === undefined || review === undefined) continue;
+      if (attempt.verdict?.verdict !== 'passed' || attempt.verdict.source !== 'review') continue;
+      if (review.verdict?.outcome !== 'passed' || review.revision !== candidate.revision || review.verdict.artifactRevision !== candidate.revision || review.reviewerAgentId === undefined) continue;
+      if (candidate.verdict.verdict !== 'passed' || candidate.verdict.artifactRevision !== candidate.revision) continue;
+      accepted.push({
+        taskId: task.id,
+        revision: candidate.revision,
+        baseRevision: attempt.lease.baseRevision,
+        workspacePath: attempt.lease.workspacePath,
+        changedPaths: candidate.changedPaths,
+        verification: task.contract.verification,
+        implementerAgentIds: [...new Set(task.attemptRecords.map((record) => record.agentId).filter((id): id is string => id !== undefined))],
+        reviewerAgentId: review.reviewerAgentId,
+        reviewId: review.reviewId,
+        source,
+      });
+    }
+    return accepted;
+  }
+
+  /** Re-read the input's review from Pier's ledger: fresh, read-only, passed, bound to the revision. */
+  private confirmReview(candidate: AcceptedCandidate): void {
+    const row = this.ports.ledger.latest(candidate.workspacePath, candidate.reviewerAgentId);
+    const label = `${candidate.taskId}@${candidate.revision}`;
+    if (row === undefined) fail('NOT_ACCEPTED', `${label}: Pier ledger has no reviewer ${candidate.reviewerAgentId} in ${candidate.workspacePath}`);
+    if (row.status === 'running' || row.revivedFrom !== null || row.outcome === null) fail('NOT_ACCEPTED', `${label}: reviewer ${candidate.reviewerAgentId} is not a settled fresh session in Pier's ledger`);
+    const role = this.ports.checkReviewerRole(row.kind);
+    if (!role.ok) fail('NOT_ACCEPTED', `${label}: reviewer role "${row.kind}" is not read-only (${role.reason})`);
+    const parsed = parseReviewerOutcome(row.outcome, candidate.reviewId);
+    if (!parsed.ok || parsed.verdict.outcome !== 'passed' || parsed.verdict.artifactRevision !== candidate.revision) {
+      fail('NOT_ACCEPTED', `${label}: Pier's ledger does not hold a passing verdict for review ${candidate.reviewId} on this revision${parsed.ok ? '' : ` (${parsed.reason})`}`);
+    }
+  }
+
+  /** Guards on the committed diff beyond scope: new assert() in tests, and integration history fidelity. */
+  private artifactGuards(task: TaskView, attempt: AttemptRecord, lease: WorkspaceLease, revision: string): string[] {
+    const reasons: string[] = [];
+    try {
+      const diff = this.ports.history.changedLineDiff(lease.workspacePath, lease.baseRevision, revision);
+      if (diff.truncated) reasons.push('diff is too large to scan for assert() in tests');
+      const asserts = findAddedAsserts(diff.text);
+      if (asserts.length > 0) {
+        reasons.push(`new assert() in test code is compiled out by Release builds (-DNDEBUG); use the repo's non-assert check pattern: ${asserts.slice(0, 5).map((entry) => `${entry.path}: ${entry.text}`).join(' | ')}`);
+      }
+    } catch (error) {
+      reasons.push(`could not scan the diff: ${message(error)}`);
+    }
+    const spec = task.integration;
+    const record = attempt.integration;
+    if (spec !== undefined) {
+      try {
+        const expectedSources = spec.inputs.flatMap((input) => input.commits);
+        const applied = record?.applied ?? [];
+        if (record?.revision !== revision) reasons.push(`HEAD ${revision} is not the recorded integrated revision ${record?.revision ?? '(none)'}`);
+        if (applied.map((entry) => entry.source).join(',') !== expectedSources.join(',')) reasons.push('applied commits do not match the declared source commits in order');
+        const actual = this.ports.history.commitsSince(lease.workspacePath, spec.baseRevision);
+        if (actual.join(',') !== applied.map((entry) => entry.integrated).join(',')) reasons.push(`history ${spec.baseRevision}..HEAD does not match the recorded integrated commits`);
+        for (const entry of applied) {
+          if (this.ports.history.pickedFrom(entry.integrated) !== entry.source) reasons.push(`${entry.integrated} does not name ${entry.source} as its cherry-pick source`);
+          if (this.ports.history.patchId(entry.integrated) !== this.ports.history.patchId(entry.source)) reasons.push(`${entry.integrated} is not patch-identical to ${entry.source}`);
+        }
+      } catch (error) {
+        reasons.push(`could not check integration history: ${message(error)}`);
+      }
+    }
+    return reasons;
+  }
+
+  private integrationBriefLines(task: TaskView, attempt: AttemptRecord): readonly string[] {
+    const spec = task.integration;
+    if (spec === undefined) return [];
+    const byIntegrated = new Map((attempt.integration?.applied ?? []).map((entry) => [entry.source, entry.integrated]));
+    return [
+      `This is an INTEGRATION review. Base revision: ${spec.baseRevision}. Integrated revision: ${attempt.integration?.revision ?? '(none)'}.`,
+      'Declared inputs (each was separately verified and freshly reviewed; review how they combine):',
+      ...spec.inputs.map((input) => `- ${input.taskId} candidate ${input.revision}: ${input.commits.map((commit) => `${commit.slice(0, 12)} → ${byIntegrated.get(commit)?.slice(0, 12) ?? '?'}`).join(', ')}`),
+      'Focus on: the combined diff; cross-task interactions; CMake/test wiring (every new test built and registered once); unexpected files; and whether the integrated history matches the declared revisions.',
+    ];
+  }
+
+  private nextIntegrationId(): string {
+    let index = this.board.tasks().filter((task) => task.integration !== undefined).length + 1;
+    while (this.board.has(`Tint-${index}`)) index += 1;
+    return `Tint-${index}`;
+  }
+
 
   private commit(event: TaskEvent): void {
     let trial: TaskBoard;
@@ -502,7 +730,10 @@ export class TaskService {
     this.commit({ v: 1, type: 'check_failed', at: this.ports.clock(), taskId: task.id, attemptId: attempt.attemptId, stage, reasons: [...reasons], ...(revision === undefined ? {} : { revision }), ...(evidence === undefined ? {} : { evidence }) });
     const used = attempt.checks.length + 1;
     let outcome: VerifyResult['outcome'] = 'check_failed';
-    if (used >= this.settings.maxChecksPerAttempt) {
+    if (task.integration !== undefined) {
+      this.commit({ v: 1, type: 'attempt_failed', at: this.ports.clock(), taskId: task.id, attemptId: attempt.attemptId, reason: `integration check failed: ${reasons.join('; ').slice(0, 400)}`, terminal: true });
+      outcome = 'attempt_failed';
+    } else if (used >= this.settings.maxChecksPerAttempt) {
       this.commit({ v: 1, type: 'attempt_failed', at: this.ports.clock(), taskId: task.id, attemptId: attempt.attemptId, reason: `${used} failed checks in one attempt (limit ${this.settings.maxChecksPerAttempt})`, terminal: false });
       outcome = 'attempt_failed';
     }

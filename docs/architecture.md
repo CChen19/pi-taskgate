@@ -29,13 +29,19 @@ There is exactly one control plane: the main agent decides the next action; the 
 - `src/host/pier-ledger.ts` / `src/host/pier-roles.ts`: read-only views of Pier's delegation ledger and role files, matching Pier's storage encodings and lookup order.
 - `src/adapters/artifact-check.ts`: pure acceptance gate over a host inspection.
 
+### Integration (P1, implemented)
+
+`task_integrate` admits only candidates that are PASSED through a passing fresh review bound to the exact candidate revision, re-confirmed from Pier's ledger (settled, not revived, read-only role, verdict names the review id and revision). Candidates accepted in earlier sessions are admitted only by replaying those sessions' task events (current branch) with the same reducer. Every candidate must have been built on the declared base, a full object id. The host creates a new integration worktree at that base and cherry-picks each candidate's `base..revision` commits in the given order with `-x`; a conflict aborts the pick, records the input, commit and conflicted paths, and fails the integration terminally — there is no resolution step. A clean result becomes an integration task that reuses `task_verify` (clean room, scope = union of input paths, plus a history check that `base..HEAD` is exactly the recorded integrated commits, each patch-identical to and naming its source) and the fresh-review flow; implementers of any input cannot review the integration. Nothing merges into the main checkout or pushes.
+
+A guard shared by all tasks rejects `assert(` added in test sources (Release builds define `NDEBUG`), scanning only added lines of the committed diff and ignoring comments, string literals and `static_assert`.
+
 ### Invariants kept from the earlier design
 
 Worker claims are never evidence; revisions come from host git. Completion is not acceptance. Verification commands are exact allowlist matches, run by the host with a minimal environment. Implementers never approve themselves; reviews are fresh and bound to an exact revision. Scope violations fail closed. The main checkout is never modified except by `git worktree add` bookkeeping; nothing pushes.
 
 ### Not implemented yet (P1+)
 
-Mechanical integration of accepted branches (the legacy `GitIntegrationRunner` is the intended base), worktree cleanup, parallel limits beyond Pier's own cap, metrics, cross-session recovery beyond Pi session replay, and porting stable pieces into Pier. The end-to-end run in a real Pi/Pier session has not happened yet.
+Conflict resolution for integration, worktree cleanup, parallel limits beyond Pier's own cap, metrics, cross-session recovery beyond Pi session replay, and porting stable pieces into Pier. The end-to-end run in a real Pi/Pier session has not happened yet.
 
 ## Legacy: external vertical slice (frozen)
 

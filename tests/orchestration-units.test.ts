@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { checkArtifact } from '../src/adapters/artifact-check.ts';
+import { checkArtifact, findAddedAsserts, isTestSource } from '../src/adapters/artifact-check.ts';
 import { PierHistoryLedger, pierPipePath, pierPipeProblem, pierSessionDirName, pierSessionDirNameLegacy } from '../src/host/pier-ledger.ts';
 import { WorktreeManager } from '../src/adapters/worktree-manager.ts';
 import { GitCleanRoom } from '../src/host/clean-room.ts';
@@ -13,7 +13,7 @@ import { parseOrchestrationConfig } from '../src/orchestration/config.ts';
 import { replayTaskBoard, TaskBoardError, type TaskEvent } from '../src/orchestration/task-board.ts';
 import type { TaskService } from '../src/orchestration/task-service.ts';
 import { TaskServiceError } from '../src/orchestration/task-service.ts';
-import { createAgentOrchestratorExtension, TASK_EVENT_CUSTOM_TYPE, type PiToolDefinition } from '../src/pi-extension/index.ts';
+import { createAgentOrchestratorExtension, readSessionFileEvents, TASK_EVENT_CUSTOM_TYPE, type PiToolDefinition } from '../src/pi-extension/index.ts';
 
 const REV = 'a'.repeat(40);
 
@@ -31,6 +31,35 @@ describe('checkArtifact', () => {
     const prefix = checkArtifact({ changedPaths: ['src/ab.ts'], artifactRevision: REV, clean: true, commitsAhead: 1 }, ['src/a']);
     assert.deepEqual(prefix.violations, ['src/ab.ts']);
     assert.deepEqual(checkArtifact({ changedPaths: ['x'], artifactRevision: REV, clean: true, commitsAhead: 1 }, []).failures, ['INVALID_SCOPE']);
+  });
+});
+
+describe('added assert() guard', () => {
+  const diff = (path: string, ...lines: string[]) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1,0 +1,${lines.length} @@\n${lines.join('\n')}\n`;
+
+  it('flags assert( on added lines of test sources only', () => {
+    assert.deepEqual(findAddedAsserts(diff('tests/test_a.cpp', '+    assert(x == 1);')).map((hit) => hit.path), ['tests/test_a.cpp']);
+    assert.equal(findAddedAsserts(diff('test_root.cc', '+assert (ok);')).length, 1);
+    assert.equal(findAddedAsserts(diff('src/foo_test.cpp', '+  if (!ok) assert(false);')).length, 1);
+    assert.equal(findAddedAsserts(diff('handler/x.cpp', '+    assert(x);')).length, 0, 'production code is out of scope');
+    assert.equal(findAddedAsserts(diff('tests/README.md', '+assert(x)')).length, 0, 'non-source files are ignored');
+  });
+
+  it('ignores removed lines, context, comments, strings, and static_assert', () => {
+    assert.equal(findAddedAsserts(diff('tests/t.cpp', '-    assert(x);', ' assert(y);')).length, 0);
+    assert.equal(findAddedAsserts(diff('tests/t.cpp', '+    // assert() compiles out under NDEBUG')).length, 0);
+    assert.equal(findAddedAsserts(diff('tests/t.cpp', '+ * assert(x) in a block comment')).length, 0);
+    assert.equal(findAddedAsserts(diff('tests/t.cpp', '+    puts("assert(x)");')).length, 0);
+    assert.equal(findAddedAsserts(diff('tests/t.cpp', '+static_assert(sizeof(int) == 4, "x");')).length, 0);
+    assert.equal(findAddedAsserts(diff('tests/t.cpp', '+my_assert(x);')).length, 0);
+    assert.equal(findAddedAsserts(`--- a/tests/t.cpp\n+++ /dev/null\n@@ -1 +0,0 @@\n-assert(x);\n`).length, 0);
+  });
+
+  it('classifies test sources', () => {
+    assert.equal(isTestSource('tests/test_router.cpp'), true);
+    assert.equal(isTestSource('test/a.h'), true);
+    assert.equal(isTestSource('handler/expire_at.h'), false);
+    assert.equal(isTestSource('CMakeLists.txt'), false);
   });
 });
 
@@ -165,6 +194,21 @@ describe('GitCleanRoom', () => {
   });
 });
 
+describe('session evidence reader', () => {
+  it('returns task events on the current branch only', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ao-session-'));
+    try {
+      const event = (id: string, parentId: string | null, taskId: string) => JSON.stringify({ type: 'custom', id, parentId, customType: TASK_EVENT_CUSTOM_TYPE, data: { v: 1, type: 'cancel', at: 1, taskId, reason: 'x' } });
+      const file = join(root, 's.jsonl');
+      writeFileSync(file, [JSON.stringify({ type: 'session', id: 'root' }), event('a', null, 'Tkeep1'), event('b', 'a', 'Tabandoned'), event('c', 'a', 'Tkeep2'), JSON.stringify({ type: 'message', id: 'd', parentId: 'c' })].join('\n'));
+      assert.deepEqual(readSessionFileEvents(file).map((entry) => (entry as { taskId: string }).taskId), ['Tkeep1', 'Tkeep2']);
+      assert.throws(() => readSessionFileEvents(join(root, 'notes.txt')), /\.jsonl/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('task board replay', () => {
   it('rejects events that do not follow the state machine', () => {
     const contract = { id: 'T1', objective: 'o', depends_on: [], files_in_scope: ['src/'], acceptance_criteria: ['a'], verification: ['make'], retry: { max_attempts: 1 } };
@@ -196,7 +240,7 @@ describe('pi extension', () => {
   it('registers the task tools and fails closed when the service cannot be built', async () => {
     const pi = fakePi();
     createAgentOrchestratorExtension({ createService: () => { throw new Error('orchestration config not found'); } })(pi.api);
-    assert.deepEqual([...pi.tools.keys()].sort(), ['task_abandon', 'task_bind', 'task_plan', 'task_review_brief', 'task_review_record', 'task_start', 'task_status', 'task_verify']);
+    assert.deepEqual([...pi.tools.keys()].sort(), ['task_abandon', 'task_bind', 'task_integrate', 'task_plan', 'task_review_brief', 'task_review_record', 'task_start', 'task_status', 'task_verify']);
     pi.handlers.get('session_start')!({}, { sessionManager: { getBranch: () => [] } });
     await assert.rejects(pi.tools.get('task_status')!.execute('c1', {}, undefined, undefined, {}), /unavailable: orchestration config not found/);
   });

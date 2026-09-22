@@ -70,6 +70,34 @@ function readEvents(ctx: unknown): TaskEvent[] {
   return events;
 }
 
+/**
+ * Task events on the current branch of a Pi session file: walk parentId links
+ * back from the last entry so abandoned branches are excluded.
+ */
+export function readSessionFileEvents(path: string): TaskEvent[] {
+  if (!path.endsWith('.jsonl')) throw new Error(`evidence ${path} is not a Pi session .jsonl file`);
+  const entries = new Map<string, { parentId: string | null; record: Record<string, unknown> }>();
+  let last: string | undefined;
+  for (const line of readFileSync(path, 'utf8').split('\n')) {
+    if (line.trim().length === 0) continue;
+    let record: Record<string, unknown>;
+    try { record = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+    if (typeof record.id !== 'string' || record.type === 'session') continue;
+    entries.set(record.id, { parentId: typeof record.parentId === 'string' ? record.parentId : null, record });
+    last = record.id;
+  }
+  const branch: Record<string, unknown>[] = [];
+  const visited = new Set<string>();
+  for (let id = last; id !== undefined && !visited.has(id);) {
+    visited.add(id);
+    const entry = entries.get(id);
+    if (entry === undefined) break;
+    branch.push(entry.record);
+    id = entry.parentId ?? undefined;
+  }
+  return readEvents({ sessionManager: { getBranch: () => branch.reverse() } });
+}
+
 function text(value: string, details?: unknown): PiToolResult {
   return { content: [{ type: 'text', text: value }], ...(details === undefined ? {} : { details }) };
 }
@@ -85,12 +113,15 @@ export function formatTask(task: TaskView): string {
   if (task.unmetDependencies.length > 0) parts.push(`waiting on ${task.unmetDependencies.join(',')}`);
   if (task.blocker !== undefined) parts.push(`blocker ${task.blocker}`);
   const lines = [parts.join(' · '), `  objective: ${task.contract.objective.split('\n')[0]!.slice(0, 160)}`];
+  if (task.integration !== undefined) lines.push(`  integration of ${task.integration.inputs.map((input) => `${input.taskId}@${short(input.revision)}`).join(', ')} onto ${short(task.integration.baseRevision)}`);
   if (attempt !== undefined) {
     lines.push(`  attempt ${attempt.attemptId}: agent ${attempt.agentId ?? '(unbound)'} · worktree ${attempt.lease.workspacePath} · branch ${attempt.lease.branch} · base ${short(attempt.lease.baseRevision)}`);
     if (attempt.checks.length > 0) {
       const last = attempt.checks[attempt.checks.length - 1]!;
       lines.push(`  failed checks: ${attempt.checks.length} (last ${last.stage} @${short(last.revision)}: ${last.reasons.join('; ').slice(0, 300)})`);
     }
+    if (attempt.integration?.revision !== undefined) lines.push(`  integrated revision ${attempt.integration.revision} (${attempt.integration.applied.length} commit(s))`);
+    if (attempt.integration?.conflict !== undefined) lines.push(`  CONFLICT at ${short(attempt.integration.conflict.commit)} (candidate ${short(attempt.integration.conflict.input)}) in ${attempt.integration.conflict.paths.join(', ')}`);
     if (attempt.candidate !== undefined) lines.push(`  candidate ${attempt.candidate.revision} · ${attempt.candidate.changedPaths.length} path(s) · verification ${attempt.candidate.verdict.verdict}`);
     if (attempt.review !== undefined) lines.push(`  review ${attempt.review.reviewId} @${short(attempt.review.revision)}: ${attempt.review.verdict === undefined ? 'awaiting reviewer' : `${attempt.review.verdict.outcome} by ${attempt.review.reviewerAgentId ?? '?'}`}`);
     if (attempt.verdict !== undefined) lines.push(`  verdict ${attempt.verdict.verdict} (${attempt.verdict.source}): ${attempt.verdict.reasons.join('; ').slice(0, 300)}`);
@@ -299,6 +330,41 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
     }, (svc, params) => {
       const result = svc.recordReview(taskId(params), stringParam(params, 'agent_id'));
       return text(`${result.taskId} review ${result.verdict} for ${result.revision} → ${result.state}\n${result.reasons.map((reason) => `- ${reason}`).join('\n')}\nREADY: ${svc.readySet().join(', ') || '(none)'}`, result);
+    });
+
+    tool({
+      name: 'task_integrate',
+      label: 'Task Integrate',
+      description: 'Integrate exact accepted candidate revisions onto an exact base revision in a new host-owned integration worktree/branch (the main checkout is never touched). Every input must be a PASSED task whose candidate revision passed clean-room verification and a fresh review; the host re-confirms each review in Pier\'s ledger. Candidates accepted in earlier sessions need their Pi session .jsonl files in evidence_sessions. Commits of base..candidate are cherry-picked (-x) in the given order; any conflict aborts, is recorded, and fails the integration (no auto-resolution). On success it returns an integration task id: run task_verify on it, then task_review_brief / spawn a fresh reviewer / task_review_record, exactly like a normal task.',
+      parameters: {
+        type: 'object',
+        properties: {
+          base_revision: { type: 'string', description: 'Full object id of the base (not HEAD or a branch name)' },
+          revisions: { ...STRING_ARRAY, description: 'Accepted candidate revisions in integration order (full ids or unique prefixes of accepted candidates)' },
+          evidence_sessions: { ...STRING_ARRAY, description: 'Absolute paths of Pi session .jsonl files holding the acceptance of candidates from earlier sessions' },
+        },
+        required: ['base_revision', 'revisions'],
+        additionalProperties: false,
+      },
+    }, (svc, params) => {
+      const p = params as { base_revision?: unknown; revisions?: unknown; evidence_sessions?: unknown };
+      const sessions = Array.isArray(p.evidence_sessions) ? p.evidence_sessions.map(String) : [];
+      const evidence = sessions.map((path) => {
+        try { return { source: path, events: readSessionFileEvents(path) }; } catch (error) { throw new TaskServiceError('INVALID_INPUT', `cannot read evidence ${path}: ${error instanceof Error ? error.message : String(error)}`); }
+      });
+      const result = svc.integrate({ baseRevision: String(p.base_revision ?? ''), revisions: Array.isArray(p.revisions) ? p.revisions.map(String) : [], evidence });
+      const lines = [
+        `${result.taskId} ${result.state} · base ${result.baseRevision}`,
+        `branch ${result.branch} · worktree ${result.workspacePath}`,
+        'inputs:',
+        ...result.inputs.map((input) => `- ${input.taskId} ${input.revision} (${input.commits.length} commit(s); reviewed by ${input.reviewerAgentId}; evidence: ${input.source})`),
+        'applied:',
+        ...(result.applied.length === 0 ? ['- (none)'] : result.applied.map((entry) => `- ${entry.source.slice(0, 12)} → ${entry.integrated.slice(0, 12)}`)),
+      ];
+      if (result.conflict !== undefined) lines.push(`CONFLICT cherry-picking ${result.conflict.commit} (candidate ${result.conflict.input}) in: ${result.conflict.paths.join(', ') || '(none reported)'}`, `detail: ${result.conflict.detail}`, 'The integration FAILED closed; nothing was resolved automatically. The worktree is left at the last cleanly applied commit for audit.');
+      else if (result.integratedRevision !== undefined) lines.push(`integrated revision ${result.integratedRevision}`, `Next: task_verify ${result.taskId}.`);
+      else if (result.reason !== undefined) lines.push(`FAILED: ${result.reason}`);
+      return text(lines.join('\n'), result);
     });
 
     tool({

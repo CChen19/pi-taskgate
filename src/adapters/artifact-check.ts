@@ -57,3 +57,49 @@ export function checkArtifact(inspection: WorkspaceInspection, filesInScope: rea
     violations: [...violations],
   });
 }
+
+export interface AddedAssert {
+  readonly path: string;
+  readonly text: string;
+}
+
+const TEST_PATH = /(^|\/)(tests?|testing)\/|(^|\/)test_[^/]*$|_test\.[^/]+$|\.test\.[^/]+$/;
+const SOURCE_FILE = /\.(c|cc|cpp|cxx|h|hh|hpp|hxx|ipp|inl)$/;
+const ASSERT_CALL = /(^|[^A-Za-z0-9_])assert\s*\(/;
+
+/** True for C/C++ test sources, where Release builds (-DNDEBUG) strip assert(). */
+export function isTestSource(path: string): boolean {
+  return SOURCE_FILE.test(path) && TEST_PATH.test(path);
+}
+
+/** Strip // and single-line block comments and string/char literals so prose does not trigger. */
+function codeOnly(line: string): string {
+  const trimmed = line.trimStart();
+  if (trimmed.startsWith('*') || trimmed.startsWith('/*')) return '';
+  return line
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+    .replace(/\/\*.*?\*\//g, '')
+    .replace(/\/\/.*$/, '');
+}
+
+/**
+ * Scan a unified diff (`git diff -U0`) for assert( calls on added lines of test
+ * sources. Removed and unchanged lines are ignored; static_assert is allowed.
+ */
+export function findAddedAsserts(unifiedDiff: string): readonly AddedAssert[] {
+  const found: AddedAssert[] = [];
+  let path: string | undefined;
+  for (const line of unifiedDiff.split('\n')) {
+    if (line.startsWith('+++ ')) {
+      const target = line.slice(4).trim();
+      path = target === '/dev/null' ? undefined : target.replace(/^b\//, '');
+      continue;
+    }
+    if (line.startsWith('--- ') || line.startsWith('diff --git ')) continue;
+    if (path === undefined || !isTestSource(path) || !line.startsWith('+')) continue;
+    const code = codeOnly(line.slice(1));
+    if (ASSERT_CALL.test(code)) found.push({ path, text: line.slice(1).trim().slice(0, 160) });
+  }
+  return found;
+}

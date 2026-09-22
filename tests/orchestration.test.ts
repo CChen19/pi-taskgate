@@ -8,6 +8,7 @@ import { WorktreeManager } from '../src/adapters/worktree-manager.ts';
 import { NodeCommandRunner, minimalProcessEnv } from '../src/host/command-runner.ts';
 import { GitWorktreePort } from '../src/host/git-worktree-port.ts';
 import { GitCleanRoom } from '../src/host/clean-room.ts';
+import { GitHistory } from '../src/host/git-history.ts';
 import { existsSync, readdirSync } from 'node:fs';
 import type { WorkerLedger, WorkerLedgerRow } from '../src/host/pier-ledger.ts';
 import type { RoleCheck } from '../src/host/pier-roles.ts';
@@ -48,7 +49,7 @@ class FakeLedger implements WorkerLedger {
 }
 
 const PROBE = 'pwd && git rev-parse HEAD && git status --porcelain --ignored && mkdir -p build && touch build/from-verify';
-const ALLOWLIST = ['test -f src/a.txt', 'test -f src/b.txt', 'test -f src/missing.txt', 'grep -q hello src/a.txt', 'test -f build/marker', PROBE];
+const ALLOWLIST = ['test -f README.md', 'test -f src/a.txt', 'test -f src/b.txt', 'test -f src/missing.txt', 'grep -q hello src/a.txt', 'test -f build/marker', PROBE];
 const SETTINGS: TaskServiceSettings = { verificationAllowlist: ALLOWLIST, verificationTimeoutMs: 30_000, reviewerRole: 'reviewer-readonly', maxChecksPerAttempt: 3, defaultMaxAttempts: 2 };
 
 interface Harness {
@@ -83,14 +84,15 @@ function harness(): Harness {
       const commandRunner = new NodeCommandRunner();
       let id = 0;
       return new TaskService({
-        worktrees: new WorktreeManager({ repoRoot: repo, workspaceRoot, idSource: () => `lease-${++id}-${h.events.length}` }),
+        worktrees: new WorktreeManager({ repoRoot: repo, workspaceRoot, idSource: () => `lease-${++id}-${h.events.length}`, naming: 'compact' }),
         worktreePort: new GitWorktreePort({ repoRoot: repo, workspaceRoot, commandRunner }),
         headRevision: () => git(repo, ['rev-parse', 'HEAD']),
         readDiff: (cwd, base, revision) => boundReviewerDiff(git(cwd, ['diff', '--no-color', `${base}...${revision}`, '--'])),
+        history: new GitHistory({ repoRoot: repo, commandRunner }),
         cleanRoom: new GitCleanRoom({ repoRoot: repo, root: join(workspaceRoot, '.verify'), commandRunner }),
         verifier: new ProcessAsyncVerificationRunner({ commandRunner, cwd: workspaceRoot, allowedCommands: ALLOWLIST, defaultTimeoutMs: 30_000 }),
         ledger: h.ledger,
-        checkReviewerRole: () => h.role.check,
+        checkReviewerRole: (role) => (role === undefined || role === 'reviewer-readonly' ? h.role.check : { ok: false, reason: `role ${role} is not read-only` }),
         clock: () => ++h.now.value,
         persist: (event) => { if (h.persistFailure.error !== undefined) throw h.persistFailure.error; h.events.push(structuredClone(event)); },
         randomId: () => `rev${h.events.length}`,
@@ -118,6 +120,31 @@ async function toCandidate(h: Harness, svc: TaskService, id: string, files: Reco
   h.ledger.add({ paneId: agent, cwd, status: 'settled', outcome: 'done', createdAt: h.now.value });
   const verified = await svc.verify(id);
   return { started, cwd, revision, verified };
+}
+
+/** Drive a task all the way to PASSED through verification and a fresh review. */
+async function accept(h: Harness, svc: TaskService, id: string, files: Record<string, string>, agent = `w:${id}`): Promise<string> {
+  const { cwd, revision, verified } = await toCandidate(h, svc, id, files, agent);
+  assert.equal(verified.outcome, 'awaiting_review', `${id} verified: ${verified.reasons.join('; ')}`);
+  const brief = svc.reviewBrief(id);
+  h.ledger.add({ paneId: `r:${id}`, cwd, kind: 'reviewer-readonly', status: 'settled', createdAt: h.now.value + 1, outcome: reviewerOutput(brief.reviewId!, 'passed', revision) });
+  assert.equal(svc.recordReview(id, `r:${id}`).state, 'PASSED');
+  return revision;
+}
+
+async function acceptReadme(h: Harness, svc: TaskService, id: string, content: string): Promise<string> {
+  const started = svc.start(id);
+  const cwd = started.workspacePath!;
+  h.ledger.add({ paneId: `w:${id}`, cwd, createdAt: h.now.value + 1 });
+  svc.bind(id, `w:${id}`);
+  const revision = commit(cwd, { 'README.md': content });
+  h.ledger.add({ paneId: `w:${id}`, cwd, status: 'settled', outcome: 'done', createdAt: h.now.value });
+  const verified = await svc.verify(id);
+  assert.equal(verified.outcome, 'awaiting_review', verified.reasons.join('; '));
+  const brief = svc.reviewBrief(id);
+  h.ledger.add({ paneId: `r:${id}`, cwd, kind: 'reviewer-readonly', status: 'settled', createdAt: h.now.value + 1, outcome: reviewerOutput(brief.reviewId!, 'passed', revision) });
+  assert.equal(svc.recordReview(id, `r:${id}`).state, 'PASSED');
+  return revision;
 }
 
 function reviewerOutput(reviewId: string, outcome: 'passed' | 'rejected', revision: string, reasons = ['criteria met']): string {
@@ -309,6 +336,121 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
     await rejectsCode(svc.verify('T1'), 'VERIFICATION_ERROR');
     assert.equal(svc.task('T1').state, 'RUNNING');
     assert.equal(svc.task('T1').attemptRecords[0]!.checks.length, 0);
+  });
+
+
+  describe('integration', () => {
+    const base = () => git(h.repo, ['rev-parse', 'HEAD']).trim();
+
+    it('integrates exact accepted revisions, verifies in a clean room, and requires a fresh non-implementer review', async () => {
+      const svc = h.service();
+      const b = base();
+      svc.plan([task('T1'), task('T2', { files_in_scope: ['src/b.txt'], verification: ['test -f src/b.txt'] })]);
+      const rev1 = await accept(h, svc, 'T1', { 'src/a.txt': 'hello\n' });
+      const rev2 = await accept(h, svc, 'T2', { 'src/b.txt': 'b\n' });
+      const result = svc.integrate({ baseRevision: b, revisions: [rev1.slice(0, 8), rev2] });
+      assert.equal(result.state, 'RUNNING');
+      assert.equal(result.conflict, undefined);
+      assert.deepEqual(result.inputs.map((input) => input.revision), [rev1, rev2]);
+      assert.equal(result.applied.length, 2);
+      assert.match(result.branch, /^ao\/tint-1-a1-/);
+      assert.equal(git(result.workspacePath, ['rev-parse', 'HEAD']).trim(), result.integratedRevision);
+      assert.match(git(result.workspacePath, ['log', '-1', '--format=%B']), new RegExp(`cherry picked from commit ${rev2}`));
+      assert.equal(base(), b, 'main checkout HEAD untouched');
+
+      const verified = await svc.verify(result.taskId);
+      assert.equal(verified.outcome, 'awaiting_review', verified.reasons.join('; '));
+      assert.equal(verified.revision, result.integratedRevision);
+      assert.deepEqual(verified.commands.map((command) => command.command), ['test -f src/a.txt', 'test -f src/b.txt']);
+      assert.equal(existsSync(verified.cleanRoom!), false);
+
+      const brief = svc.reviewBrief(result.taskId);
+      assert.match(brief.prompt!, /INTEGRATION review/);
+      assert.match(brief.prompt!, new RegExp(rev1));
+      await rejectsCode(() => svc.recordReview(result.taskId, 'w:T1'), 'REVIEWER_INVALID');
+      const cwd = result.workspacePath;
+      h.ledger.add({ paneId: 'r:int-revived', cwd, kind: 'reviewer-readonly', status: 'settled', createdAt: h.now.value + 1, revivedFrom: 'r:x', outcome: reviewerOutput(brief.reviewId!, 'passed', result.integratedRevision!) });
+      await rejectsCode(() => svc.recordReview(result.taskId, 'r:int-revived'), 'REVIEWER_INVALID');
+      h.ledger.add({ paneId: 'r:int', cwd, kind: 'reviewer-readonly', status: 'settled', createdAt: h.now.value + 1, outcome: reviewerOutput(brief.reviewId!, 'passed', result.integratedRevision!) });
+      assert.equal(svc.recordReview(result.taskId, 'r:int').state, 'PASSED');
+      assert.equal(svc.task(result.taskId).integration?.baseRevision, b);
+
+      const resumed = h.service();
+      resumed.restore(h.events);
+      assert.equal(resumed.task(result.taskId).attemptRecords[0]!.integration?.revision, result.integratedRevision);
+    });
+
+    it('fails closed on a conflict, records it, and leaves the worktree clean without resolving', async () => {
+      const svc = h.service();
+      svc.plan([task('T1', { files_in_scope: ['README.md'], verification: ['test -f README.md'] }), task('T2', { files_in_scope: ['README.md'], verification: ['test -f README.md'] })]);
+      const rev1 = await acceptReadme(h, svc, 'T1', 'one\n');
+      const rev2 = await acceptReadme(h, svc, 'T2', 'two\n');
+      const result = svc.integrate({ baseRevision: base(), revisions: [rev1, rev2] });
+      assert.equal(result.state, 'FAILED');
+      assert.deepEqual(result.conflict?.paths, ['README.md']);
+      assert.equal(result.conflict?.input, rev2);
+      assert.equal(result.applied.length, 1);
+      assert.equal(git(result.workspacePath, ['status', '--porcelain']), '', 'aborted pick leaves the worktree clean');
+      assert.equal(git(result.workspacePath, ['rev-parse', 'HEAD']).trim(), result.applied[0]!.integrated);
+      assert.match(svc.task(result.taskId).attemptRecords[0]!.failure!.reason, /conflict cherry-picking/);
+      await rejectsCode(svc.verify(result.taskId), 'INVALID_STATE');
+    });
+
+    it('admits only PASSED, freshly reviewed candidates built on the exact base', async () => {
+      const svc = h.service();
+      const b = base();
+      svc.plan([task('T1'), task('T2', { review_required: false }), task('T3')]);
+      const rev1 = await accept(h, svc, 'T1', { 'src/a.txt': 'hello\n' });
+      const mechanical = await toCandidate(h, svc, 'T2', { 'src/a.txt': 'hello\n' });
+      const pending = await toCandidate(h, svc, 'T3', { 'src/a.txt': 'hello\n' });
+      const before = h.events.length;
+      await rejectsCode(() => svc.integrate({ baseRevision: 'HEAD', revisions: [rev1] }), 'INVALID_INPUT');
+      await rejectsCode(() => svc.integrate({ baseRevision: b, revisions: [mechanical.revision] }), 'NOT_ACCEPTED');
+      await rejectsCode(() => svc.integrate({ baseRevision: b, revisions: [pending.revision] }), 'NOT_ACCEPTED');
+      await rejectsCode(() => svc.integrate({ baseRevision: b, revisions: ['f'.repeat(40)] }), 'NOT_ACCEPTED');
+      await rejectsCode(() => svc.integrate({ baseRevision: rev1, revisions: [rev1] }), 'NOT_ACCEPTED');
+      await rejectsCode(() => svc.integrate({ baseRevision: b, revisions: [rev1, rev1] }), 'INVALID_INPUT');
+      // The board says PASSED, but Pier's ledger no longer shows a fresh reviewer: refuse.
+      h.ledger.add({ paneId: 'r:T1', cwd: svc.task('T1').attemptRecords[0]!.lease.workspacePath, kind: 'reviewer-readonly', status: 'settled', createdAt: h.now.value, revivedFrom: 'r:old', outcome: 'x' });
+      await rejectsCode(() => svc.integrate({ baseRevision: b, revisions: [rev1] }), 'NOT_ACCEPTED');
+      assert.equal(h.events.length, before, 'refused integrations change nothing');
+    });
+
+    it('accepts candidates from another session only with that session\'s replayable evidence', async () => {
+      const first = h.service();
+      first.plan([task('T1')]);
+      const rev1 = await accept(h, first, 'T1', { 'src/a.txt': 'hello\n' });
+      const evidence = [...h.events];
+      const second = h.service();
+      await rejectsCode(() => second.integrate({ baseRevision: base(), revisions: [rev1] }), 'NOT_ACCEPTED');
+      const result = second.integrate({ baseRevision: base(), revisions: [rev1], evidence: [{ source: '/sessions/first.jsonl', events: evidence }] });
+      assert.equal(result.state, 'RUNNING');
+      assert.equal(result.inputs[0]!.source, '/sessions/first.jsonl');
+      await rejectsCode(() => second.integrate({ baseRevision: base(), revisions: [rev1], evidence: [{ source: 'bad', events: [evidence[1]!] }] }), 'INVALID_INPUT');
+    });
+
+    it('fails the integration when its history no longer matches the declared commits', async () => {
+      const svc = h.service();
+      svc.plan([task('T1')]);
+      const rev1 = await accept(h, svc, 'T1', { 'src/a.txt': 'hello\n' });
+      const result = svc.integrate({ baseRevision: base(), revisions: [rev1] });
+      commit(result.workspacePath, { 'src/a.txt': 'hello\nextra\n' }, 'sneaky extra commit');
+      const verified = await svc.verify(result.taskId);
+      assert.equal(verified.outcome, 'attempt_failed');
+      assert.match(verified.reasons.join(' '), /not the recorded integrated revision/);
+      assert.equal(svc.task(result.taskId).state, 'FAILED');
+    });
+  });
+
+  it('rejects newly added assert() in test code but not comments, static_assert, or production code', async () => {
+    const svc = h.service();
+    svc.plan([task('T1', { files_in_scope: ['src/', 'tests/'] })]);
+    const { cwd, verified } = await toCandidate(h, svc, 'T1', { 'src/a.txt': 'hello\n', 'tests/test_x.cpp': '#include <cassert>\nint main() { assert(1 + 1 == 2); return 0; }\n' });
+    assert.equal(verified.outcome, 'check_failed');
+    assert.match(verified.reasons.join(' '), /assert\(\) in test code .*tests\/test_x\.cpp/);
+    commit(cwd, { 'tests/test_x.cpp': '// assert() would compile out under NDEBUG\nstatic_assert(sizeof(int) >= 2, "int");\nint main() { return 0; }\n', 'src/prod.cpp': 'void f() { assert(true); }\n' });
+    const fixed = await svc.verify('T1');
+    assert.equal(fixed.outcome, 'awaiting_review', fixed.reasons.join('; '));
   });
 
   it('passes mechanically-verified tasks directly when review is not required', async () => {

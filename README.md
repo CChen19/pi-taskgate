@@ -6,7 +6,7 @@
 
 ## 主会话扩展（当前方向，P0 已实现，尚未真机验证）
 
-`src/pi-extension/index.ts` 是一个与 Pier 并列加载的 Pi extension，只在主会话中注册 8 个工具，不 spawn 任何 agent：
+`src/pi-extension/index.ts` 是一个与 Pier 并列加载的 Pi extension，只在主会话中注册 9 个工具，不 spawn 任何 agent：
 
 | 工具 | 由代码保证的事实 |
 |---|---|
@@ -14,9 +14,10 @@
 | `task_plan` | 原子地加入 TaskContract（全部校验通过才写入）：id 唯一、依赖存在且无环、`files_in_scope` 非空、verification 命令必须逐字在 host allowlist 中；`review_required` 默认 true |
 | `task_start` | 任务必须 READY/RETRYING 且依赖已 PASSED；host 从主 checkout 的 HEAD（或某个已 PASSED 依赖的 revision）建独立 worktree+branch，返回 worker prompt 和 `subagent` spawn 参数；`reuse_worktree` 在同一分支上开下一个 attempt |
 | `task_bind` | 通过 Pier ledger 确认该 agent 确实在该 worktree 中启动 |
-| `task_verify` | 要求 worker 在 Pier ledger 中已不是 running；host 检查 HEAD、changed paths、clean、commits ahead、scope，然后在**该 revision 的全新临时 checkout**（`<workspaceRoot>/.verify/`，只由 git 对象生成，事后删除）中跑 allowlist 命令，worker worktree 里被 ignore 的构建产物不会被复用；失败只记一次 check（attempt 不消耗，超过 `maxChecksPerAttempt` 才判 attempt 失败），通过则 settle 为 candidate（不需要 review 时直接 PASSED） |
+| `task_verify` | 要求 worker 在 Pier ledger 中已不是 running；host 检查 HEAD、changed paths、clean、commits ahead、scope，然后在**该 revision 的全新临时 checkout**（`<workspaceRoot>/.verify/`，只由 git 对象生成，事后删除）中跑 allowlist 命令，worker worktree 里被 ignore 的构建产物不会被复用；并拒绝测试代码中**新增**的 `assert(`（Release/`-DNDEBUG` 会把它编译掉；只检查新增行，忽略注释、字符串和 `static_assert`）；失败只记一次 check（attempt 不消耗，超过 `maxChecksPerAttempt` 才判 attempt 失败），通过则 settle 为 candidate（不需要 review 时直接 PASSED） |
 | `task_review_brief` | 先确认 reviewer role 对所有写/执行类工具显式 deny，且 candidate 仍是 HEAD 且干净；生成绑定 revision + 一次性 review id 的 brief |
 | `task_review_record` | 从 **Pier ledger** 读取 reviewer 的收尾输出（不采信主 agent 转述）；要求 reviewer ≠ implementer、role 正确、非 revived、在 brief 之后启动、review id 与 revision 都匹配、worktree 未变，然后 PASSED 或 RETRYING/FAILED |
+| `task_integrate` | P1：把精确的已验收 candidate revision（PASSED + clean-room 验证 + fresh review，并在 Pier ledger 里复核 reviewer verdict）按给定顺序 cherry-pick（`-x`）到基于**精确 base revision** 的新集成 worktree/分支；跨会话的 candidate 需要提供其 Pi session 文件作为证据（沿当前分支回放）。冲突即 abort、记录冲突文件并 FAILED，绝不自动解决。成功后集成任务走与普通任务相同的 `task_verify`（额外校验：集成历史与声明的源 commit 逐个 patch-id 相同且带 `-x` 来源）→ fresh reviewer → `task_review_record` |
 | `task_abandon` | 主 agent 放弃当前 attempt（受 retry 预算约束）或取消任务（依赖方变 BLOCKED） |
 
 task 事件以 `agent-orchestrator.task-event` custom entry 写入 Pi session，`/resume` 和分支切换时回放重建；worktree lease 通过 ownership ledger 重新 adopt。每次变更先在回放出的副本上试 apply，再持久化，失败时状态不变。
@@ -54,7 +55,7 @@ pi -e /path/to/pier/packages/pier-ext/src/index.ts -e /path/to/agent-orchestrato
 - 尚未在真实 Pi/Pier 会话中端到端跑过；离线测试覆盖真实 git worktree、真实 allowlist 进程、fake Pier ledger。
 - `task_verify` 依赖 Pier ledger 的 `running` 状态判断 worker 是否结束；如果 `subagent send` 之后 Pier 没有写新的 running 行，过早 verify 可能看到半成品并记一次失败 check。
 - Pier 的 todo 自动对账会在 subagent settle 时勾掉描述匹配的 todo；task 状态只以 `task_status` 为准，建议 spawn description 用 `T1:impl` 这类不与 todo 重合的形式（工具返回的就是这种）。
-- 不做自动 integration（P1）；worktree 不自动清理（P1）；git 检查是同步调用，verification 命令是异步调用。
+- integration 只做机械 cherry-pick，冲突时 fail closed，不提供冲突解决；worktree 不自动清理；git 检查是同步调用，verification 命令是异步调用。
 
 ## Legacy：外层 vertical slice（已冻结）
 
@@ -162,7 +163,7 @@ npm run vertical:run -- run --config ./vertical.config.json --plan-file ./plan.j
 npm run check
 ```
 
-本轮 274 项测试（含主会话扩展的 32 项：真实临时 git repo + worktree + allowlist 进程，fake Pier ledger/role），均不调用真实模型、Herdr、Pi 或网络。以下为 legacy slice 的覆盖说明。
+本轮 284 项测试（含主会话扩展的 42 项：真实临时 git repo + worktree + allowlist 进程，fake Pier ledger/role），均不调用真实模型、Herdr、Pi 或网络。以下为 legacy slice 的覆盖说明。
 
 Legacy slice 部分（242 项：241 项 fake + 1 项真实本地临时 git repo 语义验证），均不调用真实模型、Herdr、Pi、Git worktree、网络或凭据。vertical slice 的 fake 覆盖包括：并发独立任务 + 精确 revision review + integration；allowlist 升级在 executor start 前拒绝；SIGINT 取消运行中 worker；机械验证失败不 review/merge；reviewer 显式拒绝与 stale revision 均不 merge 且清理 artifact；`SCOPE_VIOLATION` 等 acceptanceEligible=false 的 settlement 从不触发机械 verify/review/merge；prerequisite 失败后 dependent 从不 start 且 journal 记录 BLOCKED；final integration verification 失败时保留 worker artifacts 与 integration workspace；malformed planner 首次失败后带结构 feedback 重试一次成功（planner 调用 2、metrics 正确）；metrics.modelCalls 对每个成功 task_started 的 worker attempt 计一次（retry 按实际 start 计，纯 executor start failure 不计，2-task happy path 断言 5）；真实 `GitIntegrationRunner.asPort()` 以冻结 plain port 过 core 严格 plain-object boundary 完成 rebase/merge/verification/conflict/status 并断言 merged（含 coordinator 未注入 integrationRunner 的 real-runner 构造 seam 回归，旧代码以 `runner must be a plain object` 失败）；planner transport 取消/失败/超时立即失败不重试；SIGINT 后 planner 只 spawn 一次、interrupt+close 各一次且 summary failed；config 边界（非绝对/空 role base、非法 reviewerStrategy、越界 plannerRetries、allowlist 重复/空白、可变 baseRevision（HEAD/branch/tag/短 SHA/revspec/空白））在任何 planner/executor 调用与 pane/worktree 前拒绝；默认 role base 由 repoRoot 注入为绝对路径。host fake 另外断言 integration git/verification 命令与 worktree plumbing 使用最小 env（不含密钥）、timeout、maxOutputBytes 上限，integration rebase 传入 base 必须等于固定 `options.baseRevision`，且未授权命令被拒；新增 pre-prompt boundary readiness 回归：session JSONL 延迟出现后只提交一次 prompt 并以有效的 post-boundary 追加结果 settle，永久缺失/永久 malformed 都在第 10 次（也是最后一次）poll 重试按文档化预算失败，close/interrupt 在 readiness 期间绝不提交 prompt，malformed 可在预算内恢复，pre-prompt `working` 快照不会污染 post-prompt `workingSeen`，pre-prompt `blocked`/`cancelled` 直接 fail closed 且不启动 prompt，readiness 期间 pane 从 host pane list 消失时 fail closed 为 `lost` 并丢弃保存的 prompt/env（phase 置 terminal），且 `StructuredAgentRunner` 自行 sanitize（中和 C0/C1 控制符、NEL、U+2028/U+2029、bidi embedding/isolate/标记）并 cap（160 字符，且不在 surrogate 对中间截断）port 提供的 terminal `outcome` 后带入抛错（含超大、Unicode-spoofing 与 surrogate-boundary 回归）。另有一项真实本地临时 git repo 语义单测（普通 repo，不建 worktree、不联网）：固定 base SHA 在 worker commit 后 `git rev-list base..HEAD` 为 1 且 `git diff base...HEAD` 非空，而 `HEAD` 基准为 0/空。下一步主控命令是：
 

@@ -8,6 +8,7 @@ import { WorktreeManager } from '../adapters/worktree-manager.ts';
 import { boundReviewerDiff } from '../core/reviewer-brief.ts';
 import { NodeCommandRunner, minimalProcessEnv, type CommandRunner } from '../host/command-runner.ts';
 import { GitCleanRoom } from '../host/clean-room.ts';
+import { GitHistory } from '../host/git-history.ts';
 import { GitWorktreePort } from '../host/git-worktree-port.ts';
 import { join } from 'node:path';
 import { PierHistoryLedger, pierPipeProblem } from '../host/pier-ledger.ts';
@@ -50,7 +51,8 @@ export function createHostTaskService(options: HostWiringOptions): TaskService {
     verifier: new ProcessAsyncVerificationRunner({ commandRunner, cwd: config.workspaceRoot, allowedCommands: config.verificationAllowlist, defaultTimeoutMs: config.verificationTimeoutMs, maxOutputBytes: 256 * 1024 }),
     cleanRoom: new GitCleanRoom({ repoRoot: config.repoRoot, root: join(config.workspaceRoot, '.verify'), commandRunner }),
     ledger: new PierHistoryLedger(config.pierHistoryRoots === undefined ? {} : { roots: config.pierHistoryRoots }),
-    checkReviewerRole: () => checkReadOnlyRole(roleDirs, config.reviewerRole),
+    checkReviewerRole: (role) => checkReadOnlyRole(roleDirs, role ?? config.reviewerRole),
+    history: new GitHistory({ repoRoot: config.repoRoot, commandRunner }),
     clock: () => Date.now(),
     persist: options.persist,
     checkWorkerCwd: pierPipeProblem,
