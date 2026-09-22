@@ -33,12 +33,23 @@ const MAX_ASSISTANT_TEXT = 32 * 1024;
 const MAX_POST_PROMPT_IDLE_POLLS = 3;
 /** Permit exactly two done probes after working without a new outcome; fail on the third. */
 const MAX_TRANSCRIPT_GRACE_POLLS = 2;
+/**
+ * Pre-prompt session-boundary readiness budget. `agent start` success is only a
+ * process-start acknowledgement: the Pi session JSONL path/file may not be
+ * reported yet. The start-completion callback makes one immediate capture
+ * attempt; at most ten poll-driven retries follow. A capture that succeeds on
+ * retry ten is accepted, and a capture that fails on retry ten terminates
+ * immediately (there is no eleventh retry).
+ */
+const MAX_BOUNDARY_READY_POLLS = 10;
 type Probe = { readonly status: 'working' | 'done' | 'blocked' | 'cancelled' | 'failed' | 'missing'; readonly sessionPath?: string };
 type TranscriptResult =
   | { readonly ok: true; readonly terminal: Terminal }
   | { readonly ok: false; readonly retryable: boolean; readonly outcome: string };
 
 type SessionBoundary = { readonly path: string; readonly byteLength: number; readonly prefixDigest: string; readonly device: number; readonly inode: number };
+type PanePhase = 'starting' | 'awaiting-boundary' | 'prompting' | 'ready' | 'terminal';
+type PendingPrompt = { readonly prompt: string; readonly env: NodeJS.ProcessEnv };
 type SessionRead = { readonly ok: true; readonly bytes: Buffer; readonly device: number; readonly inode: number } | { readonly ok: false; readonly replaced: boolean };
 type ParsedSession = { readonly ok: true; readonly assistantText?: string } | { readonly ok: false };
 
@@ -46,10 +57,13 @@ interface PaneState {
   readonly paneId: string;
   readonly cwd: string;
   owned: boolean;
-  phase: 'starting' | 'prompting' | 'ready' | 'terminal';
+  phase: PanePhase;
   workingSeen: boolean;
   postPromptIdlePolls: number;
   transcriptGracePolls: number;
+  boundaryPolls: number;
+  boundaryError?: string;
+  pendingPrompt?: PendingPrompt;
   sessionBoundary?: SessionBoundary;
   generation: number;
   cancelled: boolean;
@@ -226,7 +240,7 @@ export class HerdrCliPort implements HerdrSubagentPort {
     ], env, this.config.timeouts.probeMs));
     if (commandFailed(tab)) throw new Error(`herdr tab create failed: ${bounded(tab.stderr || tab.stdout)}`);
     const id = tabPaneId(parsedJson(tab.stdout));
-    const state: PaneState = { paneId: id, cwd: request.cwd, owned: true, phase: 'starting', workingSeen: false, postPromptIdlePolls: 0, transcriptGracePolls: 0, generation: 0, cancelled: false, closed: false };
+    const state: PaneState = { paneId: id, cwd: request.cwd, owned: true, phase: 'starting', workingSeen: false, postPromptIdlePolls: 0, transcriptGracePolls: 0, boundaryPolls: 0, pendingPrompt: { prompt: request.prompt, env }, generation: 0, cancelled: false, closed: false };
     this.panes.set(id, state);
     const generation = state.generation;
     const startAbort = new AbortController();
@@ -239,6 +253,7 @@ export class HerdrCliPort implements HerdrSubagentPort {
       ], env, this.config.timeouts.startMs, startAbort.signal));
       state.startJob = state.currentJob = startJob;
     } catch (error) {
+      delete state.pendingPrompt;
       state.terminal = { status: 'failed', outcome: bounded(error instanceof Error ? error.message : 'herdr agent start failed') };
       state.phase = 'terminal';
       return { sessionId: id };
@@ -246,48 +261,27 @@ export class HerdrCliPort implements HerdrSubagentPort {
     void startJob.promise.then((started) => {
       if (!this.current(state, generation)) return;
       delete state.startJob;
-      if (commandFailed(started)) { state.terminal = { status: 'failed', outcome: bounded(started.stderr || 'herdr agent start failed') }; state.phase = 'terminal'; return; }
+      if (commandFailed(started)) { delete state.pendingPrompt; state.terminal = { status: 'failed', outcome: bounded(started.stderr || 'herdr agent start failed') }; state.phase = 'terminal'; return; }
       try {
         state.sessionBoundary = this.captureSessionBoundary(state);
       } catch (error) {
-        state.terminal = { status: 'failed', outcome: bounded(error instanceof Error ? error.message : 'herdr agent session boundary was unavailable') };
-        state.phase = 'terminal';
+        // `agent start` success is only a process-start acknowledgement; the Pi
+        // session JSONL may not exist or be reported yet. Enter the bounded
+        // pre-prompt readiness phase and retry once per later host poll.
+        state.boundaryPolls = 0;
+        state.boundaryError = bounded(error instanceof Error ? error.message : 'herdr agent session boundary was unavailable');
+        state.phase = 'awaiting-boundary';
         return;
       }
-      state.phase = 'prompting';
-      const promptAbort = new AbortController();
-      state.promptAbort = promptAbort;
-      let promptJob: RunningCommand;
-      try {
-        promptJob = this.runner.runAsync(spec(this.config, request.cwd, ['agent', 'prompt', id, request.prompt, '--wait', '--timeout', String(this.config.timeouts.promptMs)], env, this.config.timeouts.promptMs, promptAbort.signal));
-        state.promptJob = state.currentJob = promptJob;
-      } catch (error) {
-        if (!this.current(state, generation)) return;
-        state.terminal = { status: 'failed', outcome: bounded(error instanceof Error ? error.message : 'herdr agent prompt failed') };
-        state.phase = 'terminal';
-        return;
-      }
-      void promptJob.promise.then((prompted) => {
-        if (!this.current(state, generation)) return;
-        delete state.promptJob;
-        if (state.currentJob === promptJob) delete state.currentJob;
-        if (commandFailed(prompted)) state.terminal = { status: 'failed', outcome: bounded(prompted.stderr || 'herdr agent prompt failed') };
-        state.phase = state.terminal === undefined ? 'ready' : 'terminal';
-      }, (error: unknown) => {
-        if (!this.current(state, generation)) return;
-        state.terminal = { status: state.cancelled ? 'cancelled' : 'failed', outcome: bounded(error instanceof Error ? error.message : 'herdr agent prompt failed') };
-        state.phase = 'terminal';
-      }).catch((error: unknown) => {
-        if (!this.current(state, generation)) return;
-        state.terminal = { status: state.cancelled ? 'cancelled' : 'failed', outcome: bounded(error instanceof Error ? error.message : 'herdr agent prompt failed') };
-        state.phase = 'terminal';
-      });
+      this.startPrompt(state, generation);
     }, (error: unknown) => {
       if (!this.current(state, generation)) return;
+      delete state.pendingPrompt;
       state.terminal = { status: state.cancelled ? 'cancelled' : 'failed', outcome: bounded(error instanceof Error ? error.message : 'herdr agent start failed') };
       state.phase = 'terminal';
     }).catch((error: unknown) => {
       if (!this.current(state, generation)) return;
+      delete state.pendingPrompt;
       state.terminal = { status: state.cancelled ? 'cancelled' : 'failed', outcome: bounded(error instanceof Error ? error.message : 'herdr agent start failed') };
       state.phase = 'terminal';
     });
@@ -311,7 +305,15 @@ export class HerdrCliPort implements HerdrSubagentPort {
     if (state.terminal !== undefined) return state.terminal;
     if (state.phase === 'starting') return { status: 'running' };
     const quick = this.probe(state);
-    if (quick.status === 'missing') { state.terminal = { status: 'lost', outcome: 'herdr pane is no longer present' }; return state.terminal; }
+    if (quick.status === 'missing') { delete state.pendingPrompt; state.terminal = { status: 'lost', outcome: 'herdr pane is no longer present' }; state.phase = 'terminal'; return state.terminal; }
+    if (state.phase === 'awaiting-boundary') {
+      const readiness = this.retryBoundary(state, quick);
+      // On a successful capture the prompt was just launched; this pre-prompt
+      // snapshot must never be interpreted as post-prompt state (for example
+      // workingSeen must not be set before this generation's prompt).
+      if (readiness === 'ready') return { status: 'running' };
+      return state.terminal ?? { status: 'running' };
+    }
     if (quick.status === 'failed') { state.terminal = { status: 'failed', outcome: 'herdr agent probe failed' }; return state.terminal; }
     if (state.sessionBoundary !== undefined && quick.sessionPath !== state.sessionBoundary.path) {
       state.terminal = { status: 'failed', outcome: 'herdr agent session path changed' };
@@ -394,7 +396,7 @@ export class HerdrCliPort implements HerdrSubagentPort {
     if (existing !== undefined) {
       if (existing.terminal !== undefined) throw new Error('cannot reattach a terminal herdr pane');
       if (existing.closed) throw new Error('cannot reattach a closed herdr pane');
-      if (existing.phase === 'starting' || existing.phase === 'prompting') throw new Error('cannot reattach a herdr pane that is actively starting or prompting');
+      if (existing.phase === 'starting' || existing.phase === 'awaiting-boundary' || existing.phase === 'prompting') throw new Error('cannot reattach a herdr pane that is actively starting, awaiting a boundary, or prompting');
       let boundary: SessionBoundary;
       try {
         boundary = this.captureSessionBoundary(existing);
@@ -415,7 +417,7 @@ export class HerdrCliPort implements HerdrSubagentPort {
     let parsed: unknown;
     try { parsed = parsedJson(listed.stdout); } catch { throw new Error('cannot reattach from malformed herdr pane list'); }
     if (!paneIds(parsed).includes(sessionId)) throw new Error('cannot reattach missing herdr pane');
-    const state: PaneState = { paneId: sessionId, cwd, owned: true, phase: 'ready', workingSeen: false, postPromptIdlePolls: 0, transcriptGracePolls: 0, generation: 0, cancelled: false, closed: false };
+    const state: PaneState = { paneId: sessionId, cwd, owned: true, phase: 'ready', workingSeen: false, postPromptIdlePolls: 0, transcriptGracePolls: 0, boundaryPolls: 0, generation: 0, cancelled: false, closed: false };
     try {
       state.sessionBoundary = this.captureSessionBoundary(state);
     } catch (error) {
@@ -429,9 +431,82 @@ export class HerdrCliPort implements HerdrSubagentPort {
     return state.generation === generation && !state.closed && !state.cancelled;
   }
 
+  /**
+   * One bounded pre-prompt boundary retry driven by a single host poll.
+   * Returns 'pending' while the budget lasts, 'ready' once the boundary is
+   * pinned and the prompt was launched, and 'terminal' once exhausted.
+   */
+  private retryBoundary(state: PaneState, quick: Probe): 'ready' | 'pending' | 'terminal' {
+    // A pre-prompt blocked/cancelled agent is terminal regardless of whether a
+    // boundary could be captured: never launch the prompt in that state.
+    if (quick.status === 'blocked') { delete state.pendingPrompt; state.terminal = { status: 'failed', outcome: 'worker is blocked' }; state.phase = 'terminal'; return 'terminal'; }
+    if (quick.status === 'cancelled') { delete state.pendingPrompt; state.terminal = { status: 'cancelled', outcome: 'worker was cancelled' }; state.phase = 'terminal'; return 'terminal'; }
+    state.boundaryPolls += 1;
+    try {
+      if (quick.status === 'failed') throw new Error('herdr agent session boundary probe failed');
+      if (quick.sessionPath === undefined) throw new Error('herdr agent session path was unavailable');
+      const boundary = sessionBoundary(quick.sessionPath);
+      if (boundary === undefined) throw new Error('herdr session JSONL boundary was unavailable or malformed');
+      state.sessionBoundary = boundary;
+      delete state.boundaryError;
+      this.startPrompt(state, state.generation);
+      return state.terminal === undefined ? 'ready' : 'terminal';
+    } catch (error) {
+      state.boundaryError = bounded(error instanceof Error ? error.message : 'herdr agent session boundary was unavailable');
+    }
+    if (state.boundaryPolls >= MAX_BOUNDARY_READY_POLLS) {
+      delete state.pendingPrompt;
+      state.terminal = { status: 'failed', outcome: bounded(`herdr agent session boundary readiness budget (${MAX_BOUNDARY_READY_POLLS} poll retries) exhausted: ${state.boundaryError}`) };
+      state.phase = 'terminal';
+      return 'terminal';
+    }
+    return 'pending';
+  }
+
+  /** Launch the saved prompt exactly once with the spawn-time env/timeout/signal semantics. */
+  private startPrompt(state: PaneState, generation: number): void {
+    if (!this.current(state, generation)) return;
+    const pending = state.pendingPrompt;
+    if (pending === undefined) {
+      state.terminal = { status: 'failed', outcome: bounded('herdr agent prompt launch data was unavailable') };
+      state.phase = 'terminal';
+      return;
+    }
+    delete state.pendingPrompt;
+    state.phase = 'prompting';
+    const promptAbort = new AbortController();
+    state.promptAbort = promptAbort;
+    let promptJob: RunningCommand;
+    try {
+      promptJob = this.runner.runAsync(spec(this.config, state.cwd, ['agent', 'prompt', state.paneId, pending.prompt, '--wait', '--timeout', String(this.config.timeouts.promptMs)], pending.env, this.config.timeouts.promptMs, promptAbort.signal));
+      state.promptJob = state.currentJob = promptJob;
+    } catch (error) {
+      if (!this.current(state, generation)) return;
+      state.terminal = { status: 'failed', outcome: bounded(error instanceof Error ? error.message : 'herdr agent prompt failed') };
+      state.phase = 'terminal';
+      return;
+    }
+    void promptJob.promise.then((prompted) => {
+      if (!this.current(state, generation)) return;
+      delete state.promptJob;
+      if (state.currentJob === promptJob) delete state.currentJob;
+      if (commandFailed(prompted)) state.terminal = { status: 'failed', outcome: bounded(prompted.stderr || 'herdr agent prompt failed') };
+      state.phase = state.terminal === undefined ? 'ready' : 'terminal';
+    }, (error: unknown) => {
+      if (!this.current(state, generation)) return;
+      state.terminal = { status: state.cancelled ? 'cancelled' : 'failed', outcome: bounded(error instanceof Error ? error.message : 'herdr agent prompt failed') };
+      state.phase = 'terminal';
+    }).catch((error: unknown) => {
+      if (!this.current(state, generation)) return;
+      state.terminal = { status: state.cancelled ? 'cancelled' : 'failed', outcome: bounded(error instanceof Error ? error.message : 'herdr agent prompt failed') };
+      state.phase = 'terminal';
+    });
+  }
+
   private cancelJobs(state: PaneState): void {
     state.generation++;
     state.cancelled = true;
+    delete state.pendingPrompt;
     state.startAbort?.abort();
     state.promptAbort?.abort();
     state.startJob?.cancel();
@@ -463,7 +538,7 @@ export class HerdrCliPort implements HerdrSubagentPort {
       const listed = this.runner.run(spec(this.config, cwd, ['pane', 'list', '--workspace', this.config.workspaceId], safeEnv(this.config), this.config.timeouts.probeMs));
       if (commandFailed(listed)) return { status: 'failed', outcome: 'herdr pane list was unavailable' };
       if (!paneIds(parsedJson(listed.stdout)).includes(sessionId)) return { status: 'lost', outcome: 'herdr pane is no longer present' };
-      const state: PaneState = { paneId: sessionId, cwd, owned: false, phase: 'ready', workingSeen: false, postPromptIdlePolls: 0, transcriptGracePolls: 0, generation: 0, cancelled: false, closed: false };
+      const state: PaneState = { paneId: sessionId, cwd, owned: false, phase: 'ready', workingSeen: false, postPromptIdlePolls: 0, transcriptGracePolls: 0, boundaryPolls: 0, generation: 0, cancelled: false, closed: false };
       state.sessionBoundary = this.captureSessionBoundary(state);
       this.panes.set(sessionId, state);
       return this.poll(sessionId);

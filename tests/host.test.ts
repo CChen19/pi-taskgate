@@ -341,11 +341,12 @@ describe('host command seams', () => {
     assert.deepEqual(port.poll('pane-prefix-mutation'), { status: 'failed', outcome: 'herdr session JSONL was truncated or replaced' });
   });
 
-  it('fails closed when the agent session path is missing after start', async () => {
+  it('fails closed on the bounded attempt when the agent session path never appears', async () => {
     const command = new ControlledHerdrCommand(['idle'], '/tmp/ao-unused-session.jsonl', 'pane-missing-session');
     command.run = (spec) => {
       command.sync.push(spec);
       if (spec.args[0] === 'tab') return result('{"result":{"root_pane":{"pane_id":"pane-missing-session"}}}');
+      if (spec.args[0] === 'pane' && spec.args[1] === 'list') return result('{"result":{"panes":[{"pane_id":"pane-missing-session"}]}}');
       if (spec.args[0] === 'agent' && spec.args[1] === 'get') return result('{"result":{"agent":{"agent_status":"idle","agent_session":{}}}}');
       return result();
     };
@@ -353,7 +354,209 @@ describe('host command seams', () => {
     port.spawn(spawnRequest);
     command.complete(0);
     await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.deepEqual(port.poll('pane-missing-session'), { status: 'failed', outcome: 'herdr agent session path was unavailable' });
+    // The initial start-completion attempt plus ten poll retries stay running...
+    for (let retry = 0; retry < 9; retry++) assert.deepEqual(port.poll('pane-missing-session'), { status: 'running' });
+    // Retry ten is the last allowed poll-driven attempt; its failure terminates.
+    assert.deepEqual(port.poll('pane-missing-session'), { status: 'failed', outcome: 'herdr agent session boundary readiness budget (10 poll retries) exhausted: herdr agent session path was unavailable' });
+  });
+
+  it('delays the prompt until the session JSONL appears and then submits it exactly once', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-delayed-boundary-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    const command = new ControlledHerdrCommand(['idle'], sessionFile, 'pane-delayed-boundary');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    assert.deepEqual(port.spawn(spawnRequest), { sessionId: 'pane-delayed-boundary' });
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    // `agent start` was acknowledged, but the boundary is absent: no prompt yet.
+    assert.equal(command.jobs.length, 1);
+    assert.equal(command.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 0);
+    assert.deepEqual(port.poll('pane-delayed-boundary'), { status: 'running' });
+    assert.equal(command.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 0);
+
+    // The Pi session JSONL becomes available on a later host poll.
+    writeFileSync(sessionFile, '');
+    assert.deepEqual(port.poll('pane-delayed-boundary'), { status: 'running' });
+    assert.equal(command.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 1);
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // Later polls must never resubmit the prompt.
+    assert.deepEqual(port.poll('pane-delayed-boundary'), { status: 'running' });
+    assert.equal(command.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 1);
+    appendFileSync(sessionFile, '{"role":"assistant","content":"delayed result"}\n');
+    assert.deepEqual(port.poll('pane-delayed-boundary'), { status: 'settled', outcome: 'delayed result', resultRef: 'herdr-session:pane-delayed-boundary' });
+    assert.equal(port.readFinalAssistant('pane-delayed-boundary'), 'delayed result');
+  });
+
+  it('fails on the documented attempt when the session JSONL path never appears', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-permanent-boundary-'));
+    const sessionFile = join(directory, 'never.jsonl');
+    const command = new ControlledHerdrCommand(['idle'], sessionFile, 'pane-permanent-boundary');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    for (let retry = 0; retry < 9; retry++) assert.deepEqual(port.poll('pane-permanent-boundary'), { status: 'running' });
+    assert.equal(command.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 0);
+    assert.deepEqual(port.poll('pane-permanent-boundary'), { status: 'failed', outcome: 'herdr agent session boundary readiness budget (10 poll retries) exhausted: herdr session JSONL boundary was unavailable or malformed' });
+  });
+
+  it('accepts a boundary captured on poll retry 10 and terminates on the tenth failed retry', async () => {
+    // Success on the tenth and final allowed poll-driven retry.
+    const successDirectory = mkdtempSync(join(tmpdir(), 'ao-boundary-retry-ten-'));
+    const successFile = join(successDirectory, 'session.jsonl');
+    const success = new ControlledHerdrCommand(['idle'], successFile, 'pane-boundary-retry-ten');
+    const successPort = new HerdrCliPort(herdrConfig(), success);
+    successPort.spawn(spawnRequest);
+    success.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    for (let retry = 1; retry <= 9; retry++) assert.deepEqual(successPort.poll('pane-boundary-retry-ten'), { status: 'running' });
+    assert.equal(success.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 0);
+    writeFileSync(successFile, '');
+    assert.deepEqual(successPort.poll('pane-boundary-retry-ten'), { status: 'running' });
+    assert.equal(success.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 1);
+
+    // A failure on the tenth retry terminates immediately with no eleventh retry.
+    const failureDirectory = mkdtempSync(join(tmpdir(), 'ao-boundary-retry-exhausted-'));
+    const failureFile = join(failureDirectory, 'never.jsonl');
+    const failure = new ControlledHerdrCommand(['idle'], failureFile, 'pane-boundary-retry-exhausted');
+    const failurePort = new HerdrCliPort(herdrConfig(), failure);
+    failurePort.spawn(spawnRequest);
+    failure.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    for (let retry = 1; retry <= 9; retry++) assert.deepEqual(failurePort.poll('pane-boundary-retry-exhausted'), { status: 'running' });
+    assert.deepEqual(failurePort.poll('pane-boundary-retry-exhausted'), { status: 'failed', outcome: 'herdr agent session boundary readiness budget (10 poll retries) exhausted: herdr session JSONL boundary was unavailable or malformed' });
+    assert.equal(failure.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 0);
+  });
+
+  it('drops pending prompt data and fails closed as lost when the pane disappears during readiness', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-boundary-lost-'));
+    const sessionFile = join(directory, 'never.jsonl');
+    const command = new ControlledHerdrCommand(['idle'], sessionFile, 'pane-boundary-lost');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(port.poll('pane-boundary-lost'), { status: 'running' });
+    // Narrow test-only inspection: the pane really is awaiting its boundary.
+    const state = (port as unknown as { panes: Map<string, { phase: string; pendingPrompt?: unknown }> }).panes.get('pane-boundary-lost');
+    assert.equal(state?.phase, 'awaiting-boundary');
+    assert.notEqual(state?.pendingPrompt, undefined);
+
+    // The host pane list no longer contains the tracked pane.
+    command.run = (spec) => {
+      command.sync.push(spec);
+      if (spec.args[0] === 'pane' && spec.args[1] === 'list') return result('{"result":{"panes":[]}}');
+      return result();
+    };
+    assert.deepEqual(port.poll('pane-boundary-lost'), { status: 'lost', outcome: 'herdr pane is no longer present' });
+    assert.equal(state?.phase, 'terminal');
+    assert.equal(state?.pendingPrompt, undefined);
+    assert.equal(command.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 0);
+  });
+
+  it('recovers a malformed session JSONL before the bound and then prompts exactly once', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-malformed-recovery-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, 'not-json\n');
+    const command = new ControlledHerdrCommand(['idle'], sessionFile, 'pane-malformed-recovery');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    for (let attempt = 0; attempt < 4; attempt++) assert.deepEqual(port.poll('pane-malformed-recovery'), { status: 'running' });
+    assert.equal(command.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 0);
+    writeFileSync(sessionFile, '{"role":"user","content":"prompt"}\n');
+    assert.deepEqual(port.poll('pane-malformed-recovery'), { status: 'running' });
+    assert.equal(command.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 1);
+  });
+
+  it('fails closed when a malformed session JSONL persists past the bound', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-malformed-permanent-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, 'not-json\n');
+    const command = new ControlledHerdrCommand(['idle'], sessionFile, 'pane-malformed-permanent');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    for (let retry = 0; retry < 9; retry++) assert.deepEqual(port.poll('pane-malformed-permanent'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-malformed-permanent'), { status: 'failed', outcome: 'herdr agent session boundary readiness budget (10 poll retries) exhausted: herdr session JSONL boundary was unavailable or malformed' });
+  });
+
+  it('never starts the prompt when the pane is closed or interrupted during boundary readiness', async () => {
+    const closeDirectory = mkdtempSync(join(tmpdir(), 'ao-close-boundary-'));
+    const closeFile = join(closeDirectory, 'never.jsonl');
+    const closed = new ControlledHerdrCommand(['idle'], closeFile, 'pane-close-boundary');
+    const closePort = new HerdrCliPort(herdrConfig(), closed);
+    closePort.spawn(spawnRequest);
+    closed.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(closePort.poll('pane-close-boundary'), { status: 'running' });
+    closePort.close('pane-close-boundary');
+    writeFileSync(closeFile, '');
+    assert.deepEqual(closePort.poll('pane-close-boundary'), { status: 'cancelled', outcome: 'worker pane closed' });
+    assert.equal(closed.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 0);
+
+    const cancelDirectory = mkdtempSync(join(tmpdir(), 'ao-cancel-boundary-'));
+    const cancelFile = join(cancelDirectory, 'never.jsonl');
+    const cancelled = new ControlledHerdrCommand(['idle'], cancelFile, 'pane-cancel-boundary');
+    const cancelPort = new HerdrCliPort(herdrConfig(), cancelled);
+    cancelPort.spawn(spawnRequest);
+    cancelled.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(cancelPort.poll('pane-cancel-boundary'), { status: 'running' });
+    cancelPort.interrupt('pane-cancel-boundary', 'stop');
+    writeFileSync(cancelFile, '');
+    assert.deepEqual(cancelPort.poll('pane-cancel-boundary'), { status: 'cancelled', outcome: 'worker interrupted' });
+    assert.equal(cancelled.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 0);
+  });
+
+  it('does not consume a pre-prompt working snapshot as post-prompt state after boundary capture', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-pre-prompt-working-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    const command = new ControlledHerdrCommand(['working', 'working', 'done'], sessionFile, 'pane-pre-prompt-working');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    // The initial capture failed (file absent); the next poll's snapshot is working.
+    writeFileSync(sessionFile, '');
+    assert.deepEqual(port.poll('pane-pre-prompt-working'), { status: 'running' });
+    assert.equal(command.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 1);
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    // A pre-prompt working snapshot must not set workingSeen: post-prompt idle
+    // grace (3) applies, not transcript grace after working (2).
+    assert.deepEqual(port.poll('pane-pre-prompt-working'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-pre-prompt-working'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-pre-prompt-working'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-pre-prompt-working'), { status: 'failed', outcome: 'herdr session JSONL was unchanged or had no new assistant outcome' });
+  });
+
+  it('fails closed without launching the prompt for a pre-prompt blocked or cancelled agent', async () => {
+    const blockedDirectory = mkdtempSync(join(tmpdir(), 'ao-pre-prompt-blocked-'));
+    const blockedFile = join(blockedDirectory, 'session.jsonl');
+    const blocked = new ControlledHerdrCommand(['blocked'], blockedFile, 'pane-pre-prompt-blocked');
+    const blockedPort = new HerdrCliPort(herdrConfig(), blocked);
+    blockedPort.spawn(spawnRequest);
+    blocked.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    writeFileSync(blockedFile, '');
+    assert.deepEqual(blockedPort.poll('pane-pre-prompt-blocked'), { status: 'failed', outcome: 'worker is blocked' });
+    assert.equal(blocked.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 0);
+
+    const cancelledDirectory = mkdtempSync(join(tmpdir(), 'ao-pre-prompt-cancelled-'));
+    const cancelledFile = join(cancelledDirectory, 'session.jsonl');
+    const cancelled = new ControlledHerdrCommand(['cancelled'], cancelledFile, 'pane-pre-prompt-cancelled');
+    const cancelledPort = new HerdrCliPort(herdrConfig(), cancelled);
+    cancelledPort.spawn(spawnRequest);
+    cancelled.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    writeFileSync(cancelledFile, '');
+    assert.deepEqual(cancelledPort.poll('pane-pre-prompt-cancelled'), { status: 'cancelled', outcome: 'worker was cancelled' });
+    assert.equal(cancelled.jobs.filter((job) => job.spec.args[1] === 'prompt').length, 0);
   });
 
   it('rejects an oversized appended assistant outcome permanently', async () => {
@@ -534,7 +737,7 @@ describe('host command seams', () => {
     const starting = new DeferredCommand();
     const startingPort = new HerdrCliPort(herdrConfig(), starting);
     startingPort.spawn(spawnRequest);
-    assert.throws(() => startingPort.reattach('pane-race'), /actively starting or prompting/);
+    assert.throws(() => startingPort.reattach('pane-race'), /actively starting, awaiting a boundary, or prompting/);
     startingPort.close('pane-race');
     starting.jobs[0]!.resolve(result());
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -552,6 +755,21 @@ describe('host command seams', () => {
     appendFileSync(sessionFile, '{"role":"assistant","content":"terminal result"}\n');
     assert.deepEqual(port.poll('pane-reattach-terminal'), { status: 'settled', outcome: 'terminal result', resultRef: 'herdr-session:pane-reattach-terminal' });
     assert.throws(() => port.reattach('pane-reattach-terminal'), /terminal/);
+  });
+
+  it('refuses to reattach a pane that is awaiting its session boundary', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-reattach-awaiting-'));
+    const sessionFile = join(directory, 'never.jsonl');
+    const command = new ControlledHerdrCommand(['idle'], sessionFile, 'pane-reattach-awaiting');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    // Start was acknowledged but the JSONL is absent, so the pane is in the
+    // bounded pre-prompt readiness phase rather than merely starting.
+    assert.deepEqual(port.poll('pane-reattach-awaiting'), { status: 'running' });
+    assert.throws(() => port.reattach('pane-reattach-awaiting'), /actively starting, awaiting a boundary, or prompting/);
+    port.close('pane-reattach-awaiting');
   });
 
   it('maps absent panes to lost and supports pane-id reattach without spawn', () => {

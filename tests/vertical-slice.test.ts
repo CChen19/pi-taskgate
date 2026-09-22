@@ -351,7 +351,73 @@ class CancellingHerdrFake {
   close(sessionId: string): void { this.closes.push(sessionId); }
 }
 
+class FailingHerdrFake {
+  readonly outcome: string;
+  constructor(outcome: string) { this.outcome = outcome; }
+  spawn(): { sessionId: string } { return { sessionId: 'failing-session' }; }
+  poll(): { status: 'failed'; outcome: string } { return { status: 'failed', outcome: this.outcome }; }
+  readFinalAssistant(): string { return '{}'; }
+  interrupt(): void { /* fake */ }
+  close(): void { /* fake */ }
+}
+
 describe('vertical first-run gates', () => {
+  it('propagates the Herdr terminal outcome through the structured agent transport error', async () => {
+    const herdr = new FailingHerdrFake('herdr agent session boundary readiness budget (10 poll retries) exhausted: herdr agent session path was unavailable');
+    const runner = new StructuredAgentRunner({ herdr, clock: () => 0, sleep: async () => undefined, pollIntervalMs: 1, timeoutMs: 10 });
+    const planner = new StructuredPlanner(configBase, runner, '/repo');
+    await assert.rejects(
+      planner.plan({ userTask: 'plan it', repoRoot: '/repo', baseRevision: FULL_BASE_SHA, authorizedVerificationCommands: ['check', 'final'] }),
+      /structured agent ended with failed: herdr agent session boundary readiness budget \(10 poll retries\) exhausted: herdr agent session path was unavailable/,
+    );
+  });
+
+  it('sanitizes and caps a transport outcome instead of trusting the generic port', async () => {
+    const unsafe = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/;
+    const oversized = new FailingHerdrFake(`${'x'.repeat(10)}\u202e\u2028${'y'.repeat(4096)}`);
+    const oversizedRunner = new StructuredAgentRunner({ herdr: oversized, clock: () => 0, sleep: async () => undefined, pollIntervalMs: 1, timeoutMs: 10 });
+    await assert.rejects(
+      new StructuredPlanner(configBase, oversizedRunner, '/repo').plan({ userTask: 'plan it', repoRoot: '/repo', baseRevision: FULL_BASE_SHA, authorizedVerificationCommands: ['check', 'final'] }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /^structured agent ended with failed: x{10} y+…\[truncated\]$/);
+        assert.equal(unsafe.test(error.message), false);
+        assert.ok(error.message.length <= 'structured agent ended with failed: '.length + 160);
+        return true;
+      },
+    );
+
+    // A short outcome is sanitized to a single, unspoofed line (control, NEL,
+    // line/paragraph separators, and bidi marks are neutralized).
+    const spoofed = new FailingHerdrFake('line1\nline2\u202eover\u2069\u0085next\u200fmark\u061c');
+    const spoofedRunner = new StructuredAgentRunner({ herdr: spoofed, clock: () => 0, sleep: async () => undefined, pollIntervalMs: 1, timeoutMs: 10 });
+    await assert.rejects(
+      new StructuredPlanner(configBase, spoofedRunner, '/repo').plan({ userTask: 'plan it', repoRoot: '/repo', baseRevision: FULL_BASE_SHA, authorizedVerificationCommands: ['check', 'final'] }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, 'structured agent ended with failed: line1 line2 over next mark');
+        assert.equal(unsafe.test(error.message), false);
+        return true;
+      },
+    );
+  });
+
+  it('does not truncate a transport outcome through a surrogate pair', async () => {
+    const herdr = new FailingHerdrFake(`${'x'.repeat(147)}😀${'y'.repeat(100)}`);
+    const runner = new StructuredAgentRunner({ herdr, clock: () => 0, sleep: async () => undefined, pollIntervalMs: 1, timeoutMs: 10 });
+    await assert.rejects(
+      new StructuredPlanner(configBase, runner, '/repo').plan({ userTask: 'plan it', repoRoot: '/repo', baseRevision: FULL_BASE_SHA, authorizedVerificationCommands: ['check', 'final'] }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        // Without surrogate handling the slice would end on a lone high surrogate
+        // instead of dropping the split pair.
+        assert.match(error.message, /^structured agent ended with failed: x{147}…\[truncated\]$/);
+        assert.equal(/[\uD800-\uDBFF]…\[truncated\]$/.test(error.message), false);
+        return true;
+      },
+    );
+  });
+
   it('runs StructuredPlanner through scoped context with the planner worker role', async () => {
     const herdr = new PlannerHerdrFake();
     const runner = new StructuredAgentRunner({ herdr, clock: () => 0, sleep: async () => undefined, pollIntervalMs: 1, timeoutMs: 10 });
