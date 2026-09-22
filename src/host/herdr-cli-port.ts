@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import type { CommandRunner, CommandSpec, RunningCommand } from './command-runner.ts';
 import type { HerdrSpawnRequest, HerdrSubagentPort } from '../adapters/pi-herdr-executor.ts';
@@ -29,7 +29,18 @@ export interface HerdrCliConfig {
 
 type Terminal = { readonly status: 'settled' | 'failed' | 'cancelled' | 'lost'; readonly outcome: string; readonly resultRef?: string };
 const MAX_ASSISTANT_TEXT = 32 * 1024;
+/** Permit exactly three post-prompt idle/done probes without a new outcome; fail on the fourth. */
+const MAX_POST_PROMPT_IDLE_POLLS = 3;
+/** Permit exactly two done probes after working without a new outcome; fail on the third. */
+const MAX_TRANSCRIPT_GRACE_POLLS = 2;
 type Probe = { readonly status: 'working' | 'done' | 'blocked' | 'cancelled' | 'failed' | 'missing'; readonly sessionPath?: string };
+type TranscriptResult =
+  | { readonly ok: true; readonly terminal: Terminal }
+  | { readonly ok: false; readonly retryable: boolean; readonly outcome: string };
+
+type SessionBoundary = { readonly path: string; readonly byteLength: number; readonly prefixDigest: string; readonly device: number; readonly inode: number };
+type SessionRead = { readonly ok: true; readonly bytes: Buffer; readonly device: number; readonly inode: number } | { readonly ok: false; readonly replaced: boolean };
+type ParsedSession = { readonly ok: true; readonly assistantText?: string } | { readonly ok: false };
 
 interface PaneState {
   readonly paneId: string;
@@ -37,6 +48,9 @@ interface PaneState {
   owned: boolean;
   phase: 'starting' | 'prompting' | 'ready' | 'terminal';
   workingSeen: boolean;
+  postPromptIdlePolls: number;
+  transcriptGracePolls: number;
+  sessionBoundary?: SessionBoundary;
   generation: number;
   cancelled: boolean;
   closed: boolean;
@@ -142,11 +156,8 @@ function textFrom(value: unknown): string | undefined {
   return undefined;
 }
 
-function readLastAssistant(path: string): { readonly ok: true; readonly text: string } | { readonly ok: false } {
-  if (!isAbsolute(path)) return { ok: false };
-  let raw: string;
-  try { raw = readFileSync(path, { encoding: 'utf8' }); } catch { return { ok: false }; }
-  let last: string | undefined;
+function parseSession(raw: string): ParsedSession {
+  let assistantText: string | undefined;
   for (const line of raw.split('\n')) {
     if (line.trim().length === 0) continue;
     let parsed: unknown;
@@ -158,10 +169,27 @@ function readLastAssistant(path: string): { readonly ok: true; readonly text: st
     const message = messageValue as Record<string, unknown>;
     if (message.role === 'assistant') {
       const text = textFrom(message.content ?? message.text ?? message.message);
-      if (text !== undefined && text.length > 0) last = text;
+      if (text !== undefined && text.length > 0) assistantText = text;
     }
   }
-  return last === undefined ? { ok: false } : { ok: true, text: last };
+  return { ok: true, ...(assistantText === undefined ? {} : { assistantText }) };
+}
+
+function readSession(path: string): SessionRead {
+  if (!isAbsolute(path)) return { ok: false, replaced: false };
+  try {
+    const before = statSync(path);
+    const bytes = readFileSync(path);
+    const after = statSync(path);
+    if (before.dev !== after.dev || before.ino !== after.ino) return { ok: false, replaced: true };
+    return { ok: true, bytes, device: after.dev, inode: after.ino };
+  } catch { return { ok: false, replaced: false }; }
+}
+
+function sessionBoundary(path: string): SessionBoundary | undefined {
+  const session = readSession(path);
+  if (!session.ok || !parseSession(session.bytes.toString('utf8')).ok) return undefined;
+  return { path, byteLength: session.bytes.byteLength, prefixDigest: createHash('sha256').update(session.bytes).digest('hex'), device: session.device, inode: session.inode };
 }
 
 /** Stable opaque name: task/attempt characters never enter the Herdr name. */
@@ -198,7 +226,7 @@ export class HerdrCliPort implements HerdrSubagentPort {
     ], env, this.config.timeouts.probeMs));
     if (commandFailed(tab)) throw new Error(`herdr tab create failed: ${bounded(tab.stderr || tab.stdout)}`);
     const id = tabPaneId(parsedJson(tab.stdout));
-    const state: PaneState = { paneId: id, cwd: request.cwd, owned: true, phase: 'starting', workingSeen: false, generation: 0, cancelled: false, closed: false };
+    const state: PaneState = { paneId: id, cwd: request.cwd, owned: true, phase: 'starting', workingSeen: false, postPromptIdlePolls: 0, transcriptGracePolls: 0, generation: 0, cancelled: false, closed: false };
     this.panes.set(id, state);
     const generation = state.generation;
     const startAbort = new AbortController();
@@ -219,6 +247,13 @@ export class HerdrCliPort implements HerdrSubagentPort {
       if (!this.current(state, generation)) return;
       delete state.startJob;
       if (commandFailed(started)) { state.terminal = { status: 'failed', outcome: bounded(started.stderr || 'herdr agent start failed') }; state.phase = 'terminal'; return; }
+      try {
+        state.sessionBoundary = this.captureSessionBoundary(state);
+      } catch (error) {
+        state.terminal = { status: 'failed', outcome: bounded(error instanceof Error ? error.message : 'herdr agent session boundary was unavailable') };
+        state.phase = 'terminal';
+        return;
+      }
       state.phase = 'prompting';
       const promptAbort = new AbortController();
       state.promptAbort = promptAbort;
@@ -237,7 +272,6 @@ export class HerdrCliPort implements HerdrSubagentPort {
         delete state.promptJob;
         if (state.currentJob === promptJob) delete state.currentJob;
         if (commandFailed(prompted)) state.terminal = { status: 'failed', outcome: bounded(prompted.stderr || 'herdr agent prompt failed') };
-        else state.workingSeen = true; // --wait success proves this generation completed, even if probe skipped working.
         state.phase = state.terminal === undefined ? 'ready' : 'terminal';
       }, (error: unknown) => {
         if (!this.current(state, generation)) return;
@@ -279,14 +313,40 @@ export class HerdrCliPort implements HerdrSubagentPort {
     const quick = this.probe(state);
     if (quick.status === 'missing') { state.terminal = { status: 'lost', outcome: 'herdr pane is no longer present' }; return state.terminal; }
     if (quick.status === 'failed') { state.terminal = { status: 'failed', outcome: 'herdr agent probe failed' }; return state.terminal; }
-    if (quick.status === 'working') { state.workingSeen = true; return { status: 'running' }; }
+    if (state.sessionBoundary !== undefined && quick.sessionPath !== state.sessionBoundary.path) {
+      state.terminal = { status: 'failed', outcome: 'herdr agent session path changed' };
+      return state.terminal;
+    }
+    if (quick.status === 'working') {
+      state.workingSeen = true;
+      return { status: 'running' };
+    }
     if (state.phase === 'prompting') return { status: 'running' };
     if (quick.status === 'blocked') { state.terminal = { status: 'failed', outcome: 'worker is blocked' }; return state.terminal; }
     if (quick.status === 'cancelled') { state.terminal = { status: 'cancelled', outcome: 'worker was cancelled' }; return state.terminal; }
-    if (quick.status === 'done' && state.workingSeen) {
-      const result = this.finishFromAgentGet(state.paneId, quick.sessionPath);
-      state.terminal = result;
-      return result;
+    if (quick.status === 'done') {
+      const transcript = this.finishFromAgentGet(state.paneId, quick.sessionPath);
+      if (transcript.ok) {
+        state.terminal = transcript.terminal;
+        return transcript.terminal;
+      }
+      if (!transcript.retryable) {
+        state.terminal = { status: 'failed', outcome: transcript.outcome };
+        return state.terminal;
+      }
+      if (state.workingSeen) {
+        state.transcriptGracePolls++;
+        if (state.transcriptGracePolls > MAX_TRANSCRIPT_GRACE_POLLS) {
+          state.terminal = { status: 'failed', outcome: transcript.outcome };
+          return state.terminal;
+        }
+      } else {
+        state.postPromptIdlePolls++;
+        if (state.postPromptIdlePolls > MAX_POST_PROMPT_IDLE_POLLS) {
+          state.terminal = { status: 'failed', outcome: transcript.outcome };
+          return state.terminal;
+        }
+      }
     }
     return { status: 'running' };
   }
@@ -324,16 +384,44 @@ export class HerdrCliPort implements HerdrSubagentPort {
     return undefined;
   }
 
-  /** Recovery path: paneId is the persisted session id. It never restarts a pane. */
+  /**
+   * Recovery path: paneId is the persisted session id. Reattach pins the
+   * current JSONL boundary and accepts only a later append from that same
+   * session; it deliberately cannot identify or recover a prior turn.
+   */
   reattach(sessionId: string, cwd = process.cwd()): { readonly sessionId: string } {
     const existing = this.panes.get(sessionId);
-    if (existing !== undefined) { existing.owned = true; existing.closed = false; existing.cancelled = false; return { sessionId }; }
+    if (existing !== undefined) {
+      if (existing.terminal !== undefined) throw new Error('cannot reattach a terminal herdr pane');
+      if (existing.closed) throw new Error('cannot reattach a closed herdr pane');
+      if (existing.phase === 'starting' || existing.phase === 'prompting') throw new Error('cannot reattach a herdr pane that is actively starting or prompting');
+      let boundary: SessionBoundary;
+      try {
+        boundary = this.captureSessionBoundary(existing);
+      } catch (error) {
+        throw new Error(`cannot reattach: ${bounded(error instanceof Error ? error.message : 'herdr session boundary was unavailable')}`);
+      }
+      existing.sessionBoundary = boundary;
+      existing.workingSeen = false;
+      existing.postPromptIdlePolls = 0;
+      existing.transcriptGracePolls = 0;
+      existing.phase = 'ready';
+      existing.owned = true;
+      existing.cancelled = false;
+      return { sessionId };
+    }
     const listed = this.runner.run(spec(this.config, cwd, ['pane', 'list', '--workspace', this.config.workspaceId], safeEnv(this.config), this.config.timeouts.probeMs));
     if (commandFailed(listed)) throw new Error('cannot reattach: herdr pane list was unavailable');
     let parsed: unknown;
     try { parsed = parsedJson(listed.stdout); } catch { throw new Error('cannot reattach from malformed herdr pane list'); }
     if (!paneIds(parsed).includes(sessionId)) throw new Error('cannot reattach missing herdr pane');
-    this.panes.set(sessionId, { paneId: sessionId, cwd, owned: true, phase: 'ready', workingSeen: false, generation: 0, cancelled: false, closed: false });
+    const state: PaneState = { paneId: sessionId, cwd, owned: true, phase: 'ready', workingSeen: false, postPromptIdlePolls: 0, transcriptGracePolls: 0, generation: 0, cancelled: false, closed: false };
+    try {
+      state.sessionBoundary = this.captureSessionBoundary(state);
+    } catch (error) {
+      throw new Error(`cannot reattach: ${bounded(error instanceof Error ? error.message : 'herdr session boundary was unavailable')}`);
+    }
+    this.panes.set(sessionId, state);
     return { sessionId };
   }
 
@@ -371,23 +459,48 @@ export class HerdrCliPort implements HerdrSubagentPort {
 
   private probeUnknown(sessionId: string): unknown {
     try {
-      const listed = this.runner.run(spec(this.config, process.cwd(), ['pane', 'list', '--workspace', this.config.workspaceId], safeEnv(this.config), this.config.timeouts.probeMs));
+      const cwd = process.cwd();
+      const listed = this.runner.run(spec(this.config, cwd, ['pane', 'list', '--workspace', this.config.workspaceId], safeEnv(this.config), this.config.timeouts.probeMs));
       if (commandFailed(listed)) return { status: 'failed', outcome: 'herdr pane list was unavailable' };
       if (!paneIds(parsedJson(listed.stdout)).includes(sessionId)) return { status: 'lost', outcome: 'herdr pane is no longer present' };
-      const state: PaneState = { paneId: sessionId, cwd: process.cwd(), owned: false, phase: 'ready', workingSeen: false, generation: 0, cancelled: false, closed: false };
+      const state: PaneState = { paneId: sessionId, cwd, owned: false, phase: 'ready', workingSeen: false, postPromptIdlePolls: 0, transcriptGracePolls: 0, generation: 0, cancelled: false, closed: false };
+      state.sessionBoundary = this.captureSessionBoundary(state);
       this.panes.set(sessionId, state);
       return this.poll(sessionId);
     } catch { return { status: 'failed', outcome: 'herdr pane probe was unavailable' }; }
   }
 
-  private finishFromAgentGet(paneId: string, sessionPath: string | undefined): Terminal {
-    if (sessionPath === undefined) return { status: 'failed', outcome: 'herdr agent session path was unavailable' };
-    const transcript = readLastAssistant(sessionPath);
-    if (!transcript.ok) return { status: 'failed', outcome: 'herdr session JSONL was malformed or had no assistant outcome' };
-    if (transcript.text.length > MAX_ASSISTANT_TEXT) return { status: 'failed', outcome: 'herdr assistant result exceeded the in-memory limit' };
+  private captureSessionBoundary(state: PaneState): SessionBoundary {
+    const agent = this.runner.run(spec(this.config, state.cwd, ['agent', 'get', state.paneId], safeEnv(this.config), this.config.timeouts.probeMs));
+    if (commandFailed(agent)) throw new Error('herdr agent session boundary probe failed');
+    const snapshot = agentSnapshot(parsedJson(agent.stdout));
+    if (snapshot.sessionPath === undefined) throw new Error('herdr agent session path was unavailable');
+    const boundary = sessionBoundary(snapshot.sessionPath);
+    if (boundary === undefined) throw new Error('herdr session JSONL boundary was unavailable or malformed');
+    return boundary;
+  }
+
+  private finishFromAgentGet(paneId: string, sessionPath: string | undefined): TranscriptResult {
     const state = this.panes.get(paneId);
-    if (state !== undefined) state.assistantText = transcript.text;
-    return { status: 'settled', outcome: bounded(transcript.text), resultRef: `herdr-session:${paneId}` };
+    const boundary = state?.sessionBoundary;
+    if (boundary === undefined) return { ok: false, retryable: false, outcome: 'herdr agent session boundary was unavailable' };
+    if (sessionPath !== boundary.path) return { ok: false, retryable: false, outcome: 'herdr agent session path changed' };
+    const session = readSession(boundary.path);
+    if (!session.ok) return { ok: false, retryable: !session.replaced, outcome: session.replaced ? 'herdr session JSONL was truncated or replaced' : 'herdr session JSONL was unavailable or had no new assistant outcome' };
+    if (session.device !== boundary.device || session.inode !== boundary.inode) return { ok: false, retryable: false, outcome: 'herdr session JSONL was replaced' };
+    if (session.bytes.byteLength < boundary.byteLength) return { ok: false, retryable: false, outcome: 'herdr session JSONL was truncated or replaced' };
+    const prefix = session.bytes.subarray(0, boundary.byteLength);
+    const prefixDigest = createHash('sha256').update(prefix).digest('hex');
+    if (prefixDigest !== boundary.prefixDigest) return { ok: false, retryable: false, outcome: 'herdr session JSONL was truncated or replaced' };
+    if (session.bytes.byteLength === boundary.byteLength) return { ok: false, retryable: true, outcome: 'herdr session JSONL was unchanged or had no new assistant outcome' };
+    const full = parseSession(session.bytes.toString('utf8'));
+    const appended = parseSession(session.bytes.subarray(boundary.byteLength).toString('utf8'));
+    if (!full.ok || !appended.ok) return { ok: false, retryable: true, outcome: 'herdr session JSONL was malformed or had no new assistant outcome' };
+    const text = appended.assistantText;
+    if (text === undefined) return { ok: false, retryable: true, outcome: 'herdr session JSONL was unchanged or had no new assistant outcome' };
+    if (text.length > MAX_ASSISTANT_TEXT) return { ok: false, retryable: false, outcome: 'herdr assistant result exceeded the in-memory limit' };
+    if (state !== undefined) state.assistantText = text;
+    return { ok: true, terminal: { status: 'settled', outcome: bounded(text), resultRef: `herdr-session:${paneId}` } };
   }
 }
 

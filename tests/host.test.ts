@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { NodeCommandRunner } from '../src/host/command-runner.ts';
@@ -33,6 +33,51 @@ class DeferredCommand implements CommandRunner {
     this.jobs.push(job);
     const promise = new Promise<CommandResult>((next) => { resolve = next; });
     return { promise, cancel: () => { job.cancelled = true; } };
+  }
+}
+
+class ControlledHerdrCommand implements CommandRunner {
+  readonly sync: CommandSpec[] = [];
+  readonly jobs: Array<{ readonly spec: CommandSpec; readonly resolve: (value: CommandResult) => void; cancelled: boolean }> = [];
+  private agentGets = 0;
+  readonly statuses: readonly string[];
+  readonly sessionFile: string;
+  readonly paneId: string;
+  readonly sessionPaths: readonly string[];
+  constructor(statuses: readonly string[], sessionFile: string, paneId = 'pane-controlled', sessionPaths: readonly string[] = []) {
+    this.statuses = statuses;
+    this.sessionFile = sessionFile;
+    this.paneId = paneId;
+    this.sessionPaths = sessionPaths;
+  }
+
+  run(spec: CommandSpec): CommandResult {
+    this.sync.push(spec);
+    const args = [...spec.args];
+    if (args[0] === 'tab') return result(JSON.stringify({ result: { root_pane: { pane_id: this.paneId } } }));
+    if (args[0] === 'pane' && args[1] === 'list') return result(JSON.stringify({ result: { panes: [{ pane_id: this.paneId }] } }));
+    if (args[0] === 'agent' && args[1] === 'get') {
+      const index = this.agentGets++;
+      const status = this.statuses[Math.min(index, this.statuses.length - 1)] ?? 'idle';
+      const sessionFile = this.sessionPaths[Math.min(index, this.sessionPaths.length - 1)] ?? this.sessionFile;
+      return result(JSON.stringify({ result: { agent: { agent_status: status, agent_session: { value: sessionFile } } } }));
+    }
+    return result();
+  }
+
+  runAsync(spec: CommandSpec): RunningCommand {
+    this.sync.push(spec);
+    let resolve!: (value: CommandResult) => void;
+    const job = { spec, resolve: (value: CommandResult) => resolve(value), cancelled: false };
+    this.jobs.push(job);
+    const promise = new Promise<CommandResult>((next) => { resolve = next; });
+    return { promise, cancel: () => { job.cancelled = true; } };
+  }
+
+  complete(index: number): void {
+    const job = this.jobs[index];
+    assert.ok(job, `missing async job ${index}`);
+    job.resolve(result());
   }
 }
 
@@ -133,7 +178,7 @@ describe('host command seams', () => {
   it('uses the public herdr command sequence and maps working then idle', async () => {
     const command = new FakeCommand();
     const sessionFile = join(mkdtempSync(join(tmpdir(), 'ao-session-')), 'session.jsonl');
-    writeFileSync(sessionFile, '{"role":"assistant","content":"committed artifact"}\n');
+    writeFileSync(sessionFile, '');
     command.sessionFile = sessionFile;
     const port = new HerdrCliPort({ ...herdrConfig(), env: { API_KEY: 'secret', HERDR_ENV: 'test' } }, command);
     const spawned = port.spawn(spawnRequest) as { sessionId: string };
@@ -150,6 +195,7 @@ describe('host command seams', () => {
     assert.equal(command.sync[0]?.env.API_KEY, undefined);
     assert.equal(command.sync[0]?.env.HERDR_ENV, 'test');
     assert.deepEqual(port.poll('pane-1'), { status: 'running' });
+    writeFileSync(sessionFile, '{"role":"assistant","content":"committed artifact"}\n');
     assert.deepEqual(port.poll('pane-1'), { status: 'settled', outcome: 'committed artifact', resultRef: 'herdr-session:pane-1' });
     const listCall = command.sync.find((entry) => entry.args[0] === 'pane' && entry.args[1] === 'list');
     assert.deepEqual(listCall?.args.slice(-2), ['--workspace', 'ws-1']);
@@ -161,23 +207,235 @@ describe('host command seams', () => {
     assert.ok(command.sync.some((entry) => entry.args[0] === 'pane' && entry.args[1] === 'close'));
   });
 
-  it('accepts a prompt --wait completion when the first probe is already idle/done', async () => {
-    const command = new FakeCommand();
-    const sessionFile = join(mkdtempSync(join(tmpdir(), 'ao-fast-session-')), 'session.jsonl');
+  it('waits through idle after prompt success before working and then settles from the transcript', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-race-session-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '');
+    const command = new ControlledHerdrCommand(['idle', 'working', 'done'], sessionFile, 'pane-race-generation');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    assert.equal(command.jobs.length, 1);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(command.jobs.length, 2);
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(port.poll('pane-race-generation'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-race-generation'), { status: 'running' });
+    writeFileSync(sessionFile, '{"role":"assistant","content":"race result"}\n');
+    assert.deepEqual(port.poll('pane-race-generation'), { status: 'settled', outcome: 'race result', resultRef: 'herdr-session:pane-race-generation' });
+  });
+
+  it('fails after bounded idle grace when no working state or assistant outcome appears', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-idle-timeout-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '');
+    const command = new ControlledHerdrCommand(['idle'], sessionFile, 'pane-idle-timeout');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(port.poll('pane-idle-timeout'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-idle-timeout'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-idle-timeout'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-idle-timeout'), { status: 'failed', outcome: 'herdr session JSONL was unchanged or had no new assistant outcome' });
+  });
+
+  it('accepts a genuinely quick prompt completion without observing working', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-fast-session-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '');
+    const command = new ControlledHerdrCommand(['idle', 'idle'], sessionFile, 'pane-fast');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
     writeFileSync(sessionFile, '{"role":"assistant","content":"fast result"}\n');
-    command.sessionFile = sessionFile;
+    assert.deepEqual(port.poll('pane-fast'), { status: 'settled', outcome: 'fast result', resultRef: 'herdr-session:pane-fast' });
+  });
+
+  it('fails after cumulative grace when done probes lack an assistant transcript', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-no-outcome-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '');
+    const command = new ControlledHerdrCommand(['idle', 'working', 'done', 'working', 'done', 'done'], sessionFile, 'pane-no-outcome');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(port.poll('pane-no-outcome'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-no-outcome'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-no-outcome'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-no-outcome'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-no-outcome'), { status: 'failed', outcome: 'herdr session JSONL was unchanged or had no new assistant outcome' });
+  });
+
+  it('rejects a pre-prompt assistant outcome from the same session', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-stale-session-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '{"role":"assistant","content":"stale result"}\n');
+    const command = new ControlledHerdrCommand(['idle', 'done'], sessionFile, 'pane-stale');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(port.poll('pane-stale'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-stale'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-stale'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-stale'), { status: 'failed', outcome: 'herdr session JSONL was unchanged or had no new assistant outcome' });
+  });
+
+  it('settles from only a post-boundary append and never the stale pre-prompt outcome', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-append-session-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '{"role":"assistant","content":"stale pre-prompt result"}\n');
+    const command = new ControlledHerdrCommand(['done', 'done', 'done'], sessionFile, 'pane-append');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // The boundary was pinned over the stale pre-prompt assistant. A normal
+    // post-boundary user message grows the file without a new assistant outcome.
+    appendFileSync(sessionFile, '{"role":"user","content":"do the work"}\n');
+    // If the implementation parsed the whole file instead of the appended bytes,
+    // this would settle from the stale pre-prompt assistant right here.
+    assert.deepEqual(port.poll('pane-append'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-append'), { status: 'running' });
+
+    appendFileSync(sessionFile, '{"role":"assistant","content":"fresh appended result"}\n');
+    assert.deepEqual(port.poll('pane-append'), { status: 'settled', outcome: 'fresh appended result', resultRef: 'herdr-session:pane-append' });
+    assert.equal(port.readFinalAssistant('pane-append'), 'fresh appended result');
+  });
+
+  it('fails closed when pre-boundary bytes are mutated in place even though the file grows', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-prefix-mutation-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    const originalPrefix = '{"role":"user","content":"original boundary!!"}\n';
+    const mutatedPrefix = '{"role":"user","content":"mutated boundary!!!"}\n';
+    assert.equal(originalPrefix.length, mutatedPrefix.length);
+    writeFileSync(sessionFile, originalPrefix);
+    const command = new ControlledHerdrCommand(['done', 'done'], sessionFile, 'pane-prefix-mutation');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const inodeBefore = statSync(sessionFile).ino;
+    // Same inode, same prefix length, different pinned bytes, plus a valid append.
+    writeFileSync(sessionFile, `${mutatedPrefix}{"role":"assistant","content":"appended after mutation"}\n`);
+    assert.equal(statSync(sessionFile).ino, inodeBefore);
+    assert.deepEqual(port.poll('pane-prefix-mutation'), { status: 'failed', outcome: 'herdr session JSONL was truncated or replaced' });
+  });
+
+  it('fails closed when the agent session path is missing after start', async () => {
+    const command = new ControlledHerdrCommand(['idle'], '/tmp/ao-unused-session.jsonl', 'pane-missing-session');
     command.run = (spec) => {
       command.sync.push(spec);
-      if (spec.args[0] === 'tab') return result('{"result":{"root_pane":{"pane_id":"pane-fast"}}}');
-      if (spec.args[0] === 'pane' && spec.args[1] === 'list') return result('{"result":{"panes":[{"pane_id":"pane-fast"}]}}');
-      if (spec.args[0] === 'agent' && spec.args[1] === 'get') return result(JSON.stringify({ result: { agent: { agent_status: 'idle', agent_session: { value: sessionFile } } } }));
+      if (spec.args[0] === 'tab') return result('{"result":{"root_pane":{"pane_id":"pane-missing-session"}}}');
+      if (spec.args[0] === 'agent' && spec.args[1] === 'get') return result('{"result":{"agent":{"agent_status":"idle","agent_session":{}}}}');
       return result();
     };
     const port = new HerdrCliPort(herdrConfig(), command);
     port.spawn(spawnRequest);
+    command.complete(0);
     await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(port.poll('pane-missing-session'), { status: 'failed', outcome: 'herdr agent session path was unavailable' });
+  });
+
+  it('rejects an oversized appended assistant outcome permanently', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-oversized-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '');
+    const command = new ControlledHerdrCommand(['done', 'done'], sessionFile, 'pane-oversized');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
     await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.deepEqual(port.poll('pane-fast'), { status: 'settled', outcome: 'fast result', resultRef: 'herdr-session:pane-fast' });
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    appendFileSync(sessionFile, `${JSON.stringify({ role: 'assistant', content: 'x'.repeat(32 * 1024 + 1) })}\n`);
+    assert.deepEqual(port.poll('pane-oversized'), { status: 'failed', outcome: 'herdr assistant result exceeded the in-memory limit' });
+  });
+
+  it('reads the settled assistant exactly once and rejects premature or repeated reads', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-one-shot-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '');
+    const command = new ControlledHerdrCommand(['done', 'done'], sessionFile, 'pane-one-shot');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.throws(() => port.readFinalAssistant('pane-one-shot'), /unavailable before a terminal settled state/);
+    appendFileSync(sessionFile, '{"role":"assistant","content":"one shot result"}\n');
+    assert.deepEqual(port.poll('pane-one-shot'), { status: 'settled', outcome: 'one shot result', resultRef: 'herdr-session:pane-one-shot' });
+    assert.equal(port.readFinalAssistant('pane-one-shot'), 'one shot result');
+    assert.throws(() => port.readFinalAssistant('pane-one-shot'), /already read/);
+  });
+
+  it('fails closed when the agent session path changes', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-changed-session-'));
+    const firstSession = join(directory, 'first.jsonl');
+    const secondSession = join(directory, 'second.jsonl');
+    writeFileSync(firstSession, '{"role":"user","content":"prompt"}\n');
+    writeFileSync(secondSession, '{"role":"assistant","content":"wrong session"}\n');
+    const command = new ControlledHerdrCommand(['idle', 'done'], firstSession, 'pane-changed', [firstSession, secondSession]);
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(port.poll('pane-changed'), { status: 'failed', outcome: 'herdr agent session path changed' });
+  });
+
+  it('fails closed when the session is replaced instead of appended', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-replaced-session-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '{"role":"user","content":"prompt"}\n');
+    const command = new ControlledHerdrCommand(['idle', 'done'], sessionFile, 'pane-replaced');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const replacementFile = join(directory, 'replacement.jsonl');
+    writeFileSync(replacementFile, '{"role":"user","content":"prompt"}\n{"role":"assistant","content":"replacement"}\n');
+    rmSync(sessionFile);
+    renameSync(replacementFile, sessionFile);
+    assert.deepEqual(port.poll('pane-replaced'), { status: 'failed', outcome: 'herdr session JSONL was replaced' });
+  });
+
+  it('fails closed when the session is truncated before completion', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-truncated-session-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '{"role":"user","content":"long pre-prompt boundary"}\n');
+    const command = new ControlledHerdrCommand(['idle', 'done'], sessionFile, 'pane-truncated');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    writeFileSync(sessionFile, '{"role":"user"}\n');
+    assert.deepEqual(port.poll('pane-truncated'), { status: 'failed', outcome: 'herdr session JSONL was truncated or replaced' });
   });
 
   it('cancels stale start continuations on close and never starts prompt afterward', async () => {
@@ -203,14 +461,97 @@ describe('host command seams', () => {
     assert.throws(() => new HerdrCliPort(herdrConfig(), malformedOutput).spawn(spawnRequest), /JSON/);
 
     const sessionFile = join(mkdtempSync(join(tmpdir(), 'ao-malformed-')), 'session.jsonl');
-    writeFileSync(sessionFile, '{"role":"assistant","content":"ok"}\nnot-json\n');
+    writeFileSync(sessionFile, '{"role":"user","content":"prompt"}\n');
     const command = new FakeCommand();
     command.sessionFile = sessionFile;
     const port = new HerdrCliPort(herdrConfig(), command);
     port.spawn(spawnRequest);
     await new Promise<void>((resolve) => setImmediate(resolve));
+    writeFileSync(sessionFile, '{"role":"user","content":"prompt"}\nnot-json\n');
     assert.deepEqual(port.poll('pane-1'), { status: 'running' });
-    assert.deepEqual(port.poll('pane-1'), { status: 'failed', outcome: 'herdr session JSONL was malformed or had no assistant outcome' });
+    assert.deepEqual(port.poll('pane-1'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-1'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-1'), { status: 'failed', outcome: 'herdr session JSONL was malformed or had no new assistant outcome' });
+  });
+
+  it('reattaches with a single-turn boundary and never accepts a stale outcome', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-reattach-stale-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '{"role":"assistant","content":"before recovery"}\n');
+    const command = new ControlledHerdrCommand(['idle', 'done'], sessionFile, 'pane-reattach-stale');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    assert.deepEqual(port.reattach('pane-reattach-stale', '/tmp/worktree'), { sessionId: 'pane-reattach-stale' });
+    assert.deepEqual(port.poll('pane-reattach-stale'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-reattach-stale'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-reattach-stale'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-reattach-stale'), { status: 'failed', outcome: 'herdr session JSONL was unchanged or had no new assistant outcome' });
+  });
+
+  it('re-pins the boundary and resets grace on reattach after an implicit poll attachment', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-reattach-repin-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '{"role":"user","content":"pre-existing turn"}\n');
+    const command = new ControlledHerdrCommand(['done'], sessionFile, 'pane-reattach-repin');
+    const port = new HerdrCliPort(herdrConfig(), command);
+
+    // Implicit attachment through poll(unknown pane) pins boundary #1 and probes done.
+    assert.deepEqual(port.poll('pane-reattach-repin'), { status: 'running' });
+    // Exhaust the post-prompt idle grace before the explicit reattach.
+    assert.deepEqual(port.poll('pane-reattach-repin'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-reattach-repin'), { status: 'running' });
+
+    // A completion lands after implicit attachment but before reattach; it is stale.
+    appendFileSync(sessionFile, '{"role":"assistant","content":"stale intermediate"}\n');
+    assert.deepEqual(port.reattach('pane-reattach-repin', '/tmp/worktree'), { sessionId: 'pane-reattach-repin' });
+
+    // Reattach re-pinned the boundary over the intermediate outcome and reset the
+    // grace counters: this is running (not settled stale, not failed from grace).
+    assert.deepEqual(port.poll('pane-reattach-repin'), { status: 'running' });
+
+    appendFileSync(sessionFile, '{"role":"assistant","content":"later result"}\n');
+    assert.deepEqual(port.poll('pane-reattach-repin'), { status: 'settled', outcome: 'later result', resultRef: 'herdr-session:pane-reattach-repin' });
+    assert.equal(port.readFinalAssistant('pane-reattach-repin'), 'later result');
+  });
+
+  it('leaves tracked state untouched when a reattach boundary capture fails', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ao-reattach-atomic-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    const missingFile = join(directory, 'missing.jsonl');
+    writeFileSync(sessionFile, '{"role":"user","content":"pre-existing turn"}\n');
+    const command = new ControlledHerdrCommand(['done'], sessionFile, 'pane-reattach-atomic', [sessionFile, sessionFile, sessionFile, sessionFile, missingFile, sessionFile]);
+    const port = new HerdrCliPort(herdrConfig(), command);
+
+    assert.deepEqual(port.poll('pane-reattach-atomic'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-reattach-atomic'), { status: 'running' });
+    assert.deepEqual(port.poll('pane-reattach-atomic'), { status: 'running' });
+
+    assert.throws(() => port.reattach('pane-reattach-atomic', '/tmp/worktree'), /cannot reattach/);
+    // A failed re-pin must not reset the exhausted grace: the next done probe fails.
+    assert.deepEqual(port.poll('pane-reattach-atomic'), { status: 'failed', outcome: 'herdr session JSONL was unchanged or had no new assistant outcome' });
+  });
+
+  it('fails closed instead of reattaching an actively starting or terminal pane', async () => {
+    const starting = new DeferredCommand();
+    const startingPort = new HerdrCliPort(herdrConfig(), starting);
+    startingPort.spawn(spawnRequest);
+    assert.throws(() => startingPort.reattach('pane-race'), /actively starting or prompting/);
+    startingPort.close('pane-race');
+    starting.jobs[0]!.resolve(result());
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const directory = mkdtempSync(join(tmpdir(), 'ao-reattach-terminal-'));
+    const sessionFile = join(directory, 'session.jsonl');
+    writeFileSync(sessionFile, '');
+    const command = new ControlledHerdrCommand(['done'], sessionFile, 'pane-reattach-terminal');
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    command.complete(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    command.complete(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    appendFileSync(sessionFile, '{"role":"assistant","content":"terminal result"}\n');
+    assert.deepEqual(port.poll('pane-reattach-terminal'), { status: 'settled', outcome: 'terminal result', resultRef: 'herdr-session:pane-reattach-terminal' });
+    assert.throws(() => port.reattach('pane-reattach-terminal'), /terminal/);
   });
 
   it('maps absent panes to lost and supports pane-id reattach without spawn', () => {
