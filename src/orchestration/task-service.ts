@@ -20,6 +20,7 @@ import { validateTaskContract, type TaskContract } from '../core/task-contract.t
 import { decideVerdict, validateEvidenceBundle, type EvidenceBundle, type VerificationCommand, type VerificationOutcome } from '../core/verification.ts';
 import { isPlainObject } from '../core/validate.ts';
 import type { AsyncVerificationRunner } from '../host/process-verification-runner.ts';
+import type { CleanRoomCheckout, CleanRoomPort } from '../host/clean-room.ts';
 import type { WorkerLedger } from '../host/pier-ledger.ts';
 import type { RoleCheck } from '../host/pier-roles.ts';
 import { parseReviewerOutcome, renderReviewerPrompt, renderWorkerBrief } from './briefs.ts';
@@ -40,6 +41,8 @@ export interface TaskServicePorts {
   headRevision(): string;
   readDiff(workspacePath: string, baseRevision: string, artifactRevision: string): string;
   readonly verifier: AsyncVerificationRunner;
+  /** Fresh checkouts of exact revisions; verification never runs in a worker's worktree. */
+  readonly cleanRoom: CleanRoomPort;
   readonly ledger: WorkerLedger;
   checkReviewerRole(): RoleCheck;
   clock(): number;
@@ -122,6 +125,9 @@ export interface VerifyResult {
   readonly commands: readonly CommandReport[];
   readonly checksUsed: number;
   readonly checksAllowed: number;
+  /** Throwaway checkout the commands ran in (absent when verification never ran). */
+  readonly cleanRoom?: string;
+  readonly cleanupWarning?: string;
 }
 
 export interface ReviewBriefResult {
@@ -327,21 +333,35 @@ export class TaskService {
     const check = checkArtifact(inspection, task.contract.files_in_scope ?? []);
     if (!check.ok) return this.checkFailed(task, attempt, 'artifact', check.reasons, inspection.artifactRevision, undefined, []);
 
-    const commands: VerificationCommand[] = task.contract.verification.map((command) => ({ command, cwd: lease.workspacePath, timeoutMs: this.settings.verificationTimeoutMs }));
+    // Clean room: verify the exact candidate revision in a fresh checkout built from git
+    // objects only, so nothing the worker left in its worktree (ignored build output,
+    // stale binaries) can influence the verdict.
+    let room: CleanRoomCheckout;
+    try {
+      room = this.ports.cleanRoom.prepare(inspection.artifactRevision);
+    } catch (error) {
+      fail('VERIFICATION_ERROR', `clean-room checkout of ${inspection.artifactRevision} failed: ${message(error)}`);
+    }
+    const commands: VerificationCommand[] = task.contract.verification.map((command) => ({ command, cwd: room.path, timeoutMs: this.settings.verificationTimeoutMs }));
     const outcomes: VerificationOutcome[] = [];
     const reports: CommandReport[] = [];
     const startedAt = this.ports.clock();
-    for (const command of commands) {
-      const commandStartedAt = this.ports.clock();
-      let result: Awaited<ReturnType<AsyncVerificationRunner['run']>>;
-      try {
-        result = await this.ports.verifier.run(command);
-      } catch (error) {
-        fail('VERIFICATION_ERROR', `verification command could not run: ${message(error)}`);
+    let cleanupProblem: string | undefined;
+    try {
+      for (const command of commands) {
+        const commandStartedAt = this.ports.clock();
+        let result: Awaited<ReturnType<AsyncVerificationRunner['run']>>;
+        try {
+          result = await this.ports.verifier.run(command);
+        } catch (error) {
+          fail('VERIFICATION_ERROR', `verification command could not run: ${message(error)}`);
+        }
+        const durationMs = Math.max(0, this.ports.clock() - commandStartedAt);
+        outcomes.push({ exitCode: result.exitCode, durationMs, timedOut: result.timedOut, ...(result.output === undefined ? {} : { output: result.output }), ...(result.outputRef === undefined ? {} : { outputRef: result.outputRef }) });
+        reports.push({ command: command.command, exitCode: result.exitCode, timedOut: result.timedOut, durationMs, outputTail: tail(result.output) });
       }
-      const durationMs = Math.max(0, this.ports.clock() - commandStartedAt);
-      outcomes.push({ exitCode: result.exitCode, durationMs, timedOut: result.timedOut, ...(result.output === undefined ? {} : { output: result.output }), ...(result.outputRef === undefined ? {} : { outputRef: result.outputRef }) });
-      reports.push({ command: command.command, exitCode: result.exitCode, timedOut: result.timedOut, durationMs, outputTail: tail(result.output) });
+    } finally {
+      cleanupProblem = room.dispose();
     }
     let evidence: EvidenceBundle;
     try {
@@ -349,12 +369,13 @@ export class TaskService {
     } catch (error) {
       fail('VERIFICATION_ERROR', `verification evidence is invalid: ${message(error)}`);
     }
+    const roomInfo = { cleanRoom: room.path, ...(cleanupProblem === undefined ? {} : { cleanupWarning: cleanupProblem }) };
     const after = this.inspect(lease);
     if (after.artifactRevision !== inspection.artifactRevision) {
-      return this.checkFailed(task, attempt, 'verification', [`HEAD moved during verification (${inspection.artifactRevision} → ${after.artifactRevision})`], after.artifactRevision, evidence, reports);
+      return { ...roomInfo, ...this.checkFailed(task, attempt, 'verification', [`HEAD moved during verification (${inspection.artifactRevision} → ${after.artifactRevision})`], after.artifactRevision, evidence, reports) };
     }
     const verdict = decideVerdict(evidence, { minimumCommands: 1 });
-    if (verdict.verdict === 'rejected') return this.checkFailed(task, attempt, 'verification', verdict.reasons, inspection.artifactRevision, evidence, reports);
+    if (verdict.verdict === 'rejected') return { ...roomInfo, ...this.checkFailed(task, attempt, 'verification', verdict.reasons, inspection.artifactRevision, evidence, reports) };
 
     const candidate: CandidateRecord = { revision: inspection.artifactRevision, changedPaths: check.changedPaths, evidence, verdict };
     this.commit({ v: 1, type: 'settle', at: this.ports.clock(), taskId, attemptId: attempt.attemptId, candidate });
@@ -373,6 +394,7 @@ export class TaskService {
       commands: reports,
       checksUsed: attempt.checks.length,
       checksAllowed: this.settings.maxChecksPerAttempt,
+      ...roomInfo,
     };
   }
 

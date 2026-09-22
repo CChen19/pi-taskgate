@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 import { checkArtifact } from '../src/adapters/artifact-check.ts';
 import { PierHistoryLedger, pierPipePath, pierPipeProblem, pierSessionDirName, pierSessionDirNameLegacy } from '../src/host/pier-ledger.ts';
 import { WorktreeManager } from '../src/adapters/worktree-manager.ts';
+import { GitCleanRoom } from '../src/host/clean-room.ts';
 import { checkReadOnlyRole } from '../src/host/pier-roles.ts';
 import { parseReviewerOutcome, renderWorkerBrief } from '../src/orchestration/briefs.ts';
 import { parseOrchestrationConfig } from '../src/orchestration/config.ts';
@@ -151,6 +152,16 @@ describe('read-only reviewer role check', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('GitCleanRoom', () => {
+  it('rejects non-object-id revisions before touching git', () => {
+    const calls: unknown[] = [];
+    const room = new GitCleanRoom({ repoRoot: '/repo', root: '/tmp/unused', commandRunner: { run: (spec: unknown) => { calls.push(spec); throw new Error('no'); }, runAsync: () => { throw new Error('no'); } } });
+    assert.throws(() => room.prepare('HEAD'), /full object id/);
+    assert.throws(() => room.prepare('abc123'), /full object id/);
+    assert.equal(calls.length, 0);
   });
 });
 

@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import { WorktreeManager } from '../src/adapters/worktree-manager.ts';
 import { NodeCommandRunner, minimalProcessEnv } from '../src/host/command-runner.ts';
 import { GitWorktreePort } from '../src/host/git-worktree-port.ts';
+import { GitCleanRoom } from '../src/host/clean-room.ts';
+import { existsSync, readdirSync } from 'node:fs';
 import type { WorkerLedger, WorkerLedgerRow } from '../src/host/pier-ledger.ts';
 import type { RoleCheck } from '../src/host/pier-roles.ts';
 import { ProcessAsyncVerificationRunner } from '../src/host/process-verification-runner.ts';
@@ -45,7 +47,8 @@ class FakeLedger implements WorkerLedger {
   }
 }
 
-const ALLOWLIST = ['test -f src/a.txt', 'test -f src/b.txt', 'test -f src/missing.txt', 'grep -q hello src/a.txt'];
+const PROBE = 'pwd && git rev-parse HEAD && git status --porcelain --ignored && mkdir -p build && touch build/from-verify';
+const ALLOWLIST = ['test -f src/a.txt', 'test -f src/b.txt', 'test -f src/missing.txt', 'grep -q hello src/a.txt', 'test -f build/marker', PROBE];
 const SETTINGS: TaskServiceSettings = { verificationAllowlist: ALLOWLIST, verificationTimeoutMs: 30_000, reviewerRole: 'reviewer-readonly', maxChecksPerAttempt: 3, defaultMaxAttempts: 2 };
 
 interface Harness {
@@ -66,7 +69,7 @@ function harness(): Harness {
   const workspaceRoot = join(root, 'worktrees');
   mkdirSync(repo, { recursive: true });
   git(repo, ['init', '-q']);
-  commit(repo, { 'README.md': 'base\n' }, 'base');
+  commit(repo, { 'README.md': 'base\n', '.gitignore': 'build/\n' }, 'base');
   const h: Harness = {
     root,
     repo,
@@ -84,6 +87,7 @@ function harness(): Harness {
         worktreePort: new GitWorktreePort({ repoRoot: repo, workspaceRoot, commandRunner }),
         headRevision: () => git(repo, ['rev-parse', 'HEAD']),
         readDiff: (cwd, base, revision) => boundReviewerDiff(git(cwd, ['diff', '--no-color', `${base}...${revision}`, '--'])),
+        cleanRoom: new GitCleanRoom({ repoRoot: repo, root: join(workspaceRoot, '.verify'), commandRunner }),
         verifier: new ProcessAsyncVerificationRunner({ commandRunner, cwd: workspaceRoot, allowedCommands: ALLOWLIST, defaultTimeoutMs: 30_000 }),
         ledger: h.ledger,
         checkReviewerRole: () => h.role.check,
@@ -243,6 +247,68 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
     commit(first.cwd, { 'src/missing.txt': 'now present\n' });
     const passed = await svc.verify('T1');
     assert.equal(passed.outcome, 'awaiting_review');
+  });
+
+  it('verifies in a clean checkout and never reuses ignored worker build artifacts', async () => {
+    const svc = h.service();
+    svc.plan([task('T1', { verification: ['test -f build/marker'] })]);
+    const started = svc.start('T1');
+    const cwd = started.workspacePath!;
+    h.ledger.add({ paneId: 'w:1', cwd, createdAt: h.now.value + 1 });
+    svc.bind('T1', 'w:1');
+    commit(cwd, { 'src/a.txt': 'hello\n' });
+    // Forged, gitignored build output in the worker's worktree: invisible to the clean-tree check.
+    mkdirSync(join(cwd, 'build'), { recursive: true });
+    writeFileSync(join(cwd, 'build', 'marker'), 'stale\n');
+    assert.equal(git(cwd, ['status', '--porcelain']), '', 'ignored artifact does not dirty the worktree');
+    h.ledger.add({ paneId: 'w:1', cwd, status: 'settled', outcome: 'done', createdAt: h.now.value });
+
+    const verified = await svc.verify('T1');
+    assert.equal(verified.outcome, 'check_failed', 'the worker artifact must not satisfy verification');
+    assert.match(verified.reasons.join(' '), /exited with code 1/);
+    assert.ok(verified.cleanRoom !== undefined && !verified.cleanRoom.startsWith(cwd));
+    assert.equal(existsSync(verified.cleanRoom!), false, 'clean checkout is removed');
+    assert.equal(existsSync(join(cwd, 'build', 'marker')), true, 'worker worktree is left untouched');
+    const evidence = svc.task('T1').attemptRecords[0]!.checks[0]!.evidence!;
+    assert.equal(evidence.commands[0]!.cwd, verified.cleanRoom);
+  });
+
+  it('runs commands in a pristine checkout at exactly the candidate revision and cleans it up', async () => {
+    const svc = h.service();
+    svc.plan([task('T1', { verification: [PROBE], review_required: false })]);
+    const started = svc.start('T1');
+    const cwd = started.workspacePath!;
+    h.ledger.add({ paneId: 'w:1', cwd, createdAt: h.now.value + 1 });
+    svc.bind('T1', 'w:1');
+    const revision = commit(cwd, { 'src/a.txt': 'hello\n' });
+    mkdirSync(join(cwd, 'build'), { recursive: true });
+    writeFileSync(join(cwd, 'build', 'marker'), 'stale\n');
+    h.ledger.add({ paneId: 'w:1', cwd, status: 'settled', outcome: 'done', createdAt: h.now.value });
+
+    const verified = await svc.verify('T1');
+    assert.equal(verified.outcome, 'passed');
+    const [pwd, head, ...status] = verified.commands[0]!.outputTail.trim().split('\n');
+    assert.equal(pwd, verified.cleanRoom);
+    assert.equal(head, revision);
+    assert.deepEqual(status, [], 'no ignored or untracked files existed before the commands ran');
+    assert.equal(existsSync(verified.cleanRoom!), false);
+    assert.equal(existsSync(join(cwd, 'build', 'from-verify')), false, 'verification output never lands in the worker worktree');
+    assert.equal(git(h.repo, ['worktree', 'list', '--porcelain']).split('\n').filter((line) => line.startsWith('worktree ')).length, 2, 'only the repo and the task worktree remain');
+    assert.deepEqual(readdirSync(join(h.workspaceRoot, '.verify')), []);
+  });
+
+  it('fails closed without a state change when the clean checkout cannot be prepared', async () => {
+    const base = h.service() as unknown as { ports: object };
+    const svc = new TaskService({ ...base.ports, cleanRoom: { prepare: () => { throw new Error('object missing'); } } } as never, SETTINGS);
+    svc.plan([task('T1')]);
+    const started = svc.start('T1');
+    h.ledger.add({ paneId: 'w:1', cwd: started.workspacePath!, createdAt: h.now.value + 1 });
+    svc.bind('T1', 'w:1');
+    commit(started.workspacePath!, { 'src/a.txt': 'hello\n' });
+    h.ledger.add({ paneId: 'w:1', cwd: started.workspacePath!, status: 'settled', outcome: 'done', createdAt: h.now.value });
+    await rejectsCode(svc.verify('T1'), 'VERIFICATION_ERROR');
+    assert.equal(svc.task('T1').state, 'RUNNING');
+    assert.equal(svc.task('T1').attemptRecords[0]!.checks.length, 0);
   });
 
   it('passes mechanically-verified tasks directly when review is not required', async () => {

@@ -258,12 +258,13 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
     tool({
       name: 'task_verify',
       label: 'Task Verify',
-      description: 'After the worker settles: the host inspects the worktree (HEAD revision, changed paths, clean, commits ahead), enforces files_in_scope, then runs the task\'s allowlisted verification commands at that revision. Passing settles the attempt with a candidate revision (PASSED directly when review is not required). Failing records a failed check and returns the reasons and output tails; fix via `subagent send` and verify again.',
+      description: 'After the worker settles: the host inspects the worktree (HEAD revision, changed paths, clean, commits ahead), enforces files_in_scope, then runs the task\'s allowlisted verification commands in a fresh clean checkout of exactly that revision (never in the worker\'s worktree, so no worker build output is reused). Passing settles the attempt with a candidate revision (PASSED directly when review is not required). Failing records a failed check and returns the reasons and output tails; fix via `subagent send` and verify again.',
       parameters: { type: 'object', properties: { task_id: TASK_ID_PARAM }, required: ['task_id'], additionalProperties: false },
     }, async (svc, params) => {
       const result = await svc.verify(taskId(params));
       const lines = [`${result.taskId} ${result.attemptId}: ${result.outcome} → ${result.state} · revision ${result.revision ?? '-'} · checks ${result.checksUsed}/${result.checksAllowed}`];
       if (result.changedPaths !== undefined) lines.push(`changed: ${result.changedPaths.join(', ')}`);
+      if (result.cleanRoom !== undefined) lines.push(`verified in clean checkout ${result.cleanRoom} (removed${result.cleanupWarning === undefined ? '' : ` with warning: ${result.cleanupWarning}`})`);
       if (result.reasons.length > 0) lines.push('reasons:', ...result.reasons.map((reason) => `- ${reason}`));
       for (const command of result.commands) {
         lines.push(`$ ${command.command} → exit ${command.exitCode}${command.timedOut ? ' (timed out)' : ''} in ${command.durationMs}ms`);

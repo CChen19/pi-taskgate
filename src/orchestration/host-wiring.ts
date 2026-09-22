@@ -7,7 +7,9 @@ import { randomUUID } from 'node:crypto';
 import { WorktreeManager } from '../adapters/worktree-manager.ts';
 import { boundReviewerDiff } from '../core/reviewer-brief.ts';
 import { NodeCommandRunner, minimalProcessEnv, type CommandRunner } from '../host/command-runner.ts';
+import { GitCleanRoom } from '../host/clean-room.ts';
 import { GitWorktreePort } from '../host/git-worktree-port.ts';
+import { join } from 'node:path';
 import { PierHistoryLedger, pierPipeProblem } from '../host/pier-ledger.ts';
 import { checkReadOnlyRole, defaultPierRoleDirs } from '../host/pier-roles.ts';
 import { ProcessAsyncVerificationRunner } from '../host/process-verification-runner.ts';
@@ -46,6 +48,7 @@ export function createHostTaskService(options: HostWiringOptions): TaskService {
       return boundReviewerDiff(result.stdout, result.stdoutTruncated);
     },
     verifier: new ProcessAsyncVerificationRunner({ commandRunner, cwd: config.workspaceRoot, allowedCommands: config.verificationAllowlist, defaultTimeoutMs: config.verificationTimeoutMs, maxOutputBytes: 256 * 1024 }),
+    cleanRoom: new GitCleanRoom({ repoRoot: config.repoRoot, root: join(config.workspaceRoot, '.verify'), commandRunner }),
     ledger: new PierHistoryLedger(config.pierHistoryRoots === undefined ? {} : { roots: config.pierHistoryRoots }),
     checkReviewerRole: () => checkReadOnlyRole(roleDirs, config.reviewerRole),
     clock: () => Date.now(),
