@@ -4,7 +4,27 @@
 
 > 架构调整（2026-09）：早期的"外层 coordinator + 独立 planner 进程"路线（下文 *Legacy* 部分）已冻结，不再继续开发。其中正确的机制（artifact 真相、完成≠验收、worktree 隔离、scope、allowlist、fresh reviewer）被复用到下面的主会话扩展里。
 
-## 主会话扩展（当前方向，P0 已实现，尚未真机验证）
+## Pier 提供什么，本项目补什么
+
+| | Pier（原样使用，只走公开接口） | 本项目（companion extension）补充的 |
+|---|---|---|
+| 启动 agent | `subagent` 在 herdr pane 里起 worker/reviewer，人可接管，可 revive，结算通知 | 不 spawn；只给出精确的 spawn 参数 |
+| 角色 | role 文件（tools/permissions） | 每次 review 前检查 reviewer role 对所有写/执行类工具显式 deny |
+| 谁跑了什么 | delegation ledger（pane、cwd、role、状态、收尾输出、`revivedFrom`） | 只读 ledger：绑定 worker 与 worktree、判断是否结算、直接取 reviewer 自己的 verdict |
+| 工作区 | 每个 subagent 一个 cwd | 每个 attempt 一个 host 创建的 git worktree + 分支，基于精确 base revision |
+| 任务状态 | todo（自由文本） | 事件溯源的 task board：contract、依赖、attempt、check、candidate revision、review、verdict |
+| “做完了吗” | 子 agent 自己说 | host 读 git、scope 检查、clean-room 里跑 allowlist 命令、绑定 revision 的 fresh review |
+| 合并 | — | 精确 revision 的 cherry-pick 集成 → clean-room 验证 → fresh 集成 review |
+| 恢复 | session 文件、`--session` resume | 从 session 自身的事件条目回放 task board |
+
+两条流程：
+
+- **单个任务**：`task_plan` → `task_start` → spawn worker → `task_bind` → 结算后 `task_verify`（失败记 check，主 agent 可 `subagent send` 让 worker 修）→ `task_review_brief` → spawn 全新只读 reviewer → `task_review_record` → PASSED，或 RETRYING → 新 attempt（预算用完则 FAILED）。
+- **集成**：`task_integrate`（只收 PASSED + fresh review 绑定精确 revision 的 candidate，按顺序 cherry-pick 到精确 base，冲突即 FAILED）→ `task_verify`（clean room + 历史核对）→ fresh 集成 reviewer → `task_review_record`。合并到 master 由人做，从不 push。
+
+Fail-closed 守卫的完整列表、状态机和 session 恢复见 [docs/architecture.md](docs/architecture.md)。首轮真机运行中实际拦下的问题（残留 `build/`、Release 下失效的 `assert()`、格式错误和 revived 的 reviewer、CMake 集成冲突、超大 review diff、session resume）见 [docs/field-report-2026-09.md](docs/field-report-2026-09.md)。与“只用 Pier”的对比实验设计见 [docs/evaluation.md](docs/evaluation.md)，第一轮结果（14 次试验，含 4 种故障注入）见 [docs/benchmark-2026-09-22.md](docs/benchmark-2026-09-22.md)。
+
+## 主会话扩展（P0/P1 已实现，2026-09-22 已在 TinyWebServer 上真机运行）
 
 `src/pi-extension/index.ts` 是一个与 Pier 并列加载的 Pi extension，只在主会话中注册 9 个工具，不 spawn 任何 agent：
 
@@ -50,12 +70,14 @@ pi -e /path/to/pier/packages/pier-ext/src/index.ts -e /path/to/agent-orchestrato
 
 小任务不需要 task 工具，主 agent 直接做并跑检查；复杂或可并行的任务才走 task board。
 
-### 已知限制（P0）
+### 已知限制
 
-- 尚未在真实 Pi/Pier 会话中端到端跑过；离线测试覆盖真实 git worktree、真实 allowlist 进程、fake Pier ledger。
+- 真机运行只有 2026-09-22 的五轮（TinyWebServer，deepseek-flash 与 kimi-for-coding），不是对照实验；离线测试覆盖真实 git worktree、真实 allowlist 进程、fake Pier ledger。
+- reviewer 没有 shell，需要命令结果时可能通过 `ask_user_question` 问人；这种回答不是 host 证据（见 field report）。
 - `task_verify` 依赖 Pier ledger 的 `running` 状态判断 worker 是否结束；如果 `subagent send` 之后 Pier 没有写新的 running 行，过早 verify 可能看到半成品并记一次失败 check。
 - Pier 的 todo 自动对账会在 subagent settle 时勾掉描述匹配的 todo；task 状态只以 `task_status` 为准，建议 spawn description 用 `T1:impl` 这类不与 todo 重合的形式（工具返回的就是这种）。
-- integration 只做机械 cherry-pick，冲突时 fail closed，不提供冲突解决；worktree 不自动清理；git 检查是同步调用，verification 命令是异步调用。
+- integration 只做机械 cherry-pick，冲突时 fail closed，不提供冲突解决；worktree 和分支不自动清理；git 检查是同步调用，verification 命令是异步调用。
+- 没有内建 metrics；field report 的数字是从 session 文件手工抽取的（方法见 docs/evaluation.md）。
 
 ## Legacy：外层 vertical slice（已冻结）
 
@@ -163,7 +185,7 @@ npm run vertical:run -- run --config ./vertical.config.json --plan-file ./plan.j
 npm run check
 ```
 
-本轮 289 项测试（含主会话扩展的 47 项：真实临时 git repo + worktree + allowlist 进程，fake Pier ledger/role），均不调用真实模型、Herdr、Pi 或网络。以下为 legacy slice 的覆盖说明。
+共 290 项测试（其中主会话扩展 48 项：真实临时 git repo + worktree + allowlist 进程，fake Pier ledger/role），均不调用真实模型、Herdr、Pi 或网络。以下为 legacy slice 的覆盖说明。
 
 Legacy slice 部分（242 项：241 项 fake + 1 项真实本地临时 git repo 语义验证），均不调用真实模型、Herdr、Pi、Git worktree、网络或凭据。vertical slice 的 fake 覆盖包括：并发独立任务 + 精确 revision review + integration；allowlist 升级在 executor start 前拒绝；SIGINT 取消运行中 worker；机械验证失败不 review/merge；reviewer 显式拒绝与 stale revision 均不 merge 且清理 artifact；`SCOPE_VIOLATION` 等 acceptanceEligible=false 的 settlement 从不触发机械 verify/review/merge；prerequisite 失败后 dependent 从不 start 且 journal 记录 BLOCKED；final integration verification 失败时保留 worker artifacts 与 integration workspace；malformed planner 首次失败后带结构 feedback 重试一次成功（planner 调用 2、metrics 正确）；metrics.modelCalls 对每个成功 task_started 的 worker attempt 计一次（retry 按实际 start 计，纯 executor start failure 不计，2-task happy path 断言 5）；真实 `GitIntegrationRunner.asPort()` 以冻结 plain port 过 core 严格 plain-object boundary 完成 rebase/merge/verification/conflict/status 并断言 merged（含 coordinator 未注入 integrationRunner 的 real-runner 构造 seam 回归，旧代码以 `runner must be a plain object` 失败）；planner transport 取消/失败/超时立即失败不重试；SIGINT 后 planner 只 spawn 一次、interrupt+close 各一次且 summary failed；config 边界（非绝对/空 role base、非法 reviewerStrategy、越界 plannerRetries、allowlist 重复/空白、可变 baseRevision（HEAD/branch/tag/短 SHA/revspec/空白））在任何 planner/executor 调用与 pane/worktree 前拒绝；默认 role base 由 repoRoot 注入为绝对路径。host fake 另外断言 integration git/verification 命令与 worktree plumbing 使用最小 env（不含密钥）、timeout、maxOutputBytes 上限，integration rebase 传入 base 必须等于固定 `options.baseRevision`，且未授权命令被拒；新增 pre-prompt boundary readiness 回归：session JSONL 延迟出现后只提交一次 prompt 并以有效的 post-boundary 追加结果 settle，永久缺失/永久 malformed 都在第 10 次（也是最后一次）poll 重试按文档化预算失败，close/interrupt 在 readiness 期间绝不提交 prompt，malformed 可在预算内恢复，pre-prompt `working` 快照不会污染 post-prompt `workingSeen`，pre-prompt `blocked`/`cancelled` 直接 fail closed 且不启动 prompt，readiness 期间 pane 从 host pane list 消失时 fail closed 为 `lost` 并丢弃保存的 prompt/env（phase 置 terminal），且 `StructuredAgentRunner` 自行 sanitize（中和 C0/C1 控制符、NEL、U+2028/U+2029、bidi embedding/isolate/标记）并 cap（160 字符，且不在 surrogate 对中间截断）port 提供的 terminal `outcome` 后带入抛错（含超大、Unicode-spoofing 与 surrogate-boundary 回归）。另有一项真实本地临时 git repo 语义单测（普通 repo，不建 worktree、不联网）：固定 base SHA 在 worker commit 后 `git rev-list base..HEAD` 为 1 且 `git diff base...HEAD` 非空，而 `HEAD` 基准为 0/空。下一步主控命令是：
 
