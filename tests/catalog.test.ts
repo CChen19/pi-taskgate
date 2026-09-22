@@ -13,8 +13,8 @@ function validConfigJson(): Record<string, unknown> {
 describe('createCatalog', () => {
   it('builds a queryable catalog from a valid config', () => {
     const catalog = createCatalog(validConfigJson());
-    assert.deepEqual([...catalog.roleIds].sort(), ['coordinator', EXPLORER_ROLE_ID, IMPLEMENTER_ROLE_ID, REVIEWER_ROLE_ID].sort());
-    assert.deepEqual([...catalog.workerRoleIds].sort(), [EXPLORER_ROLE_ID, IMPLEMENTER_ROLE_ID, REVIEWER_ROLE_ID].sort());
+    assert.deepEqual([...catalog.roleIds].sort(), ['coordinator', EXPLORER_ROLE_ID, IMPLEMENTER_ROLE_ID, REVIEWER_ROLE_ID, 'planner'].sort());
+    assert.deepEqual([...catalog.workerRoleIds].sort(), [EXPLORER_ROLE_ID, IMPLEMENTER_ROLE_ID, REVIEWER_ROLE_ID, 'planner'].sort());
     assert.deepEqual([...catalog.modelProfileIds].sort(), [PROFILE_FAST, PROFILE_SLASH].sort());
 
     const implementer = catalog.getRole(IMPLEMENTER_ROLE_ID);
@@ -157,7 +157,7 @@ describe('createCatalog', () => {
     // Caller config stays mutable; catalog is unaffected.
     assert.doesNotThrow(() => roles.push({ id: 'injected', kind: 'worker', description: 'x', tools: [] }));
     assert.equal(catalog.getRole('injected'), undefined);
-    assert.deepEqual([...catalog.roleIds].sort(), ['coordinator', EXPLORER_ROLE_ID, IMPLEMENTER_ROLE_ID, REVIEWER_ROLE_ID].sort());
+    assert.deepEqual([...catalog.roleIds].sort(), ['coordinator', EXPLORER_ROLE_ID, IMPLEMENTER_ROLE_ID, REVIEWER_ROLE_ID, 'planner'].sort());
   });
 
   it('returns deeply frozen snapshots', () => {

@@ -8,6 +8,7 @@ import type { CommandRunner, CommandSpec, CommandResult, RunningCommand } from '
 import { GitWorktreePort, changedFromStatus } from '../src/host/git-worktree-port.ts';
 import { HerdrCliPort } from '../src/host/herdr-cli-port.ts';
 import { ProcessVerificationRunner } from '../src/host/process-verification-runner.ts';
+import { GitIntegrationRunner } from '../src/host/git-integration-runner.ts';
 import { WorktreeManager, WORKTREE_MARKER_PREFIX } from '../src/adapters/worktree-manager.ts';
 import type { HerdrSpawnRequest } from '../src/adapters/pi-herdr-executor.ts';
 
@@ -159,6 +160,25 @@ describe('host command seams', () => {
     assert.ok(command.sync.some((entry) => entry.args[0] === 'pane' && entry.args[1] === 'close'));
   });
 
+  it('accepts a prompt --wait completion when the first probe is already idle/done', async () => {
+    const command = new FakeCommand();
+    const sessionFile = join(mkdtempSync(join(tmpdir(), 'ao-fast-session-')), 'session.jsonl');
+    writeFileSync(sessionFile, '{"role":"assistant","content":"fast result"}\n');
+    command.sessionFile = sessionFile;
+    command.run = (spec) => {
+      command.sync.push(spec);
+      if (spec.args[0] === 'tab') return result('{"result":{"root_pane":{"pane_id":"pane-fast"}}}');
+      if (spec.args[0] === 'pane' && spec.args[1] === 'list') return result('{"result":{"panes":[{"pane_id":"pane-fast"}]}}');
+      if (spec.args[0] === 'agent' && spec.args[1] === 'get') return result(JSON.stringify({ result: { agent: { agent_status: 'idle', agent_session: { value: sessionFile } } } }));
+      return result();
+    };
+    const port = new HerdrCliPort(herdrConfig(), command);
+    port.spawn(spawnRequest);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(port.poll('pane-fast'), { status: 'settled', outcome: 'fast result', resultRef: 'herdr-session:pane-fast' });
+  });
+
   it('cancels stale start continuations on close and never starts prompt afterward', async () => {
     const command = new DeferredCommand();
     const port = new HerdrCliPort(herdrConfig(), command);
@@ -214,7 +234,7 @@ describe('git worktree host port', () => {
     const root = mkdtempSync(join(tmpdir(), 'ao-host-'));
     const repo = join(root, 'repo');
     const command = new FakeCommand();
-    const port = new GitWorktreePort({ workspaceRoot: root, commandRunner: command });
+    const port = new GitWorktreePort({ workspaceRoot: root, commandRunner: command, env: { PATH: '/usr/bin', HOME: '/home', SECRET_TOKEN: 'topsecret', API_KEY: 'zzz' }, gitTimeoutMs: 123 });
     const manager = new WorktreeManager({ repoRoot: repo, workspaceRoot: root, idSource: () => 'token-1' });
     const lease = manager.acquire(port, 'T-host', 'T-host:attempt-1', 'base');
     command.workspace = lease.workspacePath;
@@ -230,6 +250,15 @@ describe('git worktree host port', () => {
     tampered.branch = 'attacker';
     writeFileSync(file, JSON.stringify(tampered));
     assert.throws(() => port.verifyOwnership(binding), /ownership|match/);
+    for (const spec of command.sync) {
+      assert.equal(spec.command, 'git');
+      assert.equal(spec.env.SECRET_TOKEN, undefined);
+      assert.equal(spec.env.API_KEY, undefined);
+      assert.deepEqual(Object.keys(spec.env).every((key) => ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'].includes(key)), true);
+      assert.equal(spec.env.PATH, '/usr/bin');
+      assert.equal(spec.timeoutMs, 123);
+      assert.equal(spec.maxOutputBytes, 64 * 1024);
+    }
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -246,6 +275,7 @@ describe('git worktree host port', () => {
     assert.equal(inspection.clean, false);
     assert.equal(inspection.commitsAhead, 0);
     assert.equal(manager.cleanup(port, lease).ok, false);
+    assert.equal(command.sync.every((spec) => spec.timeoutMs === 30_000 && spec.maxOutputBytes === 64 * 1024), true);
     rmSync(root, { recursive: true, force: true });
   });
 });
@@ -318,6 +348,36 @@ describe('process tree cleanup', { concurrency: false }, () => {
       killIfAlive(childPid);
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+});
+
+describe('integration verification host runner', () => {
+  it('uses the integration cwd, exact allowlist, hermetic env, timeout, and bounded output', () => {
+    const specs: CommandSpec[] = [];
+    const integration = { taskId: 'Tintegration', attemptId: 'a-1', baseRevision: 'base', workspacePath: '/integration', branch: 'integration/branch', ownershipToken: 'token', managedMarker: 'agent-orchestrator:token' };
+    const commandRunner = {
+      run: (spec: CommandSpec) => { specs.push(spec); return result(spec.args[0] === 'rev-parse' ? 'ok\n' : ''); },
+      runAsync: () => { throw new Error('unused'); },
+    };
+    const runner = new GitIntegrationRunner({ commandRunner, integration, baseRevision: 'base', verificationAllowlist: ['final'], verificationTimeoutMs: 77, env: { PATH: '/bin', HOME: '/home', SECRET_TOKEN: 'topsecret', API_KEY: 'zzz' } });
+    const unit = { taskId: 'Tone', branch: 'integration/Tone', revision: 'ok', verification: { verdict: 'passed', reasons: ['ok'], artifactRevision: 'ok' } };
+    const rebased = runner.gitOps.rebase('base', unit as never);
+    assert.equal((rebased as { ok: boolean }).ok, true);
+    assert.throws(() => runner.gitOps.rebase('a-different-base', unit as never), /does not match the configured base revision/);
+    const outcome = runner.commandRunner.run({ command: 'final' });
+    assert.equal((outcome as { exitCode: number }).exitCode, 0);
+    assert.equal(specs.length, 3);
+    assert.deepEqual(specs[0]?.args.slice(0, 2), ['rev-parse', 'integration/Tone']);
+    assert.equal(specs.at(-1)?.command, 'bash');
+    for (const spec of specs) {
+      assert.equal(spec.cwd, '/integration');
+      assert.equal(spec.timeoutMs, 77);
+      assert.ok((spec.maxOutputBytes ?? 0) > 0);
+      assert.equal(spec.env.SECRET_TOKEN, undefined);
+      assert.equal(spec.env.API_KEY, undefined);
+      assert.deepEqual(Object.keys(spec.env).every((key) => ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'].includes(key)), true);
+    }
+    assert.throws(() => runner.commandRunner.run({ command: 'unauthorized' }), /authorized/);
   });
 });
 

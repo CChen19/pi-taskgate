@@ -10,6 +10,7 @@ import type { CatalogConfig, ModelProfile, ModelRoute, RoleDefinition } from './
 
 export const COORDINATOR_ROLE_ID = 'coordinator';
 export const EXPLORER_ROLE_ID = 'explorer';
+export const PLANNER_ROLE_ID = 'planner';
 export const IMPLEMENTER_ROLE_ID = 'implementer';
 export const REVIEWER_ROLE_ID = 'reviewer';
 
@@ -25,6 +26,12 @@ export const DEFAULT_ROLES: readonly RoleDefinition[] = [
     kind: 'worker',
     description: 'Read-only codebase exploration: locate symbols, summarize structure, answer questions with file references.',
     tools: ['fs.read', 'code.search'],
+  },
+  {
+    id: PLANNER_ROLE_ID,
+    kind: 'worker',
+    description: 'Read-only semantic planner that returns a strict task plan.',
+    tools: ['read', 'todo_write', 'ask_user_question'],
   },
   {
     id: IMPLEMENTER_ROLE_ID,

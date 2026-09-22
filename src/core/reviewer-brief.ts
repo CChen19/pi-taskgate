@@ -32,10 +32,19 @@ export interface ReviewerSpec {
   readonly files_in_scope: readonly string[];
 }
 
+export const MAX_REVIEW_DIFF_LENGTH = 32 * 1024;
+const REVIEW_DIFF_MARKER = '\n...[diff truncated at 32 KiB]';
+
 export interface ReviewerDiff {
   readonly artifactRevision: string;
-  /** Bounded patch text; absent when only an external diff reference is available. */
+  /** Bounded actual patch text; absent only for legacy pure-core callers. */
   readonly patch?: string;
+}
+
+export function boundReviewerDiff(value: string, truncated = false): string {
+  if (!truncated && value.length <= MAX_REVIEW_DIFF_LENGTH) return value;
+  const limit = MAX_REVIEW_DIFF_LENGTH - REVIEW_DIFF_MARKER.length;
+  return `${value.slice(0, Math.max(0, limit))}${REVIEW_DIFF_MARKER}`;
 }
 
 export interface ReviewerEvidence {
@@ -218,7 +227,7 @@ export function assembleReviewerBrief(input: unknown): ReviewBrief {
   const normalized = validateBriefInput(input);
   const diff: ReviewerDiff = {
     artifactRevision: normalized.artifactRevision,
-    ...(normalized.diff === undefined ? {} : { patch: truncateForMessage(normalized.diff) }),
+    ...(normalized.diff === undefined ? {} : { patch: boundReviewerDiff(normalized.diff) }),
   };
   const copiedCommands: VerificationCommand[] = [];
   for (let index = 0; index < normalized.evidence.commands.length; index++) {

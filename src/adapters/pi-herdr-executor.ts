@@ -41,6 +41,8 @@ export interface HerdrSpawnRequest {
 export interface HerdrSubagentPort {
   spawn(request: HerdrSpawnRequest): unknown;
   poll(sessionId: string): unknown;
+  /** Structured-result seam; implemented by the real Herdr CLI port. */
+  readonly readFinalAssistant?: (sessionId: string) => string;
   interrupt(sessionId: string, reason: string): unknown;
   close(sessionId: string): unknown;
 }
@@ -64,6 +66,8 @@ export interface PiHerdrExecutorOptions {
   readonly modelProfileId?: string;
   readonly baseRevision: string;
   readonly clock: () => number;
+  /** Preserve interrupted workspaces for audit until explicit finalization. */
+  readonly retainCancelledArtifacts?: boolean;
 }
 
 export interface PiHerdrTerminalResult {
@@ -138,7 +142,7 @@ export class ExecutorAdapterError extends Error implements ExecutorErrorData {
 }
 
 const REQUEST_FIELDS = ['taskId', 'attemptId', 'contract', 'startedAt'] as const;
-const OPTIONS_FIELDS = ['herdr', 'workspace', 'worktreePort', 'dispatchResolver', 'roleId', 'modelProfileId', 'baseRevision', 'clock'] as const;
+const OPTIONS_FIELDS = ['herdr', 'workspace', 'worktreePort', 'dispatchResolver', 'roleId', 'modelProfileId', 'baseRevision', 'clock', 'retainCancelledArtifacts'] as const;
 const SPAWN_FIELDS = ['sessionId'] as const;
 const TRANSPORT_FIELDS = ['status', 'activity', 'outcome', 'resultRef'] as const;
 const HANDLE_FIELDS = ['schemaVersion', 'taskId', 'attemptId', 'sessionId', 'roleId', 'modelProfileId', 'filesInScope', 'workspacePath', 'branch', 'ownershipToken', 'managedMarker', 'baseRevision'] as const;
@@ -374,6 +378,7 @@ export class PiHerdrExecutor implements ExecutorPort {
       boundedString(ownValue(raw, 'roleId'), 'options.roleId', 256);
       boundedString(ownValue(raw, 'baseRevision'), 'options.baseRevision', MAX_ARTIFACT_REVISION_LENGTH);
       if (ownValue(raw, 'modelProfileId') !== undefined) boundedString(ownValue(raw, 'modelProfileId'), 'options.modelProfileId', 256);
+      if (ownValue(raw, 'retainCancelledArtifacts') !== undefined && typeof ownValue(raw, 'retainCancelledArtifacts') !== 'boolean') fail('INVALID_REQUEST', 'options.retainCancelledArtifacts', 'retainCancelledArtifacts must be boolean');
       this.options = options;
     } catch (error) {
       if (error instanceof ExecutorAdapterError) throw error;
@@ -625,7 +630,9 @@ export class PiHerdrExecutor implements ExecutorPort {
       close: () => {
         const closed = closeTransport();
         const shouldRelease = terminal === undefined || terminal.settlement.acceptanceEligible === false;
-        const cleaned = closed && (!shouldRelease || release());
+        const preserveInterrupted = this.options.retainCancelledArtifacts === true && interrupted && terminal === undefined;
+        if (preserveInterrupted) this.retainedArtifacts.set(attemptKey(state.taskId, state.attemptId), lease);
+        const cleaned = closed && (preserveInterrupted || !shouldRelease || release());
         if (!closed || !cleaned) throw boundaryError!;
       },
       terminalResult: () => terminal,

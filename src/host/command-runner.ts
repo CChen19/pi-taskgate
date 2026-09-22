@@ -34,6 +34,22 @@ export interface CommandRunner {
   runAsync(spec: CommandSpec): RunningCommand;
 }
 
+const MINIMAL_ENV_KEYS = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'] as const;
+
+/**
+ * Smallest hermetic environment shared by task and integration verification
+ * (and host git) commands; never forwards the full process environment.
+ */
+export function minimalProcessEnv(source: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+  const origin = source ?? process.env;
+  const result: NodeJS.ProcessEnv = {};
+  for (const key of MINIMAL_ENV_KEYS) {
+    const value = origin[key];
+    if (value !== undefined) result[key] = value;
+  }
+  return result;
+}
+
 const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024;
 const POSIX = process.platform !== 'win32';
 const KILL_GRACE_MS = 150;

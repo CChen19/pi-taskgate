@@ -53,7 +53,7 @@ describe('planDispatch', () => {
     assert.equal(result.ok, false);
     if (result.ok) return;
     assert.equal(result.error.code, 'UNKNOWN_ROLE');
-    assert.deepEqual([...result.error.available].sort(), ['coordinator', 'explorer', 'implementer', 'reviewer'].sort());
+    assert.deepEqual([...result.error.available].sort(), ['coordinator', 'explorer', 'implementer', 'planner', 'reviewer'].sort());
   });
 
   it('refuses coordinator as a delegation target and lists worker roles', () => {
@@ -61,7 +61,7 @@ describe('planDispatch', () => {
     assert.equal(result.ok, false);
     if (result.ok) return;
     assert.equal(result.error.code, 'ROLE_NOT_DELEGATABLE');
-    assert.deepEqual([...result.error.available].sort(), ['explorer', 'implementer', 'reviewer'].sort());
+    assert.deepEqual([...result.error.available].sort(), ['explorer', 'implementer', 'planner', 'reviewer'].sort());
   });
 
   it('distinguishes unknown profiles from profiles not allowed for the role', () => {
@@ -172,7 +172,7 @@ describe('planDispatch', () => {
       assert.ok(result.error.message.length < 400);
       assert.match(result.error.message, /\[truncated\]/);
       // Structure unaffected: available IDs still listed in full.
-      assert.equal(result.error.available.length, 4);
+      assert.equal(result.error.available.length, 5);
     }
   });
 });

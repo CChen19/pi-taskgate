@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, chmodSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { CommandRunner, CommandSpec } from './command-runner.ts';
+import { minimalProcessEnv } from './command-runner.ts';
 import {
   WORKTREE_MARKER_PREFIX,
   type WorktreeCreateRequest,
@@ -31,9 +32,15 @@ export interface GitWorktreePortOptions {
   readonly repoRoot?: string;
   readonly workspaceRoot: string;
   readonly commandRunner: CommandRunner;
+  /** Explicit safe env source/override; only PATH/HOME/LANG/LC_ALL/TMPDIR are forwarded. */
   readonly env?: NodeJS.ProcessEnv;
+  /** Timeout for git plumbing; defaults to DEFAULT_GIT_TIMEOUT_MS. */
+  readonly gitTimeoutMs?: number;
   readonly maxOutputBytes?: number;
 }
+
+const DEFAULT_GIT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024;
 
 function tokenFile(root: string, token: string): string {
   const digest = createHash('sha256').update(token, 'utf8').digest('hex');
@@ -49,8 +56,9 @@ function command(options: GitWorktreePortOptions, cwd: string, args: readonly st
     command: options.gitBinary ?? 'git',
     args,
     cwd,
-    env: { ...process.env, ...options.env },
-    ...(options.maxOutputBytes === undefined ? {} : { maxOutputBytes: options.maxOutputBytes }),
+    env: minimalProcessEnv(options.env),
+    timeoutMs: options.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
+    maxOutputBytes: options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
   };
 }
 

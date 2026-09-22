@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { CommandRunner } from './command-runner.ts';
+import { minimalProcessEnv, type CommandRunner } from './command-runner.ts';
 import type { VerificationCommand, VerificationRunner, VerificationRunnerResult } from '../core/verification.ts';
 
 export interface ProcessVerificationRunnerOptions {
@@ -9,16 +9,7 @@ export interface ProcessVerificationRunnerOptions {
   readonly allowedCommands: readonly string[];
   readonly env?: NodeJS.ProcessEnv;
   readonly maxOutputBytes?: number;
-}
-
-function safeEnv(input: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
-  const source = input ?? process.env;
-  const result: NodeJS.ProcessEnv = {};
-  for (const key of ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR']) {
-    const value = source[key];
-    if (value !== undefined) result[key] = value;
-  }
-  return result;
+  readonly defaultTimeoutMs?: number;
 }
 
 function redact(output: string, env: NodeJS.ProcessEnv): string {
@@ -44,13 +35,13 @@ export class ProcessVerificationRunner implements VerificationRunner {
 
   run(command: VerificationCommand): VerificationRunnerResult {
     if (!this.options.allowedCommands.includes(command.command)) throw new Error('verification command is not authorized');
-    const env = safeEnv(this.options.env);
+    const env = minimalProcessEnv(this.options.env);
     const result = this.options.commandRunner.run({
       command: 'bash',
       args: ['-lc', command.command],
       cwd: command.cwd ?? this.options.cwd,
       env,
-      ...(command.timeoutMs === undefined ? {} : { timeoutMs: command.timeoutMs }),
+      ...((command.timeoutMs ?? this.options.defaultTimeoutMs) === undefined ? {} : { timeoutMs: command.timeoutMs ?? this.options.defaultTimeoutMs }),
       ...(this.options.maxOutputBytes === undefined ? {} : { maxOutputBytes: this.options.maxOutputBytes }),
     });
     const output = redact([result.stdout, result.stderr].filter((part) => part.length > 0).join('\n'), this.options.env ?? {});

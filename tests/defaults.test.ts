@@ -6,15 +6,16 @@ import {
   COORDINATOR_ROLE_ID,
   DEFAULT_ROLES,
   EXPLORER_ROLE_ID,
+  PLANNER_ROLE_ID,
   IMPLEMENTER_ROLE_ID,
   REVIEWER_ROLE_ID,
 } from '../src/core/defaults.ts';
 import { fixtureConfig } from './fixtures.ts';
 
 describe('default role definitions', () => {
-  it('declare coordinator plus three worker roles', () => {
-    assert.equal(DEFAULT_ROLES.length, 4);
-    assert.equal(DEFAULT_ROLES.filter((role) => role.kind === 'worker').length, 3);
+  it('declare coordinator plus four worker roles', () => {
+    assert.equal(DEFAULT_ROLES.length, 5);
+    assert.equal(DEFAULT_ROLES.filter((role) => role.kind === 'worker').length, 4);
   });
 
   it('declare no shell, edit, write, or terminal tools on the coordinator', () => {
@@ -37,7 +38,7 @@ describe('default role definitions', () => {
     for (const id of [COORDINATOR_ROLE_ID, EXPLORER_ROLE_ID, IMPLEMENTER_ROLE_ID, REVIEWER_ROLE_ID]) {
       assert.ok(catalog.getRole(id), `missing role ${id}`);
     }
-    for (const id of [EXPLORER_ROLE_ID, IMPLEMENTER_ROLE_ID, REVIEWER_ROLE_ID]) {
+    for (const id of [EXPLORER_ROLE_ID, PLANNER_ROLE_ID, IMPLEMENTER_ROLE_ID, REVIEWER_ROLE_ID]) {
       assert.ok(catalog.getRoute(id), `missing route for ${id}`);
     }
   });

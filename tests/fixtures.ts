@@ -11,8 +11,14 @@ export const PROFILE_SLASH = 'profile-slash-free';
  */
 export const SLASH_MODEL_ID = 'nex-agi/nex-n2.5-pro:free';
 
+/**
+ * Complete immutable SHA-1 git object id used as the run-wide vertical base.
+ * Fixture value shaped like `git rev-parse HEAD` output; not a real commit.
+ */
+export const FULL_BASE_SHA = '0123456789abcdef0123456789abcdef01234567';
+
 export function fixtureConfig(): CatalogConfig {
-  return defaultCatalogConfig(
+  const config = defaultCatalogConfig(
     [
       { id: PROFILE_FAST, provider: 'fixture-provider', model: 'fixture-fast-small' },
       { id: PROFILE_SLASH, provider: 'fixture-provider', model: SLASH_MODEL_ID },
@@ -23,4 +29,9 @@ export function fixtureConfig(): CatalogConfig {
       { roleId: 'reviewer', defaultProfile: PROFILE_FAST, allowedProfiles: [PROFILE_FAST] },
     ],
   );
+  return {
+    ...config,
+    roles: config.roles,
+    routes: [...config.routes, { roleId: 'planner', defaultProfile: PROFILE_FAST, allowedProfiles: [PROFILE_FAST] }],
+  };
 }

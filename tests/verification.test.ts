@@ -262,8 +262,12 @@ describe('S5 fresh reviewer contract', () => {
     const brief = assembleReviewerBrief(input);
     assert.deepEqual(Object.keys(brief).sort(), ['diff', 'evidence', 'spec']);
     assert.equal(brief.diff.artifactRevision, 'diff-sha-1');
-    assert.equal(brief.diff.patch?.length, 160);
+    assert.equal(brief.diff.patch?.length, 1000);
     assert.equal(brief.evidence.artifactRevision, 'diff-sha-1');
+    const large = assembleReviewerBrief({ ...input, diff: 'x'.repeat(40_000) });
+    assert.equal(large.diff.patch?.length, 32 * 1024);
+    assert.ok((large.diff.patch?.length ?? 0) > 160);
+    assert.match(large.diff.patch ?? '', /diff truncated/);
     assert.equal(Object.isFrozen(brief), true);
     assert.equal(Object.isFrozen(brief.spec), true);
     assert.equal(Object.isFrozen(brief.diff), true);
@@ -275,7 +279,7 @@ describe('S5 fresh reviewer contract', () => {
       diff: { artifactRevision: 'diff-sha-1', patch: input.diff },
       evidence: bundle,
     };
-    assert.equal(assembleReviewerBrief(outputShapedInput).diff.patch?.length, 160);
+    assert.equal(assembleReviewerBrief(outputShapedInput).diff.patch?.length, 1000);
 
     const withTranscript = { ...input, workerTranscript: 'must not cross context' };
     assert.throws(() => assembleReviewerBrief(withTranscript), (error: ReviewerBriefError) => {

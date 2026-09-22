@@ -28,6 +28,7 @@ export interface HerdrCliConfig {
 }
 
 type Terminal = { readonly status: 'settled' | 'failed' | 'cancelled' | 'lost'; readonly outcome: string; readonly resultRef?: string };
+const MAX_ASSISTANT_TEXT = 32 * 1024;
 type Probe = { readonly status: 'working' | 'done' | 'blocked' | 'cancelled' | 'failed' | 'missing'; readonly sessionPath?: string };
 
 interface PaneState {
@@ -40,6 +41,8 @@ interface PaneState {
   cancelled: boolean;
   closed: boolean;
   terminal?: Terminal;
+  assistantText?: string;
+  assistantRead?: boolean;
   currentJob?: RunningCommand;
   startJob?: RunningCommand;
   promptJob?: RunningCommand;
@@ -234,6 +237,7 @@ export class HerdrCliPort implements HerdrSubagentPort {
         delete state.promptJob;
         if (state.currentJob === promptJob) delete state.currentJob;
         if (commandFailed(prompted)) state.terminal = { status: 'failed', outcome: bounded(prompted.stderr || 'herdr agent prompt failed') };
+        else state.workingSeen = true; // --wait success proves this generation completed, even if probe skipped working.
         state.phase = state.terminal === undefined ? 'ready' : 'terminal';
       }, (error: unknown) => {
         if (!this.current(state, generation)) return;
@@ -254,6 +258,16 @@ export class HerdrCliPort implements HerdrSubagentPort {
       state.phase = 'terminal';
     });
     return { sessionId: id };
+  }
+
+  /** Return the cached final assistant message exactly once; transcript is never exposed. */
+  readFinalAssistant(sessionId: string): string {
+    const state = this.panes.get(sessionId);
+    if (state === undefined || state.terminal?.status !== 'settled') throw new Error('assistant result is unavailable before a terminal settled state');
+    if (state.assistantRead === true) throw new Error('assistant result was already read');
+    if (state.assistantText === undefined || state.assistantText.length > MAX_ASSISTANT_TEXT) throw new Error('assistant result is malformed or exceeds the in-memory limit');
+    state.assistantRead = true;
+    return String(state.assistantText);
   }
 
   poll(sessionId: string): unknown {
@@ -370,6 +384,9 @@ export class HerdrCliPort implements HerdrSubagentPort {
     if (sessionPath === undefined) return { status: 'failed', outcome: 'herdr agent session path was unavailable' };
     const transcript = readLastAssistant(sessionPath);
     if (!transcript.ok) return { status: 'failed', outcome: 'herdr session JSONL was malformed or had no assistant outcome' };
+    if (transcript.text.length > MAX_ASSISTANT_TEXT) return { status: 'failed', outcome: 'herdr assistant result exceeded the in-memory limit' };
+    const state = this.panes.get(paneId);
+    if (state !== undefined) state.assistantText = transcript.text;
     return { status: 'settled', outcome: bounded(transcript.text), resultRef: `herdr-session:${paneId}` };
   }
 }
