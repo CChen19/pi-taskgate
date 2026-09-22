@@ -45,7 +45,10 @@ export function createHostTaskService(options: HostWiringOptions): TaskService {
     headRevision: () => git(config.repoRoot, ['rev-parse', 'HEAD']).stdout.trim(),
     readDiff: (workspacePath, baseRevision, artifactRevision) => {
       if (!REVISION.test(baseRevision) || !REVISION.test(artifactRevision)) throw new Error('artifact revisions must be full object ids');
-      const result = git(workspacePath, ['diff', '--no-ext-diff', '--no-color', `${baseRevision}...${artifactRevision}`, '--'], 33 * 1024);
+      const result = commandRunner.run({ command: 'git', args: ['diff', '--no-ext-diff', '--no-color', `${baseRevision}...${artifactRevision}`, '--'], cwd: workspacePath, env: minimalProcessEnv(undefined), timeoutMs: 30_000, maxOutputBytes: 33 * 1024 });
+      // Hitting the output cap stops git early; that is a bounded (marked-truncated) patch, not a failure.
+      const complete = result.status === 'exited' && result.exitCode === 0 && !result.timedOut;
+      if (!complete && !(result.stdoutTruncated && !result.timedOut)) throw new Error(result.stderr.trim() || 'git diff failed');
       return boundReviewerDiff(result.stdout, result.stdoutTruncated);
     },
     verifier: new ProcessAsyncVerificationRunner({ commandRunner, cwd: config.workspaceRoot, allowedCommands: config.verificationAllowlist, defaultTimeoutMs: config.verificationTimeoutMs, maxOutputBytes: 256 * 1024 }),

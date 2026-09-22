@@ -634,6 +634,29 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
     assert.equal(other.cancel('T1', 'descoped').state, 'CANCELLED');
   });
 
+  it('gives reviewers a bounded, marked patch when the real diff exceeds the cap', async () => {
+    const roleDir = join(h.root, 'roles');
+    mkdirSync(roleDir, { recursive: true });
+    writeFileSync(join(roleDir, 'reviewer-readonly.json'), JSON.stringify({ role: 'reviewer-readonly', version: '1.0.0', manifest: { tools: ['read'], rules: { edit: 'deny', write: 'deny', bash: 'deny', pwsh: 'deny', subagent: 'deny', terminal: 'deny' } } }));
+    const historyRoot = join(h.root, 'history');
+    const config = parseOrchestrationConfig({ version: 1, repoRoot: h.repo, workspaceRoot: h.workspaceRoot, verificationAllowlist: ['test -f src/a.txt'], reviewerRole: 'reviewer-readonly', roleDirs: [roleDir], pierHistoryRoots: [historyRoot] });
+    const svc = createHostTaskService({ config, persist: () => {}, masterCwd: h.root });
+    svc.plan([task('T1')]);
+    const started = svc.start('T1');
+    const { pierSessionDirName } = await import('../src/host/pier-ledger.ts');
+    const ledgerDir = join(historyRoot, pierSessionDirName(started.workspacePath!));
+    mkdirSync(ledgerDir, { recursive: true });
+    const row = (status: string) => JSON.stringify({ taskId: 'p', kind: 'worker-kimi', paneId: 'w1:p9', cwd: started.workspacePath, status, createdAt: Date.now(), outcome: 'done' });
+    writeFileSync(join(ledgerDir, 'history.jsonl'), `${row('running')}\n`);
+    svc.bind('T1', 'w1:p9');
+    commit(started.workspacePath!, { 'src/a.txt': `${'x'.repeat(100)}\n`.repeat(600) });
+    writeFileSync(join(ledgerDir, 'history.jsonl'), `${row('running')}\n${row('settled')}\n`);
+    assert.equal((await svc.verify('T1')).outcome, 'awaiting_review');
+    const brief = svc.reviewBrief('T1');
+    assert.equal(brief.outcome, 'review_requested');
+    assert.match(brief.prompt!, /diff truncated at 32 KiB/);
+  });
+
   it('wires the real host service from config (git, verification, ledger, role files)', async () => {
     const historyRoot = join(h.root, 'history');
     const roleDir = join(h.root, 'roles');
