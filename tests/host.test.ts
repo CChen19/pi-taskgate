@@ -9,6 +9,7 @@ import { GitWorktreePort, changedFromStatus } from '../src/host/git-worktree-por
 import { HerdrCliPort } from '../src/host/herdr-cli-port.ts';
 import { ProcessVerificationRunner } from '../src/host/process-verification-runner.ts';
 import { GitIntegrationRunner } from '../src/host/git-integration-runner.ts';
+import { planIntegration, runIntegration } from '../src/core/integration.ts';
 import { WorktreeManager, WORKTREE_MARKER_PREFIX } from '../src/adapters/worktree-manager.ts';
 import type { HerdrSpawnRequest } from '../src/adapters/pi-herdr-executor.ts';
 
@@ -378,6 +379,33 @@ describe('integration verification host runner', () => {
       assert.deepEqual(Object.keys(spec.env).every((key) => ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'].includes(key)), true);
     }
     assert.throws(() => runner.commandRunner.run({ command: 'unauthorized' }), /authorized/);
+  });
+
+  it('asPort() crosses the strict core boundary: plain and frozen, full pipeline merged; the raw class instance must not', () => {
+    const commandRunner = {
+      run: (spec: CommandSpec) => {
+        if (spec.command === 'bash') return result('final verification passed');
+        const [verb, ...rest] = spec.args;
+        return result(verb === 'rev-parse' && rest[0] === 'HEAD' ? 'merged-1' : verb === 'rev-parse' ? 'rev-unit' : '');
+      },
+      runAsync: () => { throw new Error('unused'); },
+    };
+    const integration = { taskId: 'Tintegration', attemptId: 'a-1', baseRevision: 'base', workspacePath: '/integration', branch: 'integration/branch', ownershipToken: 'token', managedMarker: 'agent-orchestrator:token' };
+    const runner = new GitIntegrationRunner({ commandRunner, integration, baseRevision: 'base', verificationAllowlist: ['final'], verificationTimeoutMs: 77 });
+    const unit = { taskId: 'Tone', branch: 'integration/Tone', revision: 'rev-unit', verification: { verdict: 'passed', reasons: [], artifactRevision: 'rev-unit' } };
+    const plan = planIntegration([unit], { baseRevision: 'base', verificationCommands: ['final'] });
+    const port = runner.asPort();
+    assert.equal(Object.getPrototypeOf(port), Object.prototype);
+    assert.equal(Object.getPrototypeOf(port.gitOps), Object.prototype);
+    assert.equal(Object.getPrototypeOf(port.commandRunner), Object.prototype);
+    assert.equal(Object.isFrozen(port) && Object.isFrozen(port.gitOps) && Object.isFrozen(port.commandRunner), true);
+    const report = runIntegration(plan, port, { clock: () => 0 });
+    assert.equal(report.outcome, 'merged');
+    assert.equal(report.steps.map((step) => step.name).join(','), 'rebase,merge,verification,conflict-check,status');
+    assert.equal(report.finalVerification?.verdict.verdict, 'passed');
+    assert.equal(report.finalVerification?.evidence.artifactRevision, 'merged-1');
+    // Contrast: the strict plain-object core boundary must keep rejecting the class instance.
+    assert.throws(() => runIntegration(plan, runner, { clock: () => 0 }), /runner must be a plain object/);
   });
 });
 

@@ -85,4 +85,13 @@ export class GitIntegrationRunner implements IntegrationRunner {
       return { exitCode: result.exitCode === null ? 1 : result.exitCode, timedOut: result.timedOut, output: [result.stdout, result.stderr].filter((part) => part.length > 0).join('\n'), outputRef: `integration:${verification.command}` };
     }};
   }
+
+  /**
+   * Frozen plain structural port for the strict core boundary. The pure core
+   * rejects class instances (`runner must be a plain object`), so callers must
+   * hand `runIntegration` this value, never the class instance itself.
+   */
+  asPort(): IntegrationRunner {
+    return Object.freeze({ gitOps: Object.freeze(this.gitOps), commandRunner: Object.freeze(this.commandRunner) });
+  }
 }

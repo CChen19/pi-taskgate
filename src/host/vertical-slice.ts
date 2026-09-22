@@ -282,6 +282,10 @@ export class VerticalSliceCoordinator {
           journal.write('scheduler', eventPayload(event), clock);
           processedEvents++;
           if (event.type === 'retry_scheduled') retries++;
+          // Scheduler emits task_started only after executor.start returned a
+          // valid handle, so each event is exactly one real model session and
+          // pure start failures (executor_error) are never counted.
+          if (event.type === 'task_started') modelCalls++;
           if (event.type === 'attempt_settled') {
             attempts++;
             if (event.settlement.acceptanceEligible) {
@@ -437,7 +441,9 @@ export class VerticalSliceCoordinator {
     if (runner === undefined) {
       integrationLease = integrationLease ?? manager.acquire(host.worktree, 'Tintegration', 'Tintegration:attempt-1', this.config.baseRevision);
       if (host.commandRunner === undefined) throw new Error('real integration requires host commandRunner');
-      runner = new GitIntegrationRunner({ commandRunner: host.commandRunner, integration: integrationLease, baseRevision: this.config.baseRevision, verificationAllowlist: this.config.verificationAllowlist, verificationTimeoutMs: this.config.verificationTimeoutMs });
+      // Hold only the frozen plain port; the class instance must never cross
+      // the strict core boundary (core rejects non-plain runner objects).
+      runner = new GitIntegrationRunner({ commandRunner: host.commandRunner, integration: integrationLease, baseRevision: this.config.baseRevision, verificationAllowlist: this.config.verificationAllowlist, verificationTimeoutMs: this.config.verificationTimeoutMs }).asPort();
     }
     this.integrationLease = integrationLease;
     const report = runIntegration(mergePlan, runner, { clock });

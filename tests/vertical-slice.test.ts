@@ -7,6 +7,9 @@ import { FakeExecutor, type AttemptSettlement, type ExecutorStartRequest, type A
 import type { VerificationRunner } from '../src/core/verification.ts';
 import type { ReviewBrief } from '../src/core/reviewer-brief.ts';
 import { fixtureConfig, FULL_BASE_SHA, PROFILE_FAST, PROFILE_SLASH } from './fixtures.ts';
+import type { CommandRunner, CommandResult, CommandSpec } from '../src/host/command-runner.ts';
+import { GitIntegrationRunner } from '../src/host/git-integration-runner.ts';
+import { planIntegration, runIntegration } from '../src/core/integration.ts';
 import { StructuredPlanner, VerticalSliceCoordinator, type VerticalHost } from '../src/host/vertical-slice.ts';
 import { StructuredAgentRunner } from '../src/host/structured-agent-runner.ts';
 import type { HerdrSpawnRequest } from '../src/adapters/pi-herdr-executor.ts';
@@ -47,6 +50,40 @@ function integration(conflict = false): IntegrationRunner {
   }, commandRunner: { run: () => ({ exitCode: 0, timedOut: false, output: 'ok' }) } };
 }
 
+/** Fake git plumbing for the real GitIntegrationRunner: no repository, no worktree, no network. */
+function fakeGitCommandRunner(branchRevision: string, headRevision: string): CommandRunner {
+  const ok = (stdout = ''): CommandResult => ({ status: 'exited', exitCode: 0, signal: null, timedOut: false, stdout, stderr: '', stdoutTruncated: false, stderrTruncated: false });
+  return {
+    run: (spec: CommandSpec): CommandResult => {
+      if (spec.command === 'bash') return ok('verification passed');
+      const [verb, ...rest] = spec.args;
+      if (verb === 'rev-parse') return ok(rest[0] === 'HEAD' ? headRevision : branchRevision);
+      if (verb === 'merge-base' || verb === 'merge' || verb === 'diff' || verb === 'status') return ok('');
+      throw new Error(`unexpected git invocation: ${spec.command} ${spec.args.join(' ')}`);
+    },
+    runAsync: () => { throw new Error('runAsync is not used'); },
+  };
+}
+
+const fakeLease = { taskId: 'Tintegration', attemptId: 'Tintegration:attempt-1', baseRevision: FULL_BASE_SHA, workspacePath: '/workspaces/integration-real', branch: 'branch/integration', ownershipToken: 'token', managedMarker: 'agent-orchestrator:token' };
+
+/** Fake integration whose status revision matches the merge revision for the given final revision. */
+function integrationMerging(finalRevision: string): IntegrationRunner {
+  return { gitOps: {
+    rebase: (_base, unit) => ({ ok: true, revision: unit.revision, details: 'ok' }),
+    merge: (unit) => ({ ok: true, revision: `merged-${unit.taskId}`, details: 'ok' }),
+    conflicts: () => ({ conflicts: [] }),
+    status: () => ({ revision: finalRevision, clean: true, details: 'clean' }),
+  }, commandRunner: { run: () => ({ exitCode: 0, timedOut: false, output: 'ok' }) } };
+}
+
+class FlakyStartExecutor implements ExecutorPort {
+  private readonly inner: FakeExecutor;
+  starts = 0;
+  constructor() { this.inner = new FakeExecutor((request: ExecutorStartRequest) => [{ status: 'settled', outcome: 'completed', settlement: settlement(request.taskId) }]); }
+  start(request: ExecutorStartRequest): AttemptHandle { this.starts++; if (this.starts === 1) throw new Error('herdr spawn failed'); return this.inner.start(request); }
+}
+
 describe('vertical slice coordinator', () => {
   it('runs independent tasks concurrently, reviews exact revisions, integrates, and retains final artifact', async () => {
     const cwds: string[] = [];
@@ -69,6 +106,55 @@ describe('vertical slice coordinator', () => {
     assert.equal(result.integration?.outcome, 'merged');
     assert.equal(result.finalRevision, 'merged-Tsecond');
     assert.equal(executor.finalized.length, 2);
+    // 1 planner session + 2 implementer sessions (task_started) + 2 reviewer sessions.
+    assert.equal(result.metrics.modelCalls, 5);
+  });
+
+  it('merges through the real GitIntegrationRunner port across the strict core boundary (first real run bug)', async () => {
+    const executor = new FinalizableExecutor();
+    const coordinator = new VerticalSliceCoordinator({ ...configBase, reviewerStrategy: 'never' }, {
+      executor,
+      // No injected integrationRunner: the coordinator itself constructs the
+      // real GitIntegrationRunner; only the fake lease and fake git plumbing
+      // are injected, so no real worktree or repository is touched.
+      host: { ...host([]), commandRunner: fakeGitCommandRunner('rev-treal', 'merged-treal') },
+      planner: { plan: () => singleTaskPlan('Treal') },
+      integrationLease: fakeLease,
+      runId: 'run-real-integration-port', clock: () => 0, sleep: async () => undefined,
+    });
+    const summary = await coordinator.run();
+    assert.equal(summary.status, 'passed');
+    assert.equal(summary.integration?.outcome, 'merged');
+    assert.equal(summary.integration?.finalVerification?.verdict.verdict, 'passed');
+    assert.equal(summary.integration?.steps.map((step) => step.name).join(','), 'rebase,merge,verification,conflict-check,status');
+    assert.equal(summary.finalRevision, 'merged-treal');
+    assert.equal(summary.finalPath, '/workspaces/integration-real');
+  });
+
+  it('counts one model call per successfully started worker attempt, including retries', async () => {
+    let verifyCalls = 0;
+    const retryHost: VerticalHost = { ...host([]), createVerificationRunner: () => ({ run: () => { verifyCalls++; return { exitCode: verifyCalls === 1 ? 1 : 0, timedOut: false, output: verifyCalls === 1 ? 'broken' : 'ok' }; } }) };
+    const plan = { version: 1, executionMode: 'single' as const, tasks: [{ id: 'Tretry-start', objective: 'retry once', depends_on: [], files_in_scope: ['src/'], acceptance_criteria: ['done'], verification: ['check'], retry: { max_attempts: 2 } }], finalVerification: ['final'] };
+    const executor = new FinalizableExecutor();
+    const coordinator = new VerticalSliceCoordinator({ ...configBase, reviewerStrategy: 'never' }, { executor, host: retryHost, planner: { plan: () => plan }, integrationRunner: integrationMerging('merged-Tretry-start'), runId: 'run-retry-start-count', clock: () => 0, sleep: async () => undefined });
+    const summary = await coordinator.run();
+    assert.equal(summary.status, 'passed');
+    assert.equal(executor.inner.startCalls.length, 2);
+    // 1 planner session + two actually started worker attempts; the rejected
+    // first attempt is a retry, not an extra uncounted model session.
+    assert.equal(summary.metrics.modelCalls, 3);
+  });
+
+  it('does not count a pure executor start failure as a model call', async () => {
+    const executor = new FlakyStartExecutor();
+    const plan = { version: 1, executionMode: 'single' as const, tasks: [{ id: 'Tflaky', objective: 'spawn flaky', depends_on: [], files_in_scope: ['src/'], acceptance_criteria: ['done'], verification: ['check'], retry: { max_attempts: 2 } }], finalVerification: ['final'] };
+    const coordinator = new VerticalSliceCoordinator({ ...configBase, reviewerStrategy: 'never' }, { executor, host: host([]), planner: { plan: () => plan }, integrationRunner: integrationMerging('merged-Tflaky'), runId: 'run-flaky-start-count', clock: () => 0, sleep: async () => undefined });
+    const summary = await coordinator.run();
+    assert.equal(summary.status, 'passed');
+    assert.equal(executor.starts, 2);
+    // 1 planner session + exactly 1 successful start; the thrown first spawn
+    // never emitted task_started and must not be counted as a model call.
+    assert.equal(summary.metrics.modelCalls, 2);
   });
 
   it('rejects planner verification escalation before executor start', async () => {
@@ -223,7 +309,8 @@ describe('planner retry classification', () => {
     assert.equal(calls, 2);
     assert.equal(feedbacks[0], undefined);
     assert.match(feedbacks[1] ?? '', /RunPlan structural validation/);
-    assert.equal(summary.metrics.modelCalls, 2);
+    // 2 planner attempts (structural retry) + 1 worker session.
+    assert.equal(summary.metrics.modelCalls, 3);
     assert.equal(summary.metrics.retries, 1);
   });
 
