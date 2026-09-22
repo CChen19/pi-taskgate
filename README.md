@@ -1,4 +1,8 @@
-# agent-orchestrator
+# pi-taskgate
+
+A quality gate for AI coding agents: work is accepted only after clean-room verification and an independent review of the exact revision. A Pi extension built on [Pier](https://github.com/July24/pier) (Pi + herdr subagents).
+
+> 命名说明：本项目原名 `agent-orchestrator`。为兼容历史 session 与实验证据，以下落盘标识保留旧名、暂不改动：Pi session 事件类型 `agent-orchestrator.task-event`、配置文件 `agent-orchestrator.json`、环境变量 `AGENT_ORCHESTRATOR_CONFIG`、worktree 所有权目录 `.agent-orchestrator/ledger`。
 
 给 Pi 主会话（Pier master）用的 deterministic orchestration primitives。**主 Pi agent 是唯一的语义 orchestrator 和人机入口**：它负责拆解任务、决定并行、动态重规划、何时问人。本项目只提供事实和约束：结构化 task state、宿主观察的 git artifact、files_in_scope、allowlist 机械验证、绑定 revision 的 fresh review。worker/reviewer 由主 agent 通过 Pier 的 `subagent` 工具在真实 pane 中启动，人随时可以进入 pane 接管。
 
@@ -65,7 +69,7 @@ task 事件以 `agent-orchestrator.task-event` custom entry 写入 Pi session，
 3. 在 herdr pane 中启动主会话，同时加载 Pier 与本扩展：
 
 ```bash
-pi -e /path/to/pier/packages/pier-ext/src/index.ts -e /path/to/agent-orchestrator/src/pi-extension/index.ts
+pi -e /path/to/pier/packages/pier-ext/src/index.ts -e /path/to/pi-taskgate/src/pi-extension/index.ts
 ```
 
 小任务不需要 task 工具，主 agent 直接做并跑检查；复杂或可并行的任务才走 task board。

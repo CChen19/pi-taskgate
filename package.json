@@ -1,8 +1,8 @@
 {
-  "name": "agent-orchestrator",
+  "name": "pi-taskgate",
   "version": "0.1.0",
   "private": true,
-  "description": "A policy-driven orchestration core with injectable and P0 real Pi/herdr/git host adapters.",
+  "description": "A quality gate for AI coding agents: a Pi extension (built on Pier) that accepts delegated work only after clean-room verification and an independent review of the exact revision.",
   "type": "module",
   "engines": {
     "node": ">=24"

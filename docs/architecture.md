@@ -8,7 +8,7 @@ Status: P0 (task tools) and P1 (integration) are implemented and have run for re
 Human ⇄ Pi main session (Pier master; the only semantic orchestrator)
           │  semantic: decompose, parallelize, re-plan, ask the human, summarize
           ▼
-   Pier `subagent` (real panes, human takeover, resume)   agent-orchestrator task tools
+   Pier `subagent` (real panes, human takeover, resume)   pi-taskgate task tools
           │                                                 (companion Pi extension)
    worker panes in host-owned worktrees ─────────────► host inspection · scope · allowlisted
    reviewer pane (read-only role, fresh)                clean-room verification · revision-bound review

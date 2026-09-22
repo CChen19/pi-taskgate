@@ -1,7 +1,7 @@
 /**
  * Companion Pi extension for the main (master) session, loaded next to Pier:
  *
- *   pi -e <pier-ext>/src/index.ts -e <agent-orchestrator>/src/pi-extension/index.ts
+ *   pi -e <pier-ext>/src/index.ts -e <pi-taskgate>/src/pi-extension/index.ts
  *
  * It adds deterministic task tools. It does not spawn agents: the main agent
  * dispatches workers and reviewers with Pier's `subagent` tool, then asks these
