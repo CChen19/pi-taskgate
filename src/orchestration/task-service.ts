@@ -451,7 +451,7 @@ export class TaskService {
     if (row.createdAt < review.issuedAt) fail('REVIEWER_INVALID', `${agentId} was launched before review ${review.reviewId} was issued`);
     if (row.outcome === null || row.outcome.trim().length === 0) fail('REVIEW_UNPARSEABLE', `reviewer ${agentId} has no closing output in the ledger`);
     const parsed = parseReviewerOutcome(row.outcome, review.reviewId);
-    if (!parsed.ok) fail('REVIEW_UNPARSEABLE', `${parsed.reason}; ask the reviewer (subagent send) to end with the required verdict line`);
+    if (!parsed.ok) fail('REVIEW_UNPARSEABLE', `${parsed.reason}; a settled reviewer cannot be re-asked (subagent send revives it, and revived sessions are not fresh). Call task_review_brief again and spawn a new reviewer, or task_abandon the attempt if the reviewer's findings already warrant a retry`);
     if (parsed.verdict.artifactRevision !== candidate.revision) fail('REVISION_MISMATCH', `review is for ${parsed.verdict.artifactRevision}, candidate is ${candidate.revision}`);
     const lease = this.liveLease(attempt);
     const guard = this.guardCandidate(task, attempt, lease, candidate);
