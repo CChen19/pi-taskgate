@@ -6,3 +6,12 @@ dist/
 .env.*
 !.env.example
 *.log
+
+# Local-only experiment and runtime state (never publish; keeps local configs untouched)
+.pi-herdr/
+.ao-bench/
+.bn/
+.aow/
+.agent-orchestrator/
+.agent-orchestrator-workspaces/
+*.local.json
