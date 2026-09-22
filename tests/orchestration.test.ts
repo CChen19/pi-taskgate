@@ -111,8 +111,8 @@ async function rejectsCode(promise: Promise<unknown> | (() => unknown), code: st
 }
 
 /** Drive one task to a settled candidate: start, worker commit, bind, settle in ledger, verify. */
-async function toCandidate(h: Harness, svc: TaskService, id: string, files: Record<string, string> = { 'src/a.txt': 'hello\n' }, agent = `w:${id}`) {
-  const started = svc.start(id);
+async function toCandidate(h: Harness, svc: TaskService, id: string, files: Record<string, string> = { 'src/a.txt': 'hello\n' }, agent = `w:${id}`, startOptions: { baseTask?: string } = {}) {
+  const started = svc.start(id, startOptions);
   const cwd = started.workspacePath!;
   h.ledger.add({ paneId: agent, cwd, createdAt: h.now.value + 1 });
   svc.bind(id, agent);
@@ -123,8 +123,8 @@ async function toCandidate(h: Harness, svc: TaskService, id: string, files: Reco
 }
 
 /** Drive a task all the way to PASSED through verification and a fresh review. */
-async function accept(h: Harness, svc: TaskService, id: string, files: Record<string, string>, agent = `w:${id}`): Promise<string> {
-  const { cwd, revision, verified } = await toCandidate(h, svc, id, files, agent);
+async function accept(h: Harness, svc: TaskService, id: string, files: Record<string, string>, agent = `w:${id}`, startOptions: { baseTask?: string } = {}): Promise<string> {
+  const { cwd, revision, verified } = await toCandidate(h, svc, id, files, agent, startOptions);
   assert.equal(verified.outcome, 'awaiting_review', `${id} verified: ${verified.reasons.join('; ')}`);
   const brief = svc.reviewBrief(id);
   h.ledger.add({ paneId: `r:${id}`, cwd, kind: 'reviewer-readonly', status: 'settled', createdAt: h.now.value + 1, outcome: reviewerOutput(brief.reviewId!, 'passed', revision) });
@@ -166,7 +166,7 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
     assert.equal(svc.status().length, 0, 'failed plans add nothing');
     assert.equal(h.events.length, 0);
 
-    const added = svc.plan([task('T3', { depends_on: ['T1'] }), task('T1'), task('T2')]);
+    const added = svc.plan([task('T3', { depends_on: ['T1'] }), task('T1'), task('T2', { files_in_scope: ['docs/'] })]);
     assert.deepEqual(added.map((entry) => entry.id), ['T1', 'T3', 'T2'], 'batch is topologically ordered');
     assert.deepEqual([...svc.readySet()].sort(), ['T1', 'T2']);
     assert.equal(svc.task('T1').contract.retry?.max_attempts, 2, 'default attempt budget applied');
@@ -175,7 +175,7 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
 
   it('runs two tasks in parallel worktrees through verification and fresh review, then unblocks the dependent', async () => {
     const svc = h.service();
-    svc.plan([task('T1'), task('T2', { files_in_scope: ['src/b.txt'], verification: ['test -f src/b.txt'] }), task('T3', { depends_on: ['T1', 'T2'] })]);
+    svc.plan([task('T1', { files_in_scope: ['src/a.txt'] }), task('T2', { files_in_scope: ['src/b.txt'], verification: ['test -f src/b.txt'] }), task('T3', { depends_on: ['T1', 'T2'] })]);
     await rejectsCode(() => svc.start('T3'), 'NOT_READY');
 
     const one = svc.start('T1');
@@ -345,7 +345,7 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
     it('integrates exact accepted revisions, verifies in a clean room, and requires a fresh non-implementer review', async () => {
       const svc = h.service();
       const b = base();
-      svc.plan([task('T1'), task('T2', { files_in_scope: ['src/b.txt'], verification: ['test -f src/b.txt'] })]);
+      svc.plan([task('T1', { files_in_scope: ['src/a.txt'] }), task('T2', { files_in_scope: ['src/b.txt'], verification: ['test -f src/b.txt'] })]);
       const rev1 = await accept(h, svc, 'T1', { 'src/a.txt': 'hello\n' });
       const rev2 = await accept(h, svc, 'T2', { 'src/b.txt': 'b\n' });
       const result = svc.integrate({ baseRevision: b, revisions: [rev1.slice(0, 8), rev2] });
@@ -382,7 +382,7 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
 
     it('fails closed on a conflict, records it, and leaves the worktree clean without resolving', async () => {
       const svc = h.service();
-      svc.plan([task('T1', { files_in_scope: ['README.md'], verification: ['test -f README.md'] }), task('T2', { files_in_scope: ['README.md'], verification: ['test -f README.md'] })]);
+      svc.plan([task('T1', { files_in_scope: ['README.md'], verification: ['test -f README.md'], planned_overlap: ['README.md'] }), task('T2', { files_in_scope: ['README.md'], verification: ['test -f README.md'], planned_overlap: ['README.md'] })]);
       const rev1 = await acceptReadme(h, svc, 'T1', 'one\n');
       const rev2 = await acceptReadme(h, svc, 'T2', 'two\n');
       const result = svc.integrate({ baseRevision: base(), revisions: [rev1, rev2] });
@@ -399,10 +399,11 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
     it('admits only PASSED, freshly reviewed candidates built on the exact base', async () => {
       const svc = h.service();
       const b = base();
-      svc.plan([task('T1'), task('T2', { review_required: false }), task('T3')]);
+      svc.plan([task('T1', { planned_overlap: ['src/'] }), task('T2', { review_required: false, planned_overlap: ['src/'] }), task('T3', { planned_overlap: ['src/'] })]);
       const rev1 = await accept(h, svc, 'T1', { 'src/a.txt': 'hello\n' });
-      const mechanical = await toCandidate(h, svc, 'T2', { 'src/a.txt': 'hello\n' });
-      const pending = await toCandidate(h, svc, 'T3', { 'src/a.txt': 'hello\n' });
+      // Distinct content: identical trees, parents, and timestamps would otherwise yield the same commit id.
+      const mechanical = await toCandidate(h, svc, 'T2', { 'src/a.txt': 'hello\nmechanical\n' });
+      const pending = await toCandidate(h, svc, 'T3', { 'src/a.txt': 'hello\npending\n' });
       const before = h.events.length;
       await rejectsCode(() => svc.integrate({ baseRevision: 'HEAD', revisions: [rev1] }), 'INVALID_INPUT');
       await rejectsCode(() => svc.integrate({ baseRevision: b, revisions: [mechanical.revision] }), 'NOT_ACCEPTED');
@@ -429,6 +430,32 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
       await rejectsCode(() => second.integrate({ baseRevision: base(), revisions: [rev1], evidence: [{ source: 'bad', events: [evidence[1]!] }] }), 'INVALID_INPUT');
     });
 
+    it('integrates candidates stacked on an earlier input, picking only their own commits', async () => {
+      const svc = h.service();
+      const b = base();
+      svc.plan([
+        task('Twire', { files_in_scope: ['wiring.txt'], verification: ['test -f README.md'] }),
+        task('Ta', { depends_on: ['Twire'], files_in_scope: ['src/a.txt'] }),
+        task('Tb', { depends_on: ['Twire'], files_in_scope: ['src/b.txt'], verification: ['test -f src/b.txt'] }),
+      ]);
+      const wire = await accept(h, svc, 'Twire', { 'wiring.txt': 'fragments\n' });
+      const a = await accept(h, svc, 'Ta', { 'src/a.txt': 'hello\n' }, 'w:Ta', { baseTask: 'Twire' });
+      const bRev = await accept(h, svc, 'Tb', { 'src/b.txt': 'b\n' }, 'w:Tb', { baseTask: 'Twire' });
+      assert.equal(svc.task('Ta').attemptRecords[0]!.lease.baseRevision, wire);
+      await rejectsCode(() => svc.integrate({ baseRevision: b, revisions: [a, wire, bRev] }), 'NOT_ACCEPTED');
+      const result = svc.integrate({ baseRevision: b, revisions: [wire, a, bRev] });
+      assert.equal(result.state, 'RUNNING', result.conflict?.detail ?? result.reason);
+      assert.deepEqual(result.inputs.map((input) => input.commits.length), [1, 1, 1], 'the wiring commit is not picked twice');
+      assert.deepEqual(result.inputs.map((input) => input.baseRevision), [b, wire, wire]);
+      const verified = await svc.verify(result.taskId);
+      assert.equal(verified.outcome, 'awaiting_review', verified.reasons.join('; '));
+      const brief = svc.reviewBrief(result.taskId);
+      assert.match(brief.prompt!, /built on the base/);
+      assert.match(brief.prompt!, new RegExp(`built on ${wire.slice(0, 12)}`));
+      h.ledger.add({ paneId: 'r:stack', cwd: result.workspacePath, kind: 'reviewer-readonly', status: 'settled', createdAt: h.now.value + 1, outcome: reviewerOutput(brief.reviewId!, 'passed', result.integratedRevision!) });
+      assert.equal(svc.recordReview(result.taskId, 'r:stack').state, 'PASSED');
+    });
+
     it('fails the integration when its history no longer matches the declared commits', async () => {
       const svc = h.service();
       svc.plan([task('T1')]);
@@ -439,6 +466,42 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
       assert.equal(verified.outcome, 'attempt_failed');
       assert.match(verified.reasons.join(' '), /not the recorded integrated revision/);
       assert.equal(svc.task(result.taskId).state, 'FAILED');
+    });
+  });
+
+  describe('planning rule: parallel tasks must not overlap', () => {
+    it('rejects exact and directory overlaps between tasks that can run in parallel', () => {
+      const svc = h.service();
+      assert.throws(() => svc.plan([task('T1', { files_in_scope: ['CMakeLists.txt', 'tests/a.cpp'] }), task('T2', { files_in_scope: ['CMakeLists.txt', 'tests/b.cpp'] })]), /T1 and T2 can run in parallel but both touch CMakeLists\.txt/);
+      assert.throws(() => svc.plan([task('T1', { files_in_scope: ['src/'] }), task('T2', { files_in_scope: ['src/b.txt'] })]), /both touch src\/ \/ src\/b\.txt/);
+      assert.equal(svc.status().length, 0);
+    });
+
+    it('allows overlap when the tasks are ordered by dependencies, directly or transitively', () => {
+      const svc = h.service();
+      svc.plan([
+        task('T1', { files_in_scope: ['CMakeLists.txt'] }),
+        task('T2', { depends_on: ['T1'], files_in_scope: ['CMakeLists.txt', 'tests/a.cpp'] }),
+        task('T3', { depends_on: ['T2'], files_in_scope: ['CMakeLists.txt', 'tests/b.cpp'] }),
+      ]);
+      assert.equal(svc.status().length, 3);
+    });
+
+    it('requires planned_overlap on both tasks', () => {
+      const svc = h.service();
+      assert.throws(() => svc.plan([task('T1', { files_in_scope: ['CMakeLists.txt'], planned_overlap: ['CMakeLists.txt'] }), task('T2', { files_in_scope: ['CMakeLists.txt'] })]), /planned_overlap/);
+      svc.plan([task('T1', { files_in_scope: ['CMakeLists.txt'], planned_overlap: ['CMakeLists.txt'] }), task('T2', { files_in_scope: ['CMakeLists.txt'], planned_overlap: ['CMakeLists.txt'] })]);
+      assert.deepEqual(svc.task('T1').plannedOverlap, ['CMakeLists.txt']);
+    });
+
+    it('checks new tasks against live board tasks but not failed or cancelled ones', () => {
+      const svc = h.service();
+      svc.plan([task('T1', { files_in_scope: ['CMakeLists.txt'] })]);
+      assert.throws(() => svc.plan([task('T2', { files_in_scope: ['CMakeLists.txt'] })]), /T1 and T2/);
+      svc.plan([task('T3', { depends_on: ['T1'], files_in_scope: ['CMakeLists.txt'] })]);
+      svc.cancel('T1', 'replaced');
+      svc.plan([task('T4', { files_in_scope: ['src/x.txt'] })]);
+      assert.throws(() => svc.plan([task('T5', { files_in_scope: ['CMakeLists.txt'] })]), /T3 and T5/, 'T3 is blocked, not terminal, and still counts');
     });
   });
 
@@ -533,7 +596,7 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
 
   it('restores from persisted events and re-adopts worktree leases', async () => {
     const svc = h.service();
-    svc.plan([task('T1'), task('T2')]);
+    svc.plan([task('T1', { planned_overlap: ['src/'] }), task('T2', { planned_overlap: ['src/'] })]);
     const { cwd, revision } = await toCandidate(h, svc, 'T1');
     const started2 = svc.start('T2');
 

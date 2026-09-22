@@ -243,12 +243,13 @@ export class TaskService {
   /** Add tasks. Validates everything before any state changes. */
   plan(inputs: unknown): readonly TaskView[] {
     if (!Array.isArray(inputs) || inputs.length === 0) fail('INVALID_INPUT', 'tasks must be a non-empty array');
-    const parsed: { contract: TaskContract; reviewRequired: boolean }[] = [];
+    const parsed: { contract: TaskContract; reviewRequired: boolean; plannedOverlap?: readonly string[] }[] = [];
     const problems: string[] = [];
     for (const [index, raw] of inputs.entries()) {
       if (!isPlainObject(raw)) { problems.push(`tasks[${index}] must be an object`); continue; }
-      const { review_required: reviewRaw, ...rest } = raw as Record<string, unknown>;
+      const { review_required: reviewRaw, planned_overlap: overlapRaw, ...rest } = raw as Record<string, unknown>;
       if (reviewRaw !== undefined && typeof reviewRaw !== 'boolean') problems.push(`tasks[${index}].review_required must be boolean`);
+      if (overlapRaw !== undefined && (!Array.isArray(overlapRaw) || overlapRaw.some((entry) => typeof entry !== 'string' || entry.length === 0))) problems.push(`tasks[${index}].planned_overlap must be an array of paths`);
       const candidate = rest.retry === undefined ? { ...rest, retry: { max_attempts: this.settings.defaultMaxAttempts } } : rest;
       const validated = validateTaskContract(candidate);
       if (!validated.ok) { problems.push(`tasks[${index}]: ${validated.error.message}`); continue; }
@@ -257,7 +258,8 @@ export class TaskService {
       if (contract.verification.length === 0) problems.push(`${contract.id}: verification must list at least one command`);
       const unauthorized = contract.verification.filter((command) => !this.settings.verificationAllowlist.includes(command));
       if (unauthorized.length > 0) problems.push(`${contract.id}: verification commands not in the host allowlist: ${unauthorized.join(' | ')} (allowed: ${this.settings.verificationAllowlist.join(' | ')})`);
-      parsed.push({ contract, reviewRequired: reviewRaw === undefined ? true : reviewRaw as boolean });
+      const plannedOverlap = Array.isArray(overlapRaw) && overlapRaw.length > 0 ? [...new Set(overlapRaw as string[])] : undefined;
+      parsed.push({ contract, reviewRequired: reviewRaw === undefined ? true : reviewRaw as boolean, ...(plannedOverlap === undefined ? {} : { plannedOverlap }) });
     }
     const ids = new Set<string>();
     for (const { contract } of parsed) {
@@ -269,6 +271,7 @@ export class TaskService {
         if (!ids.has(dependency) && !this.board.has(dependency)) problems.push(`${contract.id}: unknown dependency ${dependency}`);
       }
     }
+    if (problems.length === 0) problems.push(...this.parallelOverlaps(parsed));
     if (problems.length > 0) fail('INVALID_INPUT', problems.join('; '));
     const ordered = this.topologicalOrder(parsed);
     this.commit({ v: 1, type: 'plan', at: this.ports.clock(), tasks: ordered });
@@ -551,16 +554,19 @@ export class TaskService {
       const candidate = matches[0]!;
       if (seen.has(candidate.revision)) fail('INVALID_INPUT', `${candidate.revision} is listed twice`);
       seen.add(candidate.revision);
-      if (candidate.baseRevision !== base) fail('NOT_ACCEPTED', `${candidate.taskId}@${candidate.revision} was built on ${candidate.baseRevision}, not ${base}`);
+      // A candidate is built on the integration base, or stacked on an earlier input (e.g. a
+      // prerequisite wiring task); only its own base..revision commits are picked.
+      const allowedBases = [base, ...inputs.map((input) => input.revision)];
+      if (!allowedBases.includes(candidate.baseRevision)) fail('NOT_ACCEPTED', `${candidate.taskId}@${candidate.revision} was built on ${candidate.baseRevision}, which is neither the integration base ${base} nor an earlier input`);
       this.confirmReview(candidate);
       const unauthorized = candidate.verification.filter((command) => !this.settings.verificationAllowlist.includes(command));
       if (unauthorized.length > 0) fail('NOT_ACCEPTED', `${candidate.taskId} used verification commands outside the current allowlist: ${unauthorized.join(' | ')}`);
       let commits: readonly string[];
-      try { commits = this.ports.history.commitRange(base, candidate.revision); } catch (error) { fail('NOT_ACCEPTED', `${candidate.revision}: ${message(error)}`); }
-      if (commits.length === 0) fail('NOT_ACCEPTED', `${candidate.revision} has no commits over ${base}`);
+      try { commits = this.ports.history.commitRange(candidate.baseRevision, candidate.revision); } catch (error) { fail('NOT_ACCEPTED', `${candidate.revision}: ${message(error)}`); }
+      if (commits.length === 0) fail('NOT_ACCEPTED', `${candidate.revision} has no commits over ${candidate.baseRevision}`);
       candidate.changedPaths.forEach((path) => files.add(path));
       candidate.verification.forEach((command) => { if (!verification.includes(command)) verification.push(command); });
-      inputs.push({ taskId: candidate.taskId, revision: candidate.revision, commits: [...commits], source: candidate.source, implementerAgentIds: candidate.implementerAgentIds, reviewerAgentId: candidate.reviewerAgentId, reviewId: candidate.reviewId });
+      inputs.push({ taskId: candidate.taskId, revision: candidate.revision, baseRevision: candidate.baseRevision, commits: [...commits], source: candidate.source, implementerAgentIds: candidate.implementerAgentIds, reviewerAgentId: candidate.reviewerAgentId, reviewId: candidate.reviewId });
     }
     const taskId = this.nextIntegrationId();
     const contract = {
@@ -610,7 +616,7 @@ export class TaskService {
     if (!applied.ok) {
       const input = owner.get(applied.commit) ?? 'unknown';
       this.commit({ v: 1, type: 'integration_conflict', at: this.ports.clock(), taskId, attemptId, applied: applied.applied, input, commit: applied.commit, paths: applied.paths, detail: applied.detail });
-      this.commit({ v: 1, type: 'attempt_failed', at: this.ports.clock(), taskId, attemptId, reason: `conflict cherry-picking ${applied.commit} (candidate ${input}) in ${applied.paths.join(', ') || '(no conflicted paths reported)'}`, terminal: true });
+      this.commit({ v: 1, type: 'attempt_failed', at: this.ports.clock(), taskId, attemptId, reason: `conflict cherry-picking ${applied.commit}${applied.commit === input ? '' : ` (candidate ${input})`} in ${applied.paths.join(', ') || '(no conflicted paths reported)'}`, terminal: true });
       return { taskId, state: this.task(taskId).state, baseRevision: base, branch: lease.branch, workspacePath: lease.workspacePath, inputs, applied: applied.applied, conflict: { input, commit: applied.commit, paths: applied.paths, detail: applied.detail } };
     }
     this.commit({ v: 1, type: 'integration_applied', at: this.ports.clock(), taskId, attemptId, applied: applied.applied, revision: applied.revision });
@@ -702,7 +708,7 @@ export class TaskService {
     return [
       `This is an INTEGRATION review. Base revision: ${spec.baseRevision}. Integrated revision: ${attempt.integration?.revision ?? '(none)'}.`,
       'Declared inputs (each was separately verified and freshly reviewed; review how they combine):',
-      ...spec.inputs.map((input) => `- ${input.taskId} candidate ${input.revision}: ${input.commits.map((commit) => `${commit.slice(0, 12)} → ${byIntegrated.get(commit)?.slice(0, 12) ?? '?'}`).join(', ')}`),
+      ...spec.inputs.map((input) => `- ${input.taskId} candidate ${input.revision} (built on ${input.baseRevision === undefined || input.baseRevision === spec.baseRevision ? 'the base' : input.baseRevision.slice(0, 12)}): ${input.commits.map((commit) => `${commit.slice(0, 12)} → ${byIntegrated.get(commit)?.slice(0, 12) ?? '?'}`).join(', ')}`),
       'Focus on: the combined diff; cross-task interactions; CMake/test wiring (every new test built and registered once); unexpected files; and whether the integrated history matches the declared revisions.',
     ];
   }
@@ -819,9 +825,56 @@ export class TaskService {
     };
   }
 
-  private topologicalOrder(items: readonly { contract: TaskContract; reviewRequired: boolean }[]): { contract: TaskContract; reviewRequired: boolean }[] {
+  /**
+   * Planning rule: tasks that may run in parallel (neither depends on the other,
+   * directly or transitively) must not touch overlapping paths, because their
+   * candidates would conflict at integration. An overlap is allowed only when
+   * both tasks list the path in planned_overlap.
+   */
+  private parallelOverlaps(items: readonly { contract: TaskContract; plannedOverlap?: readonly string[] }[]): string[] {
+    const live = this.board.tasks()
+      .filter((task) => task.integration === undefined && task.state !== 'FAILED' && task.state !== 'CANCELLED')
+      .map((task) => ({ contract: task.contract, plannedOverlap: task.plannedOverlap ?? [], fresh: false }));
+    const all = [...live, ...items.map((item) => ({ contract: item.contract, plannedOverlap: item.plannedOverlap ?? [], fresh: true }))];
+    const byId = new Map(all.map((entry) => [entry.contract.id, entry]));
+    const ancestors = new Map<string, Set<string>>();
+    const ancestorsOf = (id: string, trail: Set<string> = new Set()): Set<string> => {
+      const cached = ancestors.get(id);
+      if (cached !== undefined) return cached;
+      const result = new Set<string>();
+      if (trail.has(id)) return result;
+      trail.add(id);
+      for (const dependency of byId.get(id)?.contract.depends_on ?? this.board.task(id)?.contract.depends_on ?? []) {
+        result.add(dependency);
+        ancestorsOf(dependency, trail).forEach((ancestor) => result.add(ancestor));
+      }
+      ancestors.set(id, result);
+      return result;
+    };
+    const overlaps = (a: string, b: string) => a === b || (a.endsWith('/') && b.startsWith(a)) || (b.endsWith('/') && a.startsWith(b));
+    const problems: string[] = [];
+    for (let i = 0; i < all.length; i++) {
+      for (let j = i + 1; j < all.length; j++) {
+        const a = all[i]!;
+        const b = all[j]!;
+        if (!a.fresh && !b.fresh) continue;
+        if (ancestorsOf(a.contract.id).has(b.contract.id) || ancestorsOf(b.contract.id).has(a.contract.id)) continue;
+        for (const pa of a.contract.files_in_scope ?? []) {
+          for (const pb of b.contract.files_in_scope ?? []) {
+            if (!overlaps(pa, pb)) continue;
+            const planned = (entry: typeof a) => entry.plannedOverlap.includes(pa) || entry.plannedOverlap.includes(pb);
+            if (planned(a) && planned(b)) continue;
+            problems.push(`${a.contract.id} and ${b.contract.id} can run in parallel but both touch ${pa === pb ? pa : `${pa} / ${pb}`}; their candidates would conflict at integration. Order them with depends_on, give each its own file (e.g. a separate build fragment), or list the path in planned_overlap on both tasks if the overlap is intended`);
+          }
+        }
+      }
+    }
+    return problems;
+  }
+
+  private topologicalOrder<T extends { contract: TaskContract }>(items: readonly T[]): T[] {
     const pending = new Map(items.map((item) => [item.contract.id, item]));
-    const ordered: { contract: TaskContract; reviewRequired: boolean }[] = [];
+    const ordered: T[] = [];
     while (pending.size > 0) {
       const next = [...pending.values()].find((item) => item.contract.depends_on.every((dependency) => !pending.has(dependency)));
       if (next === undefined) fail('INVALID_INPUT', `dependency cycle among: ${[...pending.keys()].join(', ')}`);

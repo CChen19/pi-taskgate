@@ -30,7 +30,9 @@ export interface CandidateRecord {
 export interface IntegrationInput {
   readonly taskId: string;
   readonly revision: string;
-  /** Commits of base..revision, oldest first; these are what gets cherry-picked. */
+  /** What the candidate was built on: the integration base or an earlier input's revision. */
+  readonly baseRevision?: string;
+  /** Commits of baseRevision..revision, oldest first; these are what gets cherry-picked. */
   readonly commits: readonly string[];
   /** Where the acceptance evidence came from ("this session" or a session file path). */
   readonly source: string;
@@ -56,7 +58,7 @@ export interface IntegrationRecord {
 }
 
 export type TaskEvent =
-  | { readonly v: 1; readonly type: 'plan'; readonly at: number; readonly tasks: readonly { readonly contract: TaskContract; readonly reviewRequired: boolean; readonly integration?: IntegrationSpec }[] }
+  | { readonly v: 1; readonly type: 'plan'; readonly at: number; readonly tasks: readonly { readonly contract: TaskContract; readonly reviewRequired: boolean; readonly integration?: IntegrationSpec; readonly plannedOverlap?: readonly string[] }[] }
   | { readonly v: 1; readonly type: 'integration_applied'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly applied: readonly AppliedCommit[]; readonly revision: string }
   | { readonly v: 1; readonly type: 'integration_conflict'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly applied: readonly AppliedCommit[]; readonly input: string; readonly commit: string; readonly paths: readonly string[]; readonly detail: string }
   | { readonly v: 1; readonly type: 'start'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly lease: WorkspaceLease; readonly reusedFrom?: string }
@@ -102,6 +104,7 @@ export interface AttemptRecord {
 export interface TaskView extends TaskSnapshot {
   readonly reviewRequired: boolean;
   readonly integration?: IntegrationSpec;
+  readonly plannedOverlap?: readonly string[];
   readonly unmetDependencies: readonly string[];
   readonly attemptRecords: readonly AttemptRecord[];
   readonly cancelReason?: string;
@@ -134,6 +137,7 @@ interface MutableAttempt {
 interface TaskMeta {
   reviewRequired: boolean;
   integration?: IntegrationSpec;
+  plannedOverlap?: readonly string[];
   attempts: MutableAttempt[];
   cancelReason?: string;
 }
@@ -155,9 +159,9 @@ export class TaskBoard {
         for (const { contract } of event.tasks) {
           if (this.meta.has(contract.id)) throw new TaskBoardError('TASK_ALREADY_EXISTS', `task ${contract.id} already exists`);
         }
-        for (const { contract, reviewRequired, integration } of event.tasks) {
+        for (const { contract, reviewRequired, integration, plannedOverlap } of event.tasks) {
           graphOk(this.graph.addTask(contract), `plan ${contract.id}`);
-          this.meta.set(contract.id, { reviewRequired, ...(integration === undefined ? {} : { integration }), attempts: [] });
+          this.meta.set(contract.id, { reviewRequired, ...(integration === undefined ? {} : { integration }), ...(plannedOverlap === undefined ? {} : { plannedOverlap: [...plannedOverlap] }), attempts: [] });
         }
         break;
       }
@@ -256,6 +260,7 @@ export class TaskBoard {
       ...snapshot,
       reviewRequired: meta.reviewRequired,
       ...(meta.integration === undefined ? {} : { integration: structuredClone(meta.integration) }),
+      ...(meta.plannedOverlap === undefined ? {} : { plannedOverlap: [...meta.plannedOverlap] }),
       unmetDependencies: unmet,
       attemptRecords: structuredClone(meta.attempts) as AttemptRecord[],
       ...(meta.cancelReason === undefined ? {} : { cancelReason: meta.cancelReason }),

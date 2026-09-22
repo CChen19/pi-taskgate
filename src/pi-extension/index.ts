@@ -115,7 +115,7 @@ export function formatTask(task: TaskView): string {
   const lines = [parts.join(' · '), `  objective: ${task.contract.objective.split('\n')[0]!.slice(0, 160)}`];
   if (task.integration !== undefined) lines.push(`  integration of ${task.integration.inputs.map((input) => `${input.taskId}@${short(input.revision)}`).join(', ')} onto ${short(task.integration.baseRevision)}`);
   if (attempt !== undefined) {
-    lines.push(`  attempt ${attempt.attemptId}: agent ${attempt.agentId ?? '(unbound)'} · worktree ${attempt.lease.workspacePath} · branch ${attempt.lease.branch} · base ${short(attempt.lease.baseRevision)}`);
+    lines.push(`  attempt ${attempt.attemptId}: agent ${attempt.agentId ?? (task.integration === undefined ? '(unbound)' : 'host (integration)')} · worktree ${attempt.lease.workspacePath} · branch ${attempt.lease.branch} · base ${short(attempt.lease.baseRevision)}`);
     if (attempt.checks.length > 0) {
       const last = attempt.checks[attempt.checks.length - 1]!;
       lines.push(`  failed checks: ${attempt.checks.length} (last ${last.stage} @${short(last.revision)}: ${last.reasons.join('; ').slice(0, 300)})`);
@@ -150,6 +150,7 @@ const STRING_ARRAY = { type: 'array', items: { type: 'string' } } as const;
 const WORKFLOW_GUIDELINES = [
   'Orchestration loop for multi-step coding work: plan tasks with task_plan, then repeatedly observe (task_status) → start ready tasks (task_start) → spawn each worker with Pier `subagent` using the returned prompt and cwd, run_in_background true → task_bind the returned agent id → on its settlement notice run task_verify → if a review is required, task_review_brief, spawn the reviewer with the returned role/cwd/prompt, then task_review_record → decide the next action.',
   'Small, single-file fixes do not need task tools or subagents; do them yourself and run the checks.',
+  'Plan parallel tasks so they do not modify the same shared or coordination file (build files, registries, shared headers). Prefer per-task fragments; if shared wiring is needed first, make it a prerequisite task and start dependents with base_task.',
   'A worker saying "done" is not acceptance. Only task_verify / task_review_record move a task toward PASSED. Never paraphrase a reviewer verdict; task_review_record reads it from Pier.',
   'When task_verify reports check_failed, send the worker the reasons with `subagent send` and verify again, or task_abandon the attempt. After a rejected review, task_start with reuse_worktree true continues on the same branch.',
 ];
@@ -216,7 +217,7 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
     tool({
       name: 'task_plan',
       label: 'Task Plan',
-      description: 'Add tasks to the board (validated atomically; nothing is added if any task is invalid). Each task is a contract: id (T followed by lowercase letters/digits/hyphens, e.g. T1, Tapi-tests), objective, depends_on (ids that must PASS first), files_in_scope (paths the worker may change; trailing slash = directory; any other change fails verification), acceptance_criteria, verification (exact commands from the host allowlist; the host runs them, not the worker), optional context, retry.max_attempts, review_required (default true; set false only for low-risk mechanical tasks).',
+      description: 'Add tasks to the board (validated atomically; nothing is added if any task is invalid). Each task is a contract: id (T followed by lowercase letters/digits/hyphens, e.g. T1, Tapi-tests), objective, depends_on (ids that must PASS first), files_in_scope (paths the worker may change; trailing slash = directory; any other change fails verification), acceptance_criteria, verification (exact commands from the host allowlist; the host runs them, not the worker), optional context, retry.max_attempts, review_required (default true; set false only for low-risk mechanical tasks). Planning rule: tasks that can run in parallel (no depends_on path between them) must not have overlapping files_in_scope, because their candidates would conflict at integration; order them with depends_on, give each its own file (e.g. a separate build/test fragment instead of appending to a shared CMakeLists.txt), or declare the shared path in planned_overlap on both tasks.',
       parameters: {
         type: 'object',
         properties: {
@@ -234,6 +235,7 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
                 verification: STRING_ARRAY,
                 retry: { type: 'object', properties: { max_attempts: { type: 'integer', minimum: 1 } }, required: ['max_attempts'], additionalProperties: false },
                 review_required: { type: 'boolean' },
+                planned_overlap: { ...STRING_ARRAY, description: 'Paths this task intentionally shares with a parallel task (must be declared on both tasks)' },
               },
               required: ['id', 'objective', 'depends_on', 'files_in_scope', 'acceptance_criteria', 'verification'],
             },
@@ -357,11 +359,11 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
         `${result.taskId} ${result.state} · base ${result.baseRevision}`,
         `branch ${result.branch} · worktree ${result.workspacePath}`,
         'inputs:',
-        ...result.inputs.map((input) => `- ${input.taskId} ${input.revision} (${input.commits.length} commit(s); reviewed by ${input.reviewerAgentId}; evidence: ${input.source})`),
+        ...result.inputs.map((input) => `- ${input.taskId} ${input.revision} (${input.commits.length} own commit(s)${input.baseRevision === undefined || input.baseRevision === result.baseRevision ? '' : ` on top of ${input.baseRevision.slice(0, 12)}`}; reviewed by ${input.reviewerAgentId}; evidence: ${input.source})`),
         'applied:',
         ...(result.applied.length === 0 ? ['- (none)'] : result.applied.map((entry) => `- ${entry.source.slice(0, 12)} → ${entry.integrated.slice(0, 12)}`)),
       ];
-      if (result.conflict !== undefined) lines.push(`CONFLICT cherry-picking ${result.conflict.commit} (candidate ${result.conflict.input}) in: ${result.conflict.paths.join(', ') || '(none reported)'}`, `detail: ${result.conflict.detail}`, 'The integration FAILED closed; nothing was resolved automatically. The worktree is left at the last cleanly applied commit for audit.');
+      if (result.conflict !== undefined) lines.push(`CONFLICT cherry-picking ${result.conflict.commit}${result.conflict.commit === result.conflict.input ? '' : ` (candidate ${result.conflict.input})`} in: ${result.conflict.paths.join(', ') || '(none reported)'}`, `detail: ${result.conflict.detail}`, 'The integration FAILED closed; nothing was resolved automatically. The worktree is left at the last cleanly applied commit for audit.');
       else if (result.integratedRevision !== undefined) lines.push(`integrated revision ${result.integratedRevision}`, `Next: task_verify ${result.taskId}.`);
       else if (result.reason !== undefined) lines.push(`FAILED: ${result.reason}`);
       return text(lines.join('\n'), result);
