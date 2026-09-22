@@ -110,3 +110,20 @@ export class PierHistoryLedger implements WorkerLedger {
     return files;
   }
 }
+
+/** Conservative Unix-socket path budget (Linux sun_path is 108 bytes, macOS 104). */
+export const PIER_PIPE_PATH_LIMIT = 103;
+/** Worst-case encoded herdr pane id length assumed when a pane id is not known yet. */
+const PANE_ID_ALLOWANCE = 10;
+
+/** Pier's per-pane pipe socket path (pipe-channel.ts pipeNameFor/pipePathFor, POSIX). */
+export function pierPipePath(cwd: string, paneId: string): string {
+  return `/tmp/pi-herdr-${pierSessionDirName(cwd)}-${paneId.replace(/[^A-Za-z0-9_-]/g, '-')}.sock`;
+}
+
+/** Reason a subagent launched in `cwd` could not register Pier's pipe, or undefined when it fits. */
+export function pierPipeProblem(cwd: string): string | undefined {
+  const length = Buffer.byteLength(pierPipePath(cwd, 'x'.repeat(PANE_ID_ALLOWANCE)), 'utf8');
+  if (length <= PIER_PIPE_PATH_LIMIT) return undefined;
+  return `a Pier subagent in ${cwd} would need a ${length}-byte pipe socket path (limit ${PIER_PIPE_PATH_LIMIT}); use a shorter workspaceRoot`;
+}

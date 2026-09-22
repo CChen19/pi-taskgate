@@ -90,6 +90,12 @@ export interface WorktreeManagerOptions {
   readonly repoRoot: string;
   readonly workspaceRoot: string;
   readonly idSource: () => string;
+  /**
+   * `compact` keeps directory names short (`t1-a1-<hash>`) so paths derived
+   * from the worktree cwd (e.g. Pier's Unix-socket pipe names) stay within OS
+   * limits. Default `legacy` preserves the original descriptive names.
+   */
+  readonly naming?: 'legacy' | 'compact';
 }
 
 export interface WorkspaceInspection extends WorktreeInspectResult {}
@@ -140,7 +146,7 @@ const INSPECT_FIELDS = ['changedPaths', 'artifactRevision', 'diffRef', 'clean', 
 const BINDING_FIELDS = ['taskId', 'attemptId', 'sessionId', 'roleId', 'modelProfileId', 'filesInScope', 'baseRevision', 'workspacePath', 'branch', 'ownershipToken', 'managedMarker'] as const;
 const VERIFY_FIELDS = ['owned', ...BINDING_FIELDS] as const;
 const LEASE_FIELDS = ['taskId', 'attemptId', 'baseRevision', 'workspacePath', 'branch', 'ownershipToken', 'managedMarker'] as const;
-const OPTIONS_FIELDS = ['repoRoot', 'workspaceRoot', 'idSource'] as const;
+const OPTIONS_FIELDS = ['repoRoot', 'workspaceRoot', 'idSource', 'naming'] as const;
 
 function errorMessage(error: unknown): string {
   try {
@@ -228,7 +234,14 @@ function key(taskId: string, attemptId: string): string {
   return `${taskId}\u0000${attemptId}`;
 }
 
-function validateOptions(options: WorktreeManagerOptions): { repoRoot: string; workspaceRoot: string; idSource: () => string } {
+function compactName(taskId: string, attemptId: string, source: string): string {
+  const task = taskId.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 12) || 'task';
+  const ordinal = /attempt-(\d+)$/.exec(attemptId)?.[1];
+  const attempt = ordinal === undefined ? `x${hash(attemptId)}` : `a${ordinal}`;
+  return `${task}-${attempt}-${hash(`${taskId}\0${attemptId}\0${source}`)}`;
+}
+
+function validateOptions(options: WorktreeManagerOptions): { repoRoot: string; workspaceRoot: string; idSource: () => string; naming: 'legacy' | 'compact' } {
   try {
     const raw = options as unknown as Record<string, unknown>;
     if (!isPlainObject(raw) || !hasExactFields(raw, OPTIONS_FIELDS)) fail('INVALID_WORKTREE', 'options', 'worktree options are invalid', OPTIONS_FIELDS);
@@ -237,7 +250,9 @@ function validateOptions(options: WorktreeManagerOptions): { repoRoot: string; w
     const workspaceRoot = absolutePath(ownValue(raw, 'workspaceRoot'), 'options.workspaceRoot');
     if (hasGitSegment(repoRoot)) fail('PATH_CONTAINMENT', 'options.repoRoot', 'repoRoot contains a protected .git path segment');
     if (hasGitSegment(workspaceRoot)) fail('PATH_CONTAINMENT', 'options.workspaceRoot', 'workspaceRoot contains a protected .git path segment');
-    return { repoRoot, workspaceRoot, idSource: ownValue(raw, 'idSource') as () => string };
+    const naming = ownValue(raw, 'naming');
+    if (naming !== undefined && naming !== 'legacy' && naming !== 'compact') fail('INVALID_WORKTREE', 'options.naming', 'naming must be legacy or compact');
+    return { repoRoot, workspaceRoot, idSource: ownValue(raw, 'idSource') as () => string, naming: naming === 'compact' ? 'compact' : 'legacy' };
   } catch (error) {
     if (error instanceof WorktreeManagerError) throw error;
     fail('INVALID_WORKTREE', 'options', 'worktree options could not be inspected');
@@ -335,6 +350,7 @@ export class WorktreeManager {
   private readonly repoRoot: string;
   private readonly workspaceRoot: string;
   private readonly idSource: () => string;
+  private readonly naming: 'legacy' | 'compact';
   private readonly active = new Map<string, WorkspaceLease>();
   private readonly paths = new Set<string>();
   private readonly branches = new Set<string>();
@@ -345,6 +361,7 @@ export class WorktreeManager {
     this.repoRoot = normalized.repoRoot;
     this.workspaceRoot = normalized.workspaceRoot;
     this.idSource = normalized.idSource;
+    this.naming = normalized.naming;
   }
 
   acquire(port: WorktreePort, taskId: string, attemptId: string, baseRevision: string): WorkspaceLease {
@@ -358,14 +375,15 @@ export class WorktreeManager {
     try { source = this.idSource(); } catch { fail('INVALID_WORKTREE', 'idSource', 'idSource failed'); }
     if (typeof source !== 'string' || source.length === 0 || source.length > MAX_WORKTREE_TOKEN_LENGTH) fail('INVALID_WORKTREE', 'idSource.return', 'idSource must return a bounded non-empty string');
     const token = `${slug(source)}-${hash(`${taskId}\0${attemptId}\0${source}`)}`.slice(0, MAX_WORKTREE_TOKEN_LENGTH);
-    const baseName = `${slug(taskId)}--${slug(attemptId)}--${token}`;
+    const baseName = this.naming === 'compact' ? compactName(taskId, attemptId, source) : `${slug(taskId)}--${slug(attemptId)}--${token}`;
+    const branchPrefix = this.naming === 'compact' ? 'ao' : 'orchestrator';
     let suffix = 0;
     let workspacePath = resolve(this.workspaceRoot, baseName);
-    let branch = `orchestrator/${baseName}`;
+    let branch = `${branchPrefix}/${baseName}`;
     while (this.paths.has(workspacePath) || this.branches.has(branch)) {
       suffix++;
       workspacePath = resolve(this.workspaceRoot, `${baseName}-${suffix}`);
-      branch = `orchestrator/${baseName}-${suffix}`;
+      branch = `${branchPrefix}/${baseName}-${suffix}`;
     }
     safeWorkspacePath(this.workspaceRoot, this.repoRoot, workspacePath);
     const expected: WorktreeCreateRequest = { repoRoot: this.repoRoot, taskId, attemptId, workspacePath, branch, baseRevision, ownershipToken: token };

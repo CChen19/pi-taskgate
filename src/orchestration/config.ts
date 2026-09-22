@@ -7,6 +7,10 @@
  */
 import { isAbsolute, normalize, relative } from 'node:path';
 import { hasExactFields, isPlainObject, ownValue } from '../core/validate.ts';
+import { pierPipeProblem } from '../host/pier-ledger.ts';
+
+/** Longest compact worktree directory name (`<task≤12>-a<n>-<hash>`) budgeted for. */
+const WORKTREE_LEAF_ALLOWANCE = 24;
 
 export interface OrchestrationConfig {
   readonly version: 1;
@@ -79,6 +83,8 @@ export function parseOrchestrationConfig(input: unknown): OrchestrationConfig {
   const inside = relative(repoRoot, workspaceRoot);
   if (inside === '' || (!inside.startsWith('..') && !isAbsolute(inside))) fail('config.workspaceRoot must be outside config.repoRoot');
   if (workspaceRoot.split('/').some((segment) => segment.toLowerCase() === '.git')) fail('config.workspaceRoot must not contain a .git segment');
+  const pipe = pierPipeProblem(`${workspaceRoot}/${'x'.repeat(WORKTREE_LEAF_ALLOWANCE)}`);
+  if (pipe !== undefined) fail(`config.workspaceRoot is too long for Pier subagents: ${pipe}`);
   const allowlist = ownValue(input, 'verificationAllowlist');
   if (!Array.isArray(allowlist) || allowlist.length === 0 || allowlist.some((entry) => typeof entry !== 'string' || entry.trim().length === 0 || entry.length > 1024)) {
     fail('config.verificationAllowlist must be a non-empty array of command strings');

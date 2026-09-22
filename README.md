@@ -29,7 +29,7 @@ task 事件以 `agent-orchestrator.task-event` custom entry 写入 Pi session，
 {
   "version": 1,
   "repoRoot": "/path/to/repo",
-  "workspaceRoot": "/path/outside/repo/worktrees",
+  "workspaceRoot": "/short/path/wt",
   "verificationAllowlist": ["make -j4", "./run_tests.sh"],
   "verificationTimeoutMs": 600000,
   "reviewerRole": "reviewer-readonly",
@@ -37,6 +37,8 @@ task 事件以 `agent-orchestrator.task-event` custom entry 写入 Pi session，
   "defaultMaxAttempts": 3
 }
 ```
+
+`workspaceRoot` 必须很短：Pier 为每个 subagent 创建 `/tmp/pi-herdr-<编码后的 cwd>-<pane>.sock`，Unix socket 路径上限约 108 字节，`/` 编码后占 3 字节。配置加载时和每次 `task_start` 都会检查，超长时 fail closed；worktree 使用紧凑命名 `<task≤12>-a<n>-<hash>`，分支为 `ao/...`。
 
 2. 在 Pier 的角色目录（`<主会话 cwd>/.pi-herdr/roles/`）放一个只读 reviewer 角色：对 `edit`/`write`/`bash`/`pwsh`/`subagent`/`terminal` 显式 `deny`。
 3. 在 herdr pane 中启动主会话，同时加载 Pier 与本扩展：
@@ -160,7 +162,7 @@ npm run vertical:run -- run --config ./vertical.config.json --plan-file ./plan.j
 npm run check
 ```
 
-本轮 267 项测试（含主会话扩展的 25 项：真实临时 git repo + worktree + allowlist 进程，fake Pier ledger/role），均不调用真实模型、Herdr、Pi 或网络。以下为 legacy slice 的覆盖说明。
+本轮 270 项测试（含主会话扩展的 28 项：真实临时 git repo + worktree + allowlist 进程，fake Pier ledger/role），均不调用真实模型、Herdr、Pi 或网络。以下为 legacy slice 的覆盖说明。
 
 Legacy slice 部分（242 项：241 项 fake + 1 项真实本地临时 git repo 语义验证），均不调用真实模型、Herdr、Pi、Git worktree、网络或凭据。vertical slice 的 fake 覆盖包括：并发独立任务 + 精确 revision review + integration；allowlist 升级在 executor start 前拒绝；SIGINT 取消运行中 worker；机械验证失败不 review/merge；reviewer 显式拒绝与 stale revision 均不 merge 且清理 artifact；`SCOPE_VIOLATION` 等 acceptanceEligible=false 的 settlement 从不触发机械 verify/review/merge；prerequisite 失败后 dependent 从不 start 且 journal 记录 BLOCKED；final integration verification 失败时保留 worker artifacts 与 integration workspace；malformed planner 首次失败后带结构 feedback 重试一次成功（planner 调用 2、metrics 正确）；metrics.modelCalls 对每个成功 task_started 的 worker attempt 计一次（retry 按实际 start 计，纯 executor start failure 不计，2-task happy path 断言 5）；真实 `GitIntegrationRunner.asPort()` 以冻结 plain port 过 core 严格 plain-object boundary 完成 rebase/merge/verification/conflict/status 并断言 merged（含 coordinator 未注入 integrationRunner 的 real-runner 构造 seam 回归，旧代码以 `runner must be a plain object` 失败）；planner transport 取消/失败/超时立即失败不重试；SIGINT 后 planner 只 spawn 一次、interrupt+close 各一次且 summary failed；config 边界（非绝对/空 role base、非法 reviewerStrategy、越界 plannerRetries、allowlist 重复/空白、可变 baseRevision（HEAD/branch/tag/短 SHA/revspec/空白））在任何 planner/executor 调用与 pane/worktree 前拒绝；默认 role base 由 repoRoot 注入为绝对路径。host fake 另外断言 integration git/verification 命令与 worktree plumbing 使用最小 env（不含密钥）、timeout、maxOutputBytes 上限，integration rebase 传入 base 必须等于固定 `options.baseRevision`，且未授权命令被拒；新增 pre-prompt boundary readiness 回归：session JSONL 延迟出现后只提交一次 prompt 并以有效的 post-boundary 追加结果 settle，永久缺失/永久 malformed 都在第 10 次（也是最后一次）poll 重试按文档化预算失败，close/interrupt 在 readiness 期间绝不提交 prompt，malformed 可在预算内恢复，pre-prompt `working` 快照不会污染 post-prompt `workingSeen`，pre-prompt `blocked`/`cancelled` 直接 fail closed 且不启动 prompt，readiness 期间 pane 从 host pane list 消失时 fail closed 为 `lost` 并丢弃保存的 prompt/env（phase 置 terminal），且 `StructuredAgentRunner` 自行 sanitize（中和 C0/C1 控制符、NEL、U+2028/U+2029、bidi embedding/isolate/标记）并 cap（160 字符，且不在 surrogate 对中间截断）port 提供的 terminal `outcome` 后带入抛错（含超大、Unicode-spoofing 与 surrogate-boundary 回归）。另有一项真实本地临时 git repo 语义单测（普通 repo，不建 worktree、不联网）：固定 base SHA 在 worker commit 后 `git rev-list base..HEAD` 为 1 且 `git diff base...HEAD` 非空，而 `HEAD` 基准为 0/空。下一步主控命令是：
 

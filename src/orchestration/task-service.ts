@@ -46,6 +46,8 @@ export interface TaskServicePorts {
   /** Durable sink (Pi session custom entry). Throwing aborts the operation. */
   persist(event: TaskEvent): void;
   randomId?(): string;
+  /** Why a subagent could not run in this worktree cwd (e.g. Pier pipe path too long), or undefined. */
+  checkWorkerCwd?(workspacePath: string): string | undefined;
 }
 
 export type ServiceErrorCode =
@@ -268,6 +270,11 @@ export class TaskService {
         this.ports.worktrees.bindSession(this.ports.worktreePort, lease, this.binding(lease, task.contract));
       } catch (error) {
         fail('LEASE_UNAVAILABLE', `could not create worktree for ${taskId}: ${message(error)}`);
+      }
+      const problem = this.ports.checkWorkerCwd?.(lease.workspacePath);
+      if (problem !== undefined) {
+        this.ports.worktrees.cleanup(this.ports.worktreePort, lease);
+        fail('LEASE_UNAVAILABLE', problem);
       }
       fresh = true;
     }

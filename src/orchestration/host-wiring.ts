@@ -8,7 +8,7 @@ import { WorktreeManager } from '../adapters/worktree-manager.ts';
 import { boundReviewerDiff } from '../core/reviewer-brief.ts';
 import { NodeCommandRunner, minimalProcessEnv, type CommandRunner } from '../host/command-runner.ts';
 import { GitWorktreePort } from '../host/git-worktree-port.ts';
-import { PierHistoryLedger } from '../host/pier-ledger.ts';
+import { PierHistoryLedger, pierPipeProblem } from '../host/pier-ledger.ts';
 import { checkReadOnlyRole, defaultPierRoleDirs } from '../host/pier-roles.ts';
 import { ProcessAsyncVerificationRunner } from '../host/process-verification-runner.ts';
 import type { OrchestrationConfig } from './config.ts';
@@ -34,7 +34,7 @@ export function createHostTaskService(options: HostWiringOptions): TaskService {
     return result;
   };
   const worktreePort = new GitWorktreePort({ repoRoot: config.repoRoot, workspaceRoot: config.workspaceRoot, commandRunner });
-  const worktrees = new WorktreeManager({ repoRoot: config.repoRoot, workspaceRoot: config.workspaceRoot, idSource: () => randomUUID() });
+  const worktrees = new WorktreeManager({ repoRoot: config.repoRoot, workspaceRoot: config.workspaceRoot, idSource: () => randomUUID(), naming: 'compact' });
   const roleDirs = config.roleDirs ?? defaultPierRoleDirs(options.masterCwd);
   return new TaskService({
     worktrees,
@@ -50,6 +50,7 @@ export function createHostTaskService(options: HostWiringOptions): TaskService {
     checkReviewerRole: () => checkReadOnlyRole(roleDirs, config.reviewerRole),
     clock: () => Date.now(),
     persist: options.persist,
+    checkWorkerCwd: pierPipeProblem,
   }, {
     verificationAllowlist: config.verificationAllowlist,
     verificationTimeoutMs: config.verificationTimeoutMs,

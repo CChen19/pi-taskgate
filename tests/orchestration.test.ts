@@ -308,6 +308,14 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
     assert.equal(started.baseRevision, revision);
   });
 
+  it('refuses to start when a subagent could not run in the worktree cwd, leaving no worktree behind', () => {
+    const svc = new TaskService({ ...(h.service() as unknown as { ports: object }).ports, checkWorkerCwd: () => 'pipe path too long' } as never, SETTINGS);
+    svc.plan([task('T1')]);
+    assert.throws(() => svc.start('T1'), (error: unknown) => error instanceof TaskServiceError && error.code === 'LEASE_UNAVAILABLE' && /pipe path too long/.test(error.message));
+    assert.equal(svc.task('T1').state, 'READY');
+    assert.equal(git(h.repo, ['worktree', 'list', '--porcelain']).split('\n').filter((line) => line.startsWith('worktree ')).length, 1);
+  });
+
   it('leaves state unchanged when persistence fails', () => {
     const svc = h.service();
     h.persistFailure.error = new Error('disk full');

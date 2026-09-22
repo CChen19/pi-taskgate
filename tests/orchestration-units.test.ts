@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { checkArtifact } from '../src/adapters/artifact-check.ts';
-import { PierHistoryLedger, pierSessionDirName, pierSessionDirNameLegacy } from '../src/host/pier-ledger.ts';
+import { PierHistoryLedger, pierPipePath, pierPipeProblem, pierSessionDirName, pierSessionDirNameLegacy } from '../src/host/pier-ledger.ts';
+import { WorktreeManager } from '../src/adapters/worktree-manager.ts';
 import { checkReadOnlyRole } from '../src/host/pier-roles.ts';
 import { parseReviewerOutcome, renderWorkerBrief } from '../src/orchestration/briefs.ts';
 import { parseOrchestrationConfig } from '../src/orchestration/config.ts';
@@ -77,6 +78,21 @@ describe('orchestration config', () => {
     assert.throws(() => parseOrchestrationConfig({ ...base, workspaceRoot: '/repo' }), /outside/);
     assert.throws(() => parseOrchestrationConfig({ ...base, verificationAllowlist: [] }), /verificationAllowlist/);
     assert.throws(() => parseOrchestrationConfig({ ...base, reviewerRole: '../x' }), /role name/);
+    assert.throws(() => parseOrchestrationConfig({ ...base, workspaceRoot: '/home/alice/Projects/.agent-orchestrator-workspaces/tinywebserver-main' }), /too long for Pier subagents/);
+  });
+
+  it('names compact worktrees short enough for Pier pipes', () => {
+    const manager = new WorktreeManager({ repoRoot: '/repo', workspaceRoot: '/home/alice/Projects/.aow/tws', idSource: () => 'c7c6100c-a39c-4c2b-a2fc-55c88ce8aaaa', naming: 'compact' });
+    const created: Record<string, unknown>[] = [];
+    const port = {
+      create: (request: { workspacePath: string; branch: string; ownershipToken: string; baseRevision: string }) => { created.push(request); return { workspacePath: request.workspacePath, branch: request.branch, ownershipToken: request.ownershipToken, managedMarker: `agent-orchestrator:s8:${request.ownershipToken}`, baseRevision: request.baseRevision }; },
+      bindSession: () => ({}), inspectChangedPaths: () => ({}), verifyOwnership: () => ({}), remove: () => undefined,
+    };
+    const lease = manager.acquire(port, 'Tapi-tests', 'Tapi-tests:attempt-2', REV);
+    assert.match(lease.workspacePath, /^\/home\/alice\/Projects\/\.aow\/tws\/tapi-tests-a2-[0-9a-z]+$/);
+    assert.match(lease.branch, /^ao\/tapi-tests-a2-/);
+    assert.equal(pierPipeProblem(lease.workspacePath), undefined);
+    assert.throws(() => new WorktreeManager({ repoRoot: '/repo', workspaceRoot: '/w', idSource: () => 'x', naming: 'short' as 'compact' }), /naming/);
   });
 });
 
@@ -103,6 +119,13 @@ describe('Pier ledger reader', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it('computes Pier pipe socket paths and rejects cwds that overflow the Unix socket limit', () => {
+    assert.equal(pierPipePath('/a/b', 'w1V:p7'), '/tmp/pi-herdr---%2Fa%2Fb---w1V-p7.sock');
+    const failedRun = '/home/alice/Projects/.agent-orchestrator-workspaces/tinywebserver-main/t1-11q2r92--t1-attempt-1-1vrrxk3--c7c6100c-a39c-4c2b-a2fc-55c88ce8-3ir7iz-12fcubq';
+    assert.match(pierPipeProblem(failedRun) ?? '', /pipe socket path/);
+    assert.equal(pierPipeProblem('/home/alice/Projects/.aow/tws/t1-a1-1k2j3h4'), undefined);
   });
 
   it('matches Pier storage-layout encodings', () => {
