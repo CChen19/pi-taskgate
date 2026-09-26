@@ -207,6 +207,41 @@ Changes, fixed before the tag:
 
    A tier starts only when the one before it is complete. The second dry-run pair (`d2a`, `d2b`) remeasures the quota per trial with polling removed. From that measurement, the tiers that fit by 2026-10-08 are fixed and recorded here before the tag. Tiers that do not fit are dropped in advance, not cut part-way through.
 
+### Amendment 4 (2026-09-26, after dry runs `d2a`/`d2b`, before the `v0.2-bench2` tag)
+
+**Dry-run results.** Both runs were valid: `d2b` had 17 s of outage, and neither run had a foreign message. Both passed the oracle.
+
+| Run | Wall time | Cost | Master turns | Other |
+|---|---|---|---|---|
+| `d2a` (A) | 10.1 min | $0.25 | 23 | — |
+| `d2b` (B1) | 35.9 min | $0.53 | 55 | 0 refusals |
+
+With the no-polling sentence, the masters waited for Pier's notices. Master cost fell to a third (A) and to about 40% (B1) of the `d1` values, and there were no empty-`reasons` reviews.
+
+**Defect found in `d2b`.** Because `sharedPaths` is `[]`, the master ordered Texpire after Trouter with `depends_on`. It then started Texpire from HEAD, because `task_start` only stacked when the master passed `base_task`, and it did not. Both candidates appended to `CMakeLists.txt`, so the first integration conflicted and failed closed. The master then re-did the task under a new name. B1 paid for the ordering and got the conflict anyway, about 11 extra minutes. This is the same failure class as G2 and G3: correctness depended on the master following a tool description.
+
+**Fix (in the code tagged `v0.2-bench2`).** `task_start` now stacks by default:
+- A task with no dependencies starts from HEAD.
+- A task with exactly one dependency starts from that dependency's accepted revision.
+- A task with several dependencies needs `base_task`, and every dependency that changes overlapping files must already be in that base's stack. Otherwise the start is refused.
+
+Scope, commits ahead, the assert scan, the reviewer diff and the integration history check are all measured from the attempt's own base, which is now the stacked one. Integration takes stacked candidates in stack order. One more uncounted B1 dry run (`d3b`, M2) is made on the tagged code before counted trials.
+
+**Quota (measured).** The `d2` pair used 6% of the codex 5-hour quota (86 → 80) and 3% of the z.ai quota (97 → 94). That is about 2% per A trial and 4% per B1 trial on M2. Assuming M6 costs about three times as much and single-task cells about 0.6 times, the projected codex use per tier is:
+
+| Tier | Codex quota |
+|---|---|
+| 1 | ≈ 130% |
+| 2 | ≈ 40% |
+| 3 | ≈ 10% |
+| **All** | **≈ 180%, about two 5-hour windows** |
+
+At three concurrent trials, the wall time is about 10 hours. All three tiers therefore fit before 2026-10-08, and **no cells are dropped.**
+
+If a limit that is not visible now (for example a weekly cap) stops the round, it stops at a tier boundary as amendment 3 specifies, and incomplete tiers are reported as incomplete.
+
+**Freeze.** After `v0.2-bench2`, the code, the kit's prompt and the rules above do not change. Any change needed after that gets a new tag, and counting restarts from zero under it. Trials from before and after such a change are never pooled.
+
 ## Question
 
 Given the same Pier setup, models, repository and task specs, do the deterministic task tools:
