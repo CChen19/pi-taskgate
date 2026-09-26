@@ -123,6 +123,34 @@ N = 3 per cell. No significance tests are run: raw counts are reported per cell,
 
 **Schedule.** Counted trials run from the day after the dry runs until **2026-10-08**. The write-up is due **2026-10-10**, whatever the results. If quota or time runs out first, the round stops with the cells that are complete. Incomplete cells are reported as incomplete, and they are not filled with another model.
 
+### Amendment 1 (2026-09-26, before any round-2 trial): brief delivered as a file
+
+**What was found.** While implementing G1, round-1 B sessions were compared with the briefs `task_review_brief` issued. None of the 19 reviewers received the issued text. The master re-types the brief as the `subagent` prompt argument, and that copy is lossy:
+
+| What changed | Reviews |
+|---|---|
+| Whitespace or diff `+`/`-` markers only | 7 |
+| Small edits, or notes added | 2 |
+| Patch cut to 15–70% of its length | 10 |
+
+Two cases are worse than truncation:
+- In mb1 Tint-1, the master replaced the integration diff with its own summary of the change.
+- In mb2 Tint-1, the whole `test_router.cpp` diff was missing, and the reviewer passed it anyway.
+
+G1 as registered counts the reviewer's prompts. It does not check what the one prompt said.
+
+**Change to B1.** The host writes the full brief to `<workspaceRoot>/.briefs/<reviewId>.md` and records its sha256 in the `review_requested` event. The spawn prompt is reduced to four lines naming the task, the review id and the brief path.
+
+`task_review_record` additionally requires:
+- the reviewer's single user message equals the issued spawn prompt, after whitespace is normalised;
+- the brief file still has the recorded hash;
+- the reviewer's successful `read` results cover every line of the brief exactly (`BRIEF_NOT_READ` otherwise).
+
+**Consequences for the analysis.**
+- B0 and B1 now differ in G1, G2, G3, the assert config, and brief delivery. Any B0/B1 difference in I6 or M6 is attributed to that bundle, not to G1 alone.
+- New secondary metric, **brief fidelity**: for each review, whether the reviewer's context held the issued brief exactly. It is measured from the session files for every B0 and B1 review, as for round 1 above. For A there is no issued brief, so it is not applicable.
+- The G1 decision rule now also requires every B1 verdict that is accepted to have full brief fidelity.
+
 ## Question
 
 Given the same Pier setup, models, repository and task specs, do the deterministic task tools:
