@@ -346,8 +346,10 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
       const svc = h.service();
       const b = base();
       svc.plan([task('T1', { files_in_scope: ['src/a.txt'] }), task('T2', { files_in_scope: ['src/b.txt'], verification: ['test -f src/b.txt'] })]);
+      assert.deepEqual(svc.deliverable(), { reason: 'more than one task: integrate the PASSED candidates with task_integrate, then verify and review the integration', notIncluded: [] });
       const rev1 = await accept(h, svc, 'T1', { 'src/a.txt': 'hello\n' });
       const rev2 = await accept(h, svc, 'T2', { 'src/b.txt': 'b\n' });
+      assert.equal(svc.deliverable().revision, undefined, 'two PASSED tasks without an integration deliver nothing');
       const result = svc.integrate({ baseRevision: b, revisions: [rev1.slice(0, 8), rev2] });
       assert.equal(result.state, 'RUNNING');
       assert.equal(result.conflict, undefined);
@@ -361,6 +363,7 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
       const verified = await svc.verify(result.taskId);
       assert.equal(verified.outcome, 'awaiting_review', verified.reasons.join('; '));
       assert.equal(verified.revision, result.integratedRevision);
+      assert.equal(svc.deliverable().reason, 'no integration has PASSED', 'a verified but unreviewed integration is not deliverable');
       assert.deepEqual(verified.commands.map((command) => command.command), ['test -f src/a.txt', 'test -f src/b.txt']);
       assert.equal(existsSync(verified.cleanRoom!), false);
 
@@ -374,10 +377,22 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
       h.ledger.add({ paneId: 'r:int', cwd, kind: 'reviewer-readonly', status: 'settled', createdAt: h.now.value + 1, outcome: reviewerOutput(brief.reviewId!, 'passed', result.integratedRevision!) });
       assert.equal(svc.recordReview(result.taskId, 'r:int').state, 'PASSED');
       assert.equal(svc.task(result.taskId).integration?.baseRevision, b);
+      assert.deepEqual(svc.deliverable(), { taskId: result.taskId, revision: result.integratedRevision, notIncluded: [] });
 
       const resumed = h.service();
       resumed.restore(h.events);
       assert.equal(resumed.task(result.taskId).attemptRecords[0]!.integration?.revision, result.integratedRevision);
+    });
+
+    it('delivers the only task\'s PASSED revision when nothing needs integrating', async () => {
+      const svc = h.service();
+      assert.deepEqual(svc.deliverable(), { reason: 'no tasks planned', notIncluded: [] });
+      svc.plan([task('T1', { files_in_scope: ['src/a.txt'] })]);
+      assert.equal(svc.deliverable().revision, undefined);
+      const rev = await accept(h, svc, 'T1', { 'src/a.txt': 'hello\n' });
+      assert.deepEqual(svc.deliverable(), { taskId: 'T1', revision: rev, notIncluded: [] });
+      svc.plan([task('T2', { files_in_scope: ['src/b.txt'], verification: ['test -f src/b.txt'] })]);
+      assert.equal(svc.deliverable().revision, undefined, 'a second task means the first alone is no longer the deliverable');
     });
 
     it('fails closed on a conflict, records it, and leaves the worktree clean without resolving', async () => {

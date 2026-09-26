@@ -11,8 +11,10 @@
  *
  * The Pi API is typed structurally; this module has no Pi dependency.
  */
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { findGitWrites, isWithin } from '../core/git-write-guard.ts';
 import { parseOrchestrationConfig } from '../orchestration/config.ts';
 import { createHostTaskService } from '../orchestration/host-wiring.ts';
 import type { TaskEvent, TaskView } from '../orchestration/task-board.ts';
@@ -44,17 +46,27 @@ export interface PiExtensionApi {
 export interface ExtensionDeps {
   /** Build a fresh service; throwing makes every tool fail closed with that message. */
   createService(persist: (event: TaskEvent) => void): TaskService;
+  /**
+   * Directories (repository and workspace roots) where the main agent may not
+   * write git history while the board has tasks. Missing or empty: every
+   * directory is protected.
+   */
+  gitGuardRoots?(): readonly string[];
 }
 
 export function defaultExtensionDeps(env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): ExtensionDeps {
+  let roots: readonly string[] = [];
   return {
+    gitGuardRoots: () => roots,
     createService(persist) {
       const path = env[CONFIG_ENV] !== undefined && env[CONFIG_ENV].length > 0 ? env[CONFIG_ENV] : join(cwd, '.pi-herdr', 'agent-orchestrator.json');
       if (!existsSync(path)) throw new Error(`orchestration config not found at ${path} (set ${CONFIG_ENV})`);
       let raw: unknown;
       try { raw = JSON.parse(readFileSync(path, 'utf8')); } catch { throw new Error(`orchestration config ${path} is not valid JSON`); }
       const config = parseOrchestrationConfig(raw);
-      return createHostTaskService({ config, persist, masterCwd: cwd });
+      const service = createHostTaskService({ config, persist, masterCwd: cwd });
+      roots = [config.repoRoot, config.workspaceRoot];
+      return service;
     },
   };
 }
@@ -96,6 +108,29 @@ export function readSessionFileEvents(path: string): TaskEvent[] {
     id = entry.parentId ?? undefined;
   }
   return readEvents({ sessionManager: { getBranch: () => branch.reverse() } });
+}
+
+/** Canonical path when it exists, so symlinked roots and cwd compare equal. */
+function canonical(path: string): string {
+  try { return realpathSync(path); } catch { return resolve(path); }
+}
+
+/**
+ * Why a main-agent bash command must not run, or undefined. While the board
+ * has tasks, git history under the protected roots is written only by workers
+ * (in their own worktrees) and by task_integrate, so the delivered revision is
+ * always one the task tools accepted. Unresolvable targets are blocked.
+ */
+export function gitWriteBlockReason(command: string, cwd: string, taskCount: number, roots: readonly string[], home: string = homedir()): string | undefined {
+  if (taskCount === 0) return undefined;
+  const protectedRoots = roots.map(canonical);
+  const writes = findGitWrites(command, canonical(cwd), home).filter((write) => write.directory === undefined || protectedRoots.length === 0 || protectedRoots.some((root) => isWithin(canonical(write.directory!), root)));
+  if (writes.length === 0) return undefined;
+  return [
+    `GIT_WRITE_BLOCKED: the task board has ${taskCount} task(s), so the main agent does not write git history in the repository or task worktrees; workers commit in their own worktrees and task_integrate builds integrations.`,
+    `Blocked: ${writes.map((write) => `\`${write.command}\` in ${write.directory ?? 'a directory that cannot be resolved statically'}`).join('; ')}.`,
+    'To deliver, report the DELIVERABLE revision from task_status; the human takes it from there. For a further change, plan it as a task (review_required false is allowed for low-risk mechanical work).',
+  ].join('\n');
 }
 
 function text(value: string, details?: unknown): PiToolResult {
@@ -149,7 +184,7 @@ const STRING_ARRAY = { type: 'array', items: { type: 'string' } } as const;
 
 const WORKFLOW_GUIDELINES = [
   'Orchestration loop for multi-step coding work: plan tasks with task_plan, then repeatedly observe (task_status) → start ready tasks (task_start) → spawn each worker with Pier `subagent` using the returned prompt and cwd, run_in_background true → task_bind the returned agent id → on its settlement notice run task_verify → if a review is required, task_review_brief, spawn the reviewer with the returned role/cwd/prompt, then task_review_record → decide the next action.',
-  'Small, single-file fixes do not need task tools or subagents; do them yourself and run the checks.',
+  'Small, single-file fixes that need no delegation do not need task tools or subagents; do them yourself and run the checks. Once a task is planned, git writes (commit, merge, cherry-pick, reset, ...) by you in the repository or task worktrees are blocked; the result to hand over is the DELIVERABLE revision in task_status.',
   'Plan parallel tasks so they do not modify the same shared or coordination file (build files, registries, shared headers). Prefer per-task fragments; if shared wiring is needed first, make it a prerequisite task and start dependents with base_task.',
   'A worker saying "done" is not acceptance. Only task_verify / task_review_record move a task toward PASSED. Never paraphrase a reviewer verdict; task_review_record reads it from Pier.',
   'When task_verify reports check_failed, send the worker the reasons with `subagent send` and verify again, or task_abandon the attempt. After a rejected review, task_start with reuse_worktree true continues on the same branch.',
@@ -184,6 +219,20 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
 
     pi.on('session_start', (_event, ctx) => { rebuild(ctx); });
     pi.on('session_tree', (_event, ctx) => { rebuild(ctx); });
+    pi.on('tool_call', (event, ctx) => {
+      const call = event as { toolName?: unknown; input?: unknown } | undefined;
+      if (call?.toolName !== 'bash' || service === undefined) return undefined;
+      const command = (call.input as { command?: unknown } | undefined)?.command;
+      if (typeof command !== 'string') return undefined;
+      const cwd = (ctx as { cwd?: unknown } | undefined)?.cwd;
+      let reason: string | undefined;
+      try {
+        reason = gitWriteBlockReason(command, typeof cwd === 'string' ? cwd : process.cwd(), service.status().length, deps.gitGuardRoots?.() ?? []);
+      } catch (error) {
+        if (/\bgit\b/.test(command)) reason = `GIT_WRITE_BLOCKED: the git write guard could not check this command (${error instanceof Error ? error.message : String(error)})`;
+      }
+      return reason === undefined ? undefined : { block: true, reason };
+    });
 
     function tool(definition: Omit<PiToolDefinition, 'execute'>, run: (svc: TaskService, params: unknown, signal: AbortSignal | undefined) => Promise<PiToolResult> | PiToolResult): void {
       pi.registerTool({
@@ -203,7 +252,7 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
     tool({
       name: 'task_status',
       label: 'Task Status',
-      description: 'Show the structured task board: every task with state, dependencies, attempts, bound Pier agent, worktree, failed checks, candidate revision, review, and verdict. Also lists READY task ids. This is the source of truth for workflow state; do not rely on chat memory.',
+      description: 'Show the structured task board: every task with state, dependencies, attempts, bound Pier agent, worktree, failed checks, candidate revision, review, and verdict. Also lists READY task ids and the DELIVERABLE revision (the latest PASSED integration, or the only task\'s PASSED revision), which is the one result to hand over. This is the source of truth for workflow state; do not rely on chat memory.',
       promptGuidelines: WORKFLOW_GUIDELINES,
       parameters: { type: 'object', properties: { task_id: TASK_ID_PARAM }, additionalProperties: false },
     }, (svc, params) => {
@@ -211,7 +260,11 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
       const tasks = typeof id === 'string' && id.length > 0 ? [svc.task(id)] : svc.status();
       const body = tasks.length === 0 ? 'No tasks planned.' : tasks.map(formatTask).join('\n');
       const extra = notes.length > 0 ? `\nLease warnings after restore:\n${notes.map((note) => `- ${note}`).join('\n')}` : '';
-      return text(`${body}\nREADY: ${svc.readySet().join(', ') || '(none)'}${extra}`, { tasks: tasks.map((task) => ({ id: task.id, state: task.state, unmetDependencies: task.unmetDependencies, attempts: task.attemptRecords.length })) });
+      const deliverable = svc.deliverable();
+      const deliver = deliverable.revision === undefined
+        ? `DELIVERABLE: none (${deliverable.reason ?? 'not ready'})`
+        : `DELIVERABLE: ${deliverable.revision} (${deliverable.taskId})${deliverable.notIncluded.length > 0 ? `; PASSED but not included: ${deliverable.notIncluded.join(', ')}` : ''}`;
+      return text(`${body}\nREADY: ${svc.readySet().join(', ') || '(none)'}\n${deliver}${extra}`, { tasks: tasks.map((task) => ({ id: task.id, state: task.state, unmetDependencies: task.unmetDependencies, attempts: task.attemptRecords.length })), deliverable });
     });
 
     tool({

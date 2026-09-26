@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -13,7 +13,7 @@ import { parseOrchestrationConfig } from '../src/orchestration/config.ts';
 import { replayTaskBoard, TaskBoardError, type TaskEvent } from '../src/orchestration/task-board.ts';
 import type { TaskService } from '../src/orchestration/task-service.ts';
 import { TaskServiceError } from '../src/orchestration/task-service.ts';
-import { createAgentOrchestratorExtension, readSessionFileEvents, TASK_EVENT_CUSTOM_TYPE, type PiToolDefinition } from '../src/pi-extension/index.ts';
+import { createAgentOrchestratorExtension, gitWriteBlockReason, readSessionFileEvents, TASK_EVENT_CUSTOM_TYPE, type PiToolDefinition } from '../src/pi-extension/index.ts';
 
 const REV = 'a'.repeat(40);
 
@@ -252,6 +252,7 @@ describe('pi extension', () => {
       restore(events: TaskEvent[]) { restored.push(events); return { tasks: 0, leaseErrors: [] }; },
       status: () => [],
       readySet: () => [],
+      deliverable: () => ({ reason: 'no tasks planned', notIncluded: [] }),
       start() { throw new TaskServiceError('NOT_READY', 'T1 is PENDING'); },
     } as unknown as TaskService;
     createAgentOrchestratorExtension({ createService: () => fake })(pi.api);
@@ -260,6 +261,60 @@ describe('pi extension', () => {
     assert.deepEqual(restored, [[event]]);
     const status = await pi.tools.get('task_status')!.execute('c1', {}, undefined, undefined, {});
     assert.match(status.content[0]!.text, /No tasks planned/);
+    assert.match(status.content[0]!.text, /DELIVERABLE: none \(no tasks planned\)/);
     await assert.rejects(pi.tools.get('task_start')!.execute('c2', { task_id: 'T1' }, undefined, undefined, {}), /NOT_READY: T1 is PENDING/);
+  });
+
+  describe('git write guard on the main agent\'s bash', () => {
+    function withBoard(taskCount: number, roots?: readonly string[]) {
+      const pi = fakePi();
+      const fake = {
+        restore: () => ({ tasks: taskCount, leaseErrors: [] }),
+        status: () => Array.from({ length: taskCount }, (_, index) => ({ id: `T${index + 1}` })),
+      } as unknown as TaskService;
+      createAgentOrchestratorExtension({ createService: () => fake, ...(roots === undefined ? {} : { gitGuardRoots: () => roots }) })(pi.api);
+      pi.handlers.get('session_start')!({}, { sessionManager: { getBranch: () => [] } });
+      return (command: unknown, toolName = 'bash', cwd = '/repo') => pi.handlers.get('tool_call')!({ toolName, input: { command } }, { cwd }) as { block: true; reason: string } | undefined;
+    }
+
+    it('lets the main agent commit its own small work while the board is empty', () => {
+      assert.equal(withBoard(0, ['/repo', '/ws'])('git commit -am fix'), undefined);
+    });
+
+    it('blocks git writes in the repository and task worktrees once a task is planned', () => {
+      const call = withBoard(2, ['/repo', '/ws']);
+      const blocked = call('git cherry-pick abc && git commit -m integrate');
+      assert.equal(blocked?.block, true);
+      assert.match(blocked!.reason, /^GIT_WRITE_BLOCKED: the task board has 2 task\(s\)/);
+      assert.match(blocked!.reason, /`git cherry-pick abc` in \/repo; `git commit -m integrate` in \/repo/);
+      assert.match(blocked!.reason, /DELIVERABLE revision from task_status/);
+      assert.equal(call('git -C /ws/T1-a1 commit -am x')?.block, true);
+      assert.equal(call('cd "$W" && git merge x')?.block, true, 'unresolvable directories fail closed');
+    });
+
+    it('allows reads, other tools, and writes outside the protected roots', () => {
+      const call = withBoard(1, ['/repo', '/ws']);
+      assert.equal(call('git log --oneline && git diff HEAD~1'), undefined);
+      assert.equal(call('cd /tmp/scratch && git init && git commit -m x'), undefined);
+      assert.equal(call('git commit -m x', 'read'), undefined);
+      assert.equal(call(undefined), undefined);
+    });
+
+    it('protects every directory when no roots are known', () => {
+      assert.equal(withBoard(1)('cd /tmp/scratch && git commit -m x')?.block, true);
+    });
+
+    it('compares canonical paths, so a symlinked cwd cannot slip past a root', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'ao-guard-'));
+      try {
+        mkdirSync(join(dir, 'repo'));
+        symlinkSync(join(dir, 'repo'), join(dir, 'link'));
+        assert.match(gitWriteBlockReason('git commit -m x', join(dir, 'link'), 1, [join(dir, 'repo')]) ?? '', /GIT_WRITE_BLOCKED/);
+        assert.match(gitWriteBlockReason('git -C ../link push', join(dir, 'repo'), 1, [join(dir, 'repo')]) ?? '', /GIT_WRITE_BLOCKED/);
+        assert.equal(gitWriteBlockReason('git commit -m x', dir, 1, [join(dir, 'repo')]), undefined);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 });

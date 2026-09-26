@@ -167,6 +167,15 @@ interface AcceptedCandidate {
   readonly source: string;
 }
 
+export interface Deliverable {
+  readonly taskId?: string;
+  readonly revision?: string;
+  /** Why there is no deliverable revision. */
+  readonly reason?: string;
+  /** PASSED non-integration tasks the deliverable does not contain. */
+  readonly notIncluded: readonly string[];
+}
+
 export interface IntegrateResult {
   readonly taskId: string;
   readonly state: string;
@@ -238,6 +247,28 @@ export class TaskService {
 
   readySet(): readonly string[] {
     return this.board.readySet();
+  }
+
+  /**
+   * The one revision to hand over: the most recently planned PASSED integration,
+   * or, on a board with a single non-integration task and no integration, that
+   * task's PASSED revision. Anything else has no deliverable.
+   */
+  deliverable(): Deliverable {
+    const tasks = this.board.tasks();
+    const accepted = (task: TaskView) => task.attemptRecords[task.attemptRecords.length - 1]?.candidate?.revision;
+    const integrations = tasks.filter((task) => task.integration !== undefined);
+    const passed = integrations.filter((task) => task.state === 'PASSED' && accepted(task) !== undefined);
+    const latest = passed[passed.length - 1];
+    if (latest !== undefined) {
+      const included = new Set(latest.integration!.inputs.map((input) => input.taskId));
+      const notIncluded = tasks.filter((task) => task.integration === undefined && task.state === 'PASSED' && !included.has(task.id)).map((task) => task.id);
+      return { taskId: latest.id, revision: accepted(latest)!, notIncluded };
+    }
+    const own = tasks.filter((task) => task.integration === undefined);
+    if (integrations.length === 0 && own.length === 1 && own[0]!.state === 'PASSED' && accepted(own[0]!) !== undefined) return { taskId: own[0]!.id, revision: accepted(own[0]!)!, notIncluded: [] };
+    if (tasks.length === 0) return { reason: 'no tasks planned', notIncluded: [] };
+    return { reason: integrations.length > 0 ? 'no integration has PASSED' : 'more than one task: integrate the PASSED candidates with task_integrate, then verify and review the integration', notIncluded: [] };
   }
 
   /** Add tasks. Validates everything before any state changes. */

@@ -34,7 +34,7 @@ Fail-closed 守卫的完整列表、状态机和 session 恢复见 [docs/archite
 
 | 工具 | 由代码保证的事实 |
 |---|---|
-| `task_status` | task board：state、未满足依赖、attempts、绑定的 Pier agent、worktree、失败的 check、candidate revision、review、verdict、READY 列表 |
+| `task_status` | task board：state、未满足依赖、attempts、绑定的 Pier agent、worktree、失败的 check、candidate revision、review、verdict、READY 列表，以及 `DELIVERABLE`：最近一个 PASSED 的集成 revision；board 上只有一个非集成任务时是它的 PASSED revision；否则为 none 并给出原因。这是唯一应交付的结果 |
 | `task_plan` | 原子地加入 TaskContract（全部校验通过才写入）：id 唯一、依赖存在且无环、`files_in_scope` 非空、verification 命令必须逐字在 host allowlist 中；`review_required` 默认 true；**规划规则**：可以并行的任务（彼此之间没有 depends_on 路径）的 `files_in_scope` 不能重叠（含目录前缀），除非两个任务都在 `planned_overlap` 里显式声明该路径 |
 | `task_start` | 任务必须 READY/RETRYING 且依赖已 PASSED；host 从主 checkout 的 HEAD（或某个已 PASSED 依赖的 revision）建独立 worktree+branch，返回 worker prompt 和 `subagent` spawn 参数；`reuse_worktree` 在同一分支上开下一个 attempt |
 | `task_bind` | 通过 Pier ledger 确认该 agent 确实在该 worktree 中启动 |
@@ -43,6 +43,8 @@ Fail-closed 守卫的完整列表、状态机和 session 恢复见 [docs/archite
 | `task_review_record` | 从 **Pier ledger** 读取 reviewer 的收尾输出（不采信主 agent 转述）；要求 reviewer ≠ implementer、role 正确、非 revived、在 brief 之后启动、review id 与 revision 都匹配、worktree 未变，然后 PASSED 或 RETRYING/FAILED |
 | `task_integrate` | P1：把精确的已验收 candidate revision（PASSED + clean-room 验证 + fresh review，并在 Pier ledger 里复核 reviewer verdict）按给定顺序 cherry-pick（`-x`）到基于**精确 base revision** 的新集成 worktree/分支；candidate 可以建在 base 上，也可以叠在更早的输入之上（如前置的 wiring 任务），只 pick 它自己的 commit；跨会话的 candidate 需要提供其 Pi session 文件作为证据（沿当前分支回放）。冲突即 abort、记录冲突文件并 FAILED，绝不自动解决。成功后集成任务走与普通任务相同的 `task_verify`（额外校验：集成历史与声明的源 commit 逐个 patch-id 相同且带 `-x` 来源）→ fresh reviewer → `task_review_record` |
 | `task_abandon` | 主 agent 放弃当前 attempt（受 retry 预算约束）或取消任务（依赖方变 BLOCKED） |
+
+**主 agent 的 git 写保护（G2，2026-09-26 实现）。** 扩展同时挂在 Pi 的 `tool_call` 事件上。board 上一旦有任务，主 agent 通过 `bash` 在 `repoRoot` 或 `workspaceRoot` 下执行的 git 写操作都会被拦下，返回 `GIT_WRITE_BLOCKED`。拦截范围包括 `commit`、`merge`、`cherry-pick`、`rebase`、`reset`、`revert`、`am`、`apply`、`push`、`pull`、`update-ref`、`switch`、移动分支的 `checkout`，以及强制、删除、改名分支的 `branch`。命令解析识别引号、分隔符、`$(...)`、heredoc、`cd`、`git -C`、`sh -c` 和 `eval`；解析不出目标目录的，一律拦截。只读 git 命令和 `--abort`/`--quit` 放行。board 为空时不拦截，主 agent 仍可自己做不需要委派的小任务。这是基于字符串的策略检查，不是沙箱：别名、脚本或其他语言里调用 git 都能绕过。真正的保证是交付规则：只认 `DELIVERABLE`。
 
 task 事件以 `agent-orchestrator.task-event` custom entry 写入 Pi session，`/resume` 和分支切换时回放重建；worktree lease 通过 ownership ledger 重新 adopt。每次变更先在回放出的副本上试 apply，再持久化，失败时状态不变。
 
@@ -72,7 +74,7 @@ task 事件以 `agent-orchestrator.task-event` custom entry 写入 Pi session，
 pi -e /path/to/pier/packages/pier-ext/src/index.ts -e /path/to/pi-taskgate/src/pi-extension/index.ts
 ```
 
-小任务不需要 task 工具，主 agent 直接做并跑检查；复杂或可并行的任务才走 task board。
+不需要委派的小任务不走 task 工具，主 agent 直接做并跑检查；复杂或可并行的任务才走 task board。board 上一旦有任务，主 agent 就不能再在仓库或 task worktree 里写 git 历史，交付的是 `task_status` 中的 `DELIVERABLE` revision，由人合并。
 
 ### 已知限制
 
@@ -81,6 +83,7 @@ pi -e /path/to/pier/packages/pier-ext/src/index.ts -e /path/to/pi-taskgate/src/p
 - `task_verify` 依赖 Pier ledger 的 `running` 状态判断 worker 是否结束；如果 `subagent send` 之后 Pier 没有写新的 running 行，过早 verify 可能看到半成品并记一次失败 check。
 - Pier 的 todo 自动对账会在 subagent settle 时勾掉描述匹配的 todo；task 状态只以 `task_status` 为准，建议 spawn description 用 `T1:impl` 这类不与 todo 重合的形式（工具返回的就是这种）。
 - integration 只做机械 cherry-pick，冲突时 fail closed，不提供冲突解决；worktree 和分支不自动清理；git 检查是同步调用，verification 命令是异步调用。
+- git 写保护只检查主 agent 的 `bash` 命令字符串，`edit`/`write` 仍可改文件，别名、脚本或其他语言里调用 git 也拦不住；它挡的是常见的绕路，不是沙箱。交付是否可信取决于人只接受 `DELIVERABLE`。
 - 没有内建 metrics；field report 的数字是从 session 文件手工抽取的（方法见 docs/evaluation.md）。
 
 ## Legacy：外层 vertical slice（已冻结）
