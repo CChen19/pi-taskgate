@@ -91,7 +91,7 @@ export function renderReviewerPrompt(brief: ReviewBrief, reviewId: string, taskI
     '',
     'End your final message with exactly one line in this form and nothing after it:',
     `${REVIEW_VERDICT_TAG} ${reviewId} {"outcome":"passed"|"rejected","reasons":["..."],"artifactRevision":"${brief.diff.artifactRevision}"}`,
-    'Use "rejected" if any acceptance criterion is unmet or the change is unsafe. Reasons must be concrete.',
+    'Use "rejected" if any acceptance criterion is unmet or the change is unsafe. "reasons" must list at least one concrete reason, for "passed" as well as "rejected"; an empty list makes the verdict unusable.',
   ].join('\n');
 }
 

@@ -140,6 +140,21 @@ This is a different and larger task than R1–R4, so it is a qualitative referen
 
 None of this was wrong in outcome as far as we know. The point is that every safeguard in that run was prompt discipline and the master's diligence. The task tools turn the equivalent safeguards (isolated worktrees, host-observed revisions, clean-room checks, independent revision-bound review, no push) into refusals.
 
+## Master model changes orchestration behaviour (dry runs, 2026-09-26)
+
+In the round-2 dry runs, the harness, prompts, roles and child model (`glm-5.3-flash`) were the same as in round 1, with only the master model changed to `gpt-6-sol`. The master's behaviour changed sharply:
+
+| | Round 1, Kimi master | Dry runs, `gpt-6-sol` master |
+|---|---|---|
+| Master turns, Pier only | 13 (ma1) | 80 (`d1a`) |
+| Master turns, with task tools | 36–43 (mb1, mb3) | 144 (`d1b`) |
+| `sleep` calls | 0 (ma1), 6 (mb1) | 13 (`d1a`), 38 (`d1b`) |
+| Share of master cost spent polling | small | 74% (`d1a`), 63% (`d1b`) |
+
+The GPT master never ended its turn to wait for subagents. It polled with `sleep N` loops and repeated `subagent output` calls, even though Pier delivered a settlement notice for every subagent, including one that died on provider timeouts.
+
+In one harness, orchestration cost and pacing depend strongly on the master model, so a cost comparison is only meaningful with the master model held fixed. Round 2 adds the same "do not poll" sentence to every arm's prompt; see amendment 3 in [evaluation.md](evaluation.md).
+
 ## Evidence sources
 
 - **Master sessions.** `~/.pi/agent/sessions/<encoded master cwd>/2026-09-22T0{7,8,9}*.jsonl`
