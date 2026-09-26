@@ -10,9 +10,7 @@
   "scripts": {
     "test": "node --test tests/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test",
-    "host:doctor": "node src/host/cli.ts doctor",
-    "vertical:run": "node src/host/vertical-cli.ts"
+    "check": "npm run typecheck && npm test"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

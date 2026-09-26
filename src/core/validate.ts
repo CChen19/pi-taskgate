@@ -19,10 +19,6 @@ export function asNonEmptyString(value: unknown): string | undefined {
   return value;
 }
 
-export function isNonEmptyStringArray(value: unknown): value is string[] {
-  if (!Array.isArray(value)) return false;
-  return value.every((entry) => asNonEmptyString(entry) !== undefined);
-}
 
 /**
  * Own property keys only (including symbols and non-enumerable keys), so

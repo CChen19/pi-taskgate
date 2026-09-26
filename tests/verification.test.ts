@@ -1,77 +1,35 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { needsFreshReview, planRoute } from '../src/core/gate.ts';
 import {
-  MechanicalVerifier,
   VerificationError,
   decideVerdict,
+  validateEvidenceBundle,
   type EvidenceBundle,
-  type VerificationCommand,
-  type VerificationRunner,
   type VerificationRunnerResult,
 } from '../src/core/verification.ts';
 import {
   ReviewerBriefError,
   assembleReviewerBrief,
   decideFinalVerdict,
-  s2VerdictInput,
   validateReviewVerdict,
 } from '../src/core/reviewer-brief.ts';
-import { validateTaskContract, type TaskContract } from '../src/core/task-contract.ts';
 
-function commands(): VerificationCommand[] {
-  return [
-    { command: 'npm run check', cwd: '/workspace', timeoutMs: 30_000 },
-    { command: 'npm test' },
-  ];
-}
-
-function runEvidence(
-  results: readonly VerificationRunnerResult[],
-  artifactRevision = 'diff-sha-1',
-): { bundle: EvidenceBundle; calls: VerificationCommand[] } {
-  const calls: VerificationCommand[] = [];
-  let now = 100;
-  const runner: VerificationRunner = {
-    run(command) {
-      calls.push(command);
-      return results[calls.length - 1] ?? { exitCode: 0, timedOut: false, output: 'default' };
-    },
-  };
-  const verifier = new MechanicalVerifier();
-  const bundle = verifier.run(commands(), {
-    taskId: 'Ts5-verification',
-    attemptId: 'Ts5-verification:attempt-1',
+/** An evidence bundle for two commands, shaped like the one task_verify records. */
+function runEvidence(results: readonly VerificationRunnerResult[], artifactRevision = 'diff-sha-1'): { bundle: EvidenceBundle } {
+  const bundle = validateEvidenceBundle({
+    taskId: 'Tverify',
+    attemptId: 'Tverify:attempt-1',
     artifactRevision,
-    clock: () => now++,
-    runner,
+    commands: [{ command: 'npm run check', cwd: '/workspace', timeoutMs: 30_000 }, { command: 'npm test' }].slice(0, Math.max(results.length, 1)),
+    outcomes: results.map((result) => ({ exitCode: result.exitCode, durationMs: 1, timedOut: result.timedOut, ...(result.output === undefined ? {} : { output: result.output }), ...(result.outputRef === undefined ? {} : { outputRef: result.outputRef }) })),
+    startedAt: 100,
+    endedAt: 105,
   });
-  return { bundle, calls };
+  return { bundle };
 }
 
-describe('S5 mechanical verification', () => {
-  it('runs every command through the fake runner and returns frozen evidence', () => {
-    const longOutput = 'x'.repeat(1_000);
-    const { bundle, calls } = runEvidence([
-      { exitCode: 0, timedOut: false, output: longOutput },
-      { exitCode: 0, timedOut: false, outputRef: 'artifact://logs/check' },
-    ]);
-
-    assert.deepEqual(calls, commands());
-    assert.deepEqual(bundle.commands, commands());
-    assert.equal(bundle.outcomes[0]?.durationMs, 1);
-    assert.equal(bundle.outcomes[0]?.output?.length, 160);
-    assert.equal(bundle.outcomes[1]?.outputRef, 'artifact://logs/check');
-    assert.equal(bundle.artifactRevision, 'diff-sha-1');
-    assert.equal(Object.isFrozen(bundle), true);
-    assert.equal(Object.isFrozen(bundle.commands), true);
-    assert.equal(Object.isFrozen(bundle.outcomes[0]), true);
-    assert.throws(() => {
-      (bundle as { artifactRevision: string }).artifactRevision = 'changed';
-    }, TypeError);
-  });
-
+describe('mechanical verdict', () => {
   it('decides pass, partial failure, timeout, and expectation failure without side effects', () => {
     const allPass = runEvidence([
       { exitCode: 0, timedOut: false, output: 'ok' },
@@ -106,140 +64,23 @@ describe('S5 mechanical verification', () => {
     assert.equal(Object.isFrozen(tooFew), true);
   });
 
-  it('fails closed on missing artifact revisions and malformed exact fields', () => {
-    assert.throws(() => runEvidence([{ exitCode: 0, timedOut: false }], ''), (error: VerificationError) => {
-      assert.equal(error.code, 'MISSING_ARTIFACT_REVISION');
-      assert.equal(error.path, 'ctx.artifactRevision');
-      assert.ok(Array.isArray(error.available));
-      return true;
-    });
+  it('rejects a timeout even when its exit code is zero', () => {
+    assert.deepEqual(decideVerdict(runEvidence([{ exitCode: 0, timedOut: true }, { exitCode: 0, timedOut: false }]).bundle).reasons, ['command 1 timed out']);
+  });
 
+  it('fails closed on missing revisions, sparse outcomes, and unbounded identifiers', () => {
     const valid = runEvidence([{ exitCode: 0, timedOut: false }]).bundle;
     const missingRevision = { ...valid } as Record<string, unknown>;
     delete missingRevision.artifactRevision;
-    assert.throws(() => decideVerdict(missingRevision), (error: VerificationError) => {
-      assert.equal(error.code, 'MISSING_ARTIFACT_REVISION');
-      assert.equal(error.path, 'bundle.artifactRevision');
-      return true;
-    });
-
-    const input = commands() as unknown as Array<Record<PropertyKey, unknown>>;
-    const symbol = Symbol('unexpected');
-    Object.defineProperty(input[0], symbol, { value: true, enumerable: false });
-    assert.throws(() => new MechanicalVerifier().run(input as unknown as VerificationCommand[], {
-      taskId: 'Tshape',
-      attemptId: 'a-1',
-      artifactRevision: 'rev',
-      clock: () => 0,
-      runner: { run: () => ({ exitCode: 0, timedOut: false }) },
-    }), (error: VerificationError) => error.code === 'INVALID_COMMAND' && error.path === 'commands[0]');
-  });
-
-  it('rejects a timeout even when its exit code is zero and wraps runner exceptions', () => {
-    const timedOut = runEvidence([
-      { exitCode: 0, timedOut: true },
-      { exitCode: 0, timedOut: false },
-    ]).bundle;
-    assert.deepEqual(decideVerdict(timedOut).reasons, ['command 1 timed out']);
-
-    assert.throws(() => new MechanicalVerifier().run([{ command: 'fake-check' }], {
-      taskId: 'Tthrows',
-      attemptId: 'Tthrows:attempt-1',
-      artifactRevision: 'rev',
-      clock: () => 0,
-      runner: { run: () => { throw new Error('fake runner failure'); } },
-    }), (error: VerificationError) => {
-      assert.equal(error.code, 'RUNNER_FAILED');
-      assert.equal(error.path, 'runner.run[0]');
-      assert.match(error.message, /fake runner failure/);
-      return true;
-    });
-  });
-
-  it('rejects sparse and method-tampered arrays with structured errors', () => {
-    const valid = runEvidence([{ exitCode: 0, timedOut: false }]).bundle;
-    const sparseOutcomes = new Array(valid.outcomes.length) as unknown[];
-    assert.throws(() => decideVerdict({ ...valid, outcomes: sparseOutcomes }), (error: VerificationError) => {
-      assert.equal(error.code, 'INVALID_EVIDENCE');
-      assert.match(error.path, /bundle\.outcomes\[0\]/);
-      return true;
-    });
-
-    const sparseReasons = new Array(1) as unknown[];
-    assert.throws(() => validateReviewVerdict({ outcome: 'passed', reasons: sparseReasons, artifactRevision: 'rev' }), (error: ReviewerBriefError) => {
-      assert.equal(error.code, 'INVALID_REVIEW_VERDICT');
-      assert.match(error.path, /reasons\[0\]/);
-      return true;
-    });
-
-    const tamperedCommands = Object.assign([{ command: 'fake-check' }], { map: null });
-    assert.throws(() => new MechanicalVerifier().run(tamperedCommands, {
-      taskId: 'Ttampered',
-      attemptId: 'Ttampered:attempt-1',
-      artifactRevision: 'rev',
-      clock: () => 0,
-      runner: { run: () => ({ exitCode: 0, timedOut: false }) },
-    }), (error: VerificationError) => {
-      assert.equal(error.code, 'INVALID_COMMAND');
-      assert.equal(error.path, 'commands');
-      return true;
-    });
-
-    const sparseCriteria = new Array(1) as unknown[];
-    assert.throws(() => assembleReviewerBrief({
-      spec: { objective: 'objective', acceptance_criteria: sparseCriteria, files_in_scope: [] },
-      artifactRevision: 'diff-sha-1',
-      evidence: valid,
-    }), (error: ReviewerBriefError) => {
-      assert.equal(error.code, 'INVALID_REVIEW_BRIEF');
-      assert.match(error.path, /acceptance_criteria\[0\]/);
-      return true;
-    });
-
-    const tamperedCriteria = Object.assign(['criterion'], { map: null });
-    assert.throws(() => assembleReviewerBrief({
-      spec: { objective: 'objective', acceptance_criteria: tamperedCriteria, files_in_scope: [] },
-      artifactRevision: 'diff-sha-1',
-      evidence: valid,
-    }), (error: ReviewerBriefError) => error.code === 'INVALID_REVIEW_BRIEF');
-  });
-
-  it('enforces bounded task, attempt, and revision identifiers', () => {
-    const base = {
-      taskId: 'T' + 'a'.repeat(63),
-      attemptId: 'a'.repeat(128),
-      artifactRevision: 'r'.repeat(256),
-    };
-    assert.doesNotThrow(() => new MechanicalVerifier().run([{ command: 'fake-check' }], {
-      ...base,
-      clock: () => 0,
-      runner: { run: () => ({ exitCode: 0, timedOut: false }) },
-    }));
-    for (const [field, value] of [
-      ['taskId', 'T' + 'a'.repeat(64)],
-      ['attemptId', 'a'.repeat(129)],
-      ['artifactRevision', 'r'.repeat(257)],
-    ] as const) {
-      assert.throws(() => new MechanicalVerifier().run([{ command: 'fake-check' }], {
-        ...base,
-        [field]: value,
-        clock: () => 0,
-        runner: { run: () => ({ exitCode: 0, timedOut: false }) },
-      }), (error: VerificationError) => {
-        assert.ok(error.code === 'INVALID_CONTEXT' || error.code === 'MISSING_ARTIFACT_REVISION');
-        return true;
-      });
+    assert.throws(() => decideVerdict(missingRevision), (error: VerificationError) => error.code === 'MISSING_ARTIFACT_REVISION' && error.path === 'bundle.artifactRevision');
+    assert.throws(() => decideVerdict({ ...valid, outcomes: new Array(valid.outcomes.length) }), (error: VerificationError) => error.code === 'INVALID_EVIDENCE' && /bundle\.outcomes\[0\]/.test(error.path));
+    for (const [field, value] of [['taskId', 'T' + 'a'.repeat(64)], ['attemptId', 'a'.repeat(129)], ['artifactRevision', 'r'.repeat(257)]] as const) {
+      assert.throws(() => validateEvidenceBundle({ ...valid, [field]: value }), VerificationError, field);
     }
-    assert.throws(() => assembleReviewerBrief({
-      spec: { objective: 'objective', acceptance_criteria: ['criterion'], files_in_scope: [] },
-      artifactRevision: 'r'.repeat(257),
-      evidence: runEvidence([{ exitCode: 0, timedOut: false }]).bundle,
-    }), (error: ReviewerBriefError) => error.code === 'INVALID_REVIEW_BRIEF');
   });
-
 });
 
-describe('S5 fresh reviewer contract', () => {
+describe('fresh reviewer contract', () => {
   function evidence(): EvidenceBundle {
     return runEvidence([
       { exitCode: 0, timedOut: false, output: 'mechanical pass' },
@@ -312,6 +153,14 @@ describe('S5 fresh reviewer contract', () => {
     }
   });
 
+  it('rejects sparse or tampered criteria and reasons structurally', () => {
+    const valid = evidence();
+    assert.throws(() => validateReviewVerdict({ outcome: 'passed', reasons: new Array(1), artifactRevision: 'rev' }), (error: ReviewerBriefError) => error.code === 'INVALID_REVIEW_VERDICT' && /reasons\[0\]/.test(error.path));
+    for (const acceptance_criteria of [new Array(1), Object.assign(['criterion'], { map: null })]) {
+      assert.throws(() => assembleReviewerBrief({ spec: { objective: 'objective', acceptance_criteria, files_in_scope: [] }, artifactRevision: 'diff-sha-1', evidence: valid }), (error: ReviewerBriefError) => error.code === 'INVALID_REVIEW_BRIEF');
+    }
+  });
+
   it('covers the complete final-verdict matrix and binds review to the artifact', () => {
     const passed = { verdict: 'passed' as const, artifactRevision: 'rev', reasons: [] };
     const rejected = { verdict: 'rejected' as const, artifactRevision: 'rev', reasons: ['command failed'] };
@@ -325,62 +174,11 @@ describe('S5 fresh reviewer contract', () => {
     assert.equal(decideFinalVerdict(passed, reviewPassed, true), 'passed');
     assert.equal(decideFinalVerdict(passed, reviewRejected, true), 'rejected');
     assert.equal(decideFinalVerdict(passed, reviewRejected, false), 'rejected');
-    assert.equal(decideFinalVerdict(passed, reviewPassed, { required: true, reason: 'plan route requires review' }), 'passed');
-    assert.equal(s2VerdictInput('passed'), 'passed');
-    assert.equal(s2VerdictInput('rejected'), 'rejected');
-    assert.throws(() => s2VerdictInput('needs_review'), (error: ReviewerBriefError) => {
-      assert.equal(error.code, 'INVALID_FINAL_DECISION');
-      assert.deepEqual(error.available, ['passed', 'rejected']);
-      return true;
-    });
 
     assert.throws(() => decideFinalVerdict(passed, { ...reviewPassed, artifactRevision: 'other' }), (error: ReviewerBriefError) => {
       assert.equal(error.code, 'ARTIFACT_REVISION_MISMATCH');
       assert.equal(error.path, 'review.artifactRevision');
       return true;
     });
-  });
-
-  it('runs contract + S4 route + mechanical verification + fresh brief end to end', () => {
-    const rawContract: TaskContract = {
-      id: 'Ts5-e2e',
-      objective: 'Make acceptance evidence explicit',
-      depends_on: [],
-      files_in_scope: ['src/core/verification.ts', 'src/core/reviewer-brief.ts'],
-      acceptance_criteria: ['Evidence is revision-bound', 'Reviewer input is isolated'],
-      verification: ['npm run check'],
-    };
-    const validated = validateTaskContract(rawContract);
-    assert.equal(validated.ok, true);
-    if (!validated.ok) return;
-    const route = planRoute(validated.contract);
-    const gate = needsFreshReview(route);
-    assert.equal(route.mechanicalVerification.required, true);
-    assert.equal(gate.required, true);
-    const mechanical = new MechanicalVerifier().run(route.mechanicalVerification.commands.map((command) => ({ command })), {
-      taskId: validated.contract.id,
-      attemptId: 'Ts5-e2e:attempt-1',
-      artifactRevision: 'commit-sha-e2e',
-      clock: () => 10,
-      runner: { run: () => ({ exitCode: 0, timedOut: false, output: 'check passed' }) },
-    });
-    const mechanicalVerdict = decideVerdict(mechanical, { minimumCommands: 1 });
-    const brief = assembleReviewerBrief({
-      spec: {
-        objective: validated.contract.objective,
-        acceptance_criteria: validated.contract.acceptance_criteria,
-        files_in_scope: validated.contract.files_in_scope ?? [],
-      },
-      artifactRevision: 'commit-sha-e2e',
-      diff: 'diff --git a/src/core/verification.ts b/src/core/verification.ts',
-      evidence: mechanical,
-    });
-    assert.equal(brief.evidence.taskId, 'Ts5-e2e');
-    const final = decideFinalVerdict(mechanicalVerdict, {
-      outcome: 'passed',
-      reasons: ['criteria checked against the brief'],
-      artifactRevision: brief.diff.artifactRevision,
-    }, gate);
-    assert.equal(final, 'passed');
   });
 });

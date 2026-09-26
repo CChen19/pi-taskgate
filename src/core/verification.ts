@@ -30,19 +30,6 @@ export interface VerificationRunnerResult {
   readonly outputRef?: string;
 }
 
-export interface VerificationRunner {
-  run(command: VerificationCommand): VerificationRunnerResult;
-}
-
-export interface VerificationRunContext {
-  readonly taskId: string;
-  readonly attemptId: string;
-  /** Immutable identifier for the artifact being checked (commit, diff hash, etc.). */
-  readonly artifactRevision: string;
-  readonly clock: () => number;
-  readonly runner: VerificationRunner;
-}
-
 export interface VerificationOutcome {
   readonly exitCode: number;
   readonly durationMs: number;
@@ -105,8 +92,6 @@ export class VerificationError extends Error {
 }
 
 const COMMAND_FIELDS = ['command', 'cwd', 'timeoutMs'] as const;
-const CONTEXT_FIELDS = ['taskId', 'attemptId', 'artifactRevision', 'clock', 'runner'] as const;
-const RUNNER_RESULT_FIELDS = ['exitCode', 'timedOut', 'output', 'outputRef'] as const;
 const EVIDENCE_FIELDS = ['taskId', 'attemptId', 'artifactRevision', 'commands', 'outcomes', 'startedAt', 'endedAt'] as const;
 const OUTCOME_FIELDS = ['exitCode', 'durationMs', 'timedOut', 'output', 'outputRef'] as const;
 const EXPECTATION_FIELDS = ['minimumCommands'] as const;
@@ -200,29 +185,7 @@ function validateCommands(value: unknown, path: string, code: VerificationErrorC
   return normalized;
 }
 
-function validateClock(clock: unknown, path: string): asserts clock is () => number {
-  if (typeof clock !== 'function') fail('INVALID_CONTEXT', path, `${path} must be a function`);
-}
 
-function validateContext(input: unknown): VerificationRunContext {
-  if (!isPlainObject(input)) fail('INVALID_CONTEXT', 'ctx', 'ctx must be a plain object');
-  if (!hasExactFields(input, CONTEXT_FIELDS)) {
-    fail('INVALID_CONTEXT', 'ctx', `ctx has unknown field(s): ${truncateForMessage(unknownFields(input, CONTEXT_FIELDS).join(', '))}`, CONTEXT_FIELDS);
-  }
-  const clock = ownValue(input, 'clock');
-  validateClock(clock, 'ctx.clock');
-  const runner = ownValue(input, 'runner');
-  if ((typeof runner !== 'object' && typeof runner !== 'function') || runner === null || typeof (runner as { run?: unknown }).run !== 'function') {
-    fail('INVALID_RUNNER', 'ctx.runner', 'ctx.runner must provide a run function', ['run']);
-  }
-  return {
-    taskId: requireTaskId(ownValue(input, 'taskId'), 'ctx.taskId', 'INVALID_CONTEXT'),
-    attemptId: requireAttemptId(ownValue(input, 'attemptId'), 'ctx.attemptId', 'INVALID_CONTEXT'),
-    artifactRevision: requireRevision(ownValue(input, 'artifactRevision'), 'ctx.artifactRevision'),
-    clock: clock as () => number,
-    runner: runner as unknown as VerificationRunner,
-  };
-}
 
 function requireRevision(value: unknown, path: string): string {
   return requireNonEmpty(value, path, 'MISSING_ARTIFACT_REVISION', MAX_ARTIFACT_REVISION_LENGTH);
@@ -236,58 +199,8 @@ function requireAttemptId(value: unknown, path: string, code: VerificationErrorC
   return requireNonEmpty(value, path, code, MAX_ATTEMPT_ID_LENGTH);
 }
 
-function readClock(clock: () => number, path: string): number {
-  let value: unknown;
-  try {
-    value = clock();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'clock threw a non-Error value';
-    fail('INVALID_CONTEXT', path, `${path} threw: ${truncateForMessage(message)}`);
-  }
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    fail('INVALID_CONTEXT', path, `${path} must return a finite number`);
-  }
-  return value;
-}
 
-function validateRunnerResult(value: unknown, path: string): VerificationRunnerResult {
-  if (!isPlainObject(value)) fail('INVALID_RUNNER_RESULT', path, `${path} must be a plain object`);
-  if (!hasExactFields(value, RUNNER_RESULT_FIELDS)) {
-    fail('INVALID_RUNNER_RESULT', path, `${path} has unknown field(s): ${truncateForMessage(unknownFields(value, RUNNER_RESULT_FIELDS).join(', '))}`, RUNNER_RESULT_FIELDS);
-  }
-  const exitCode = ownValue(value, 'exitCode');
-  if (typeof exitCode !== 'number' || !Number.isInteger(exitCode) || exitCode < 0) {
-    fail('INVALID_RUNNER_RESULT', `${path}.exitCode`, `${path}.exitCode must be a non-negative integer`);
-  }
-  const timedOut = ownValue(value, 'timedOut');
-  if (typeof timedOut !== 'boolean') fail('INVALID_RUNNER_RESULT', `${path}.timedOut`, `${path}.timedOut must be boolean`, ['true', 'false']);
-  const outputValue = ownValue(value, 'output');
-  const outputRefValue = ownValue(value, 'outputRef');
-  if (outputValue !== undefined && typeof outputValue !== 'string') fail('INVALID_RUNNER_RESULT', `${path}.output`, `${path}.output must be a string`);
-  if (outputRefValue !== undefined && asNonEmptyString(outputRefValue) === undefined) fail('INVALID_RUNNER_RESULT', `${path}.outputRef`, `${path}.outputRef must be a non-empty string`);
-  const result: VerificationRunnerResult = {
-    exitCode,
-    timedOut,
-    ...(outputValue === undefined ? {} : { output: outputValue as string }),
-    ...(outputRefValue === undefined ? {} : { outputRef: outputRefValue as string }),
-  };
-  return result;
-}
 
-function outcomeFrom(
-  raw: VerificationRunnerResult,
-  durationMs: number,
-): VerificationOutcome {
-  const outcome: { exitCode: number; durationMs: number; timedOut: boolean; output?: string; outputRef?: string } = {
-    exitCode: raw.exitCode,
-    durationMs,
-    timedOut: raw.timedOut,
-  };
-  if (raw.outputRef !== undefined) outcome.outputRef = truncateForMessage(raw.outputRef);
-  if (raw.output !== undefined) outcome.output = truncateForMessage(raw.output);
-  else if (raw.outputRef === undefined) outcome.output = '';
-  return outcome;
-}
 
 function validateOutcome(value: unknown, path: string): VerificationOutcome {
   if (!isPlainObject(value)) fail('INVALID_EVIDENCE', path, `${path} must be a plain object`);
@@ -351,55 +264,6 @@ function validateExpectations(input: unknown): VerificationExpectations {
   const minimumCommands = ownValue(input, 'minimumCommands');
   if (minimumCommands === undefined) return {};
   return { minimumCommands: requireNonNegativeInteger(minimumCommands, 'expectations.minimumCommands', 'INVALID_EXPECTATIONS') };
-}
-
-/** Mechanical verifier implementation using only injected dependencies. */
-export class MechanicalVerifier implements VerifierPort {
-  run(commands: readonly VerificationCommand[], ctx: VerificationRunContext): EvidenceBundle {
-    const normalizedCommands = validateCommands(commands, 'commands', 'INVALID_COMMAND');
-    const normalizedContext = validateContext(ctx);
-    const startedAt = readClock(normalizedContext.clock, 'ctx.clock');
-    const outcomes: VerificationOutcome[] = [];
-
-    for (const [index, command] of normalizedCommands.entries()) {
-      const commandStartedAt = readClock(normalizedContext.clock, 'ctx.clock');
-      let raw: unknown;
-      try {
-        raw = normalizedContext.runner.run(deepFreeze({ ...command }));
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'runner threw a non-Error value';
-        fail('RUNNER_FAILED', `runner.run[${index}]`, `runner failed: ${truncateForMessage(message)}`);
-      }
-      const commandEndedAt = readClock(normalizedContext.clock, 'ctx.clock');
-      if (commandEndedAt < commandStartedAt) fail('INVALID_CONTEXT', 'ctx.clock', 'ctx.clock returned decreasing time');
-      const result = validateRunnerResult(raw, `runner.run[${index}].return`);
-      outcomes.push(outcomeFrom(result, commandEndedAt - commandStartedAt));
-    }
-
-    const endedAt = readClock(normalizedContext.clock, 'ctx.clock');
-    if (endedAt < startedAt) fail('INVALID_CONTEXT', 'ctx.clock', 'ctx.clock returned decreasing time');
-    return deepFreeze({
-      taskId: normalizedContext.taskId,
-      attemptId: normalizedContext.attemptId,
-      artifactRevision: normalizedContext.artifactRevision,
-      commands: normalizedCommands,
-      outcomes,
-      startedAt,
-      endedAt,
-    });
-  }
-}
-
-export interface VerifierPort {
-  run(commands: readonly VerificationCommand[], ctx: VerificationRunContext): EvidenceBundle;
-}
-
-/** Convenience entry point for callers that do not need to retain a verifier object. */
-export function runVerification(
-  commands: readonly VerificationCommand[],
-  ctx: VerificationRunContext,
-): EvidenceBundle {
-  return new MechanicalVerifier().run(commands, ctx);
 }
 
 function validateVerdictInput(input: unknown): VerificationVerdict {

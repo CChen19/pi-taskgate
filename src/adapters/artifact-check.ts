@@ -6,7 +6,7 @@
  * clean, ahead of its base, and every changed path is inside `files_in_scope`.
  */
 import { deepFreeze } from '../core/validate.ts';
-import { validateChangedPaths } from './scoped-context.ts';
+import { validateChangedPaths } from '../core/scope.ts';
 import type { WorkspaceInspection } from './worktree-manager.ts';
 
 export type ArtifactCheckFailure = 'DIRTY_WORKTREE' | 'NO_COMMITS' | 'SCOPE_VIOLATION' | 'INVALID_SCOPE';

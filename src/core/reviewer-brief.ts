@@ -7,7 +7,6 @@
  * smuggled into the reviewer context.
  */
 
-import type { FreshReviewDecision } from './gate.ts';
 import {
   MAX_ARTIFACT_REVISION_LENGTH,
   validateEvidenceBundle,
@@ -108,7 +107,6 @@ const INPUT_FIELDS = ['spec', 'artifactRevision', 'diff', 'evidence'] as const;
 const SPEC_FIELDS = ['objective', 'acceptance_criteria', 'files_in_scope'] as const;
 const DIFF_FIELDS = ['artifactRevision', 'patch'] as const;
 const REVIEW_VERDICT_FIELDS = ['outcome', 'reasons', 'artifactRevision'] as const;
-const REVIEW_REQUIRED_FIELDS = ['required', 'reason'] as const;
 const ARRAY_METHOD_FIELDS = ['map', 'forEach', 'every', 'filter'] as const;
 
 function unknownFields(value: Record<string, unknown>, allowed: readonly string[]): readonly string[] {
@@ -280,17 +278,6 @@ export function validateReviewVerdict(input: unknown): ReviewVerdict {
   });
 }
 
-function normalizeReviewRequired(input: boolean | FreshReviewDecision): boolean {
-  if (typeof input === 'boolean') return input;
-  const root = requirePlainObject(input, 'reviewRequired', 'INVALID_FINAL_DECISION');
-  if (!hasExactFields(root, REVIEW_REQUIRED_FIELDS)) {
-    fail('INVALID_FINAL_DECISION', 'reviewRequired', `reviewRequired has unknown field(s): ${truncateForMessage(unknownFields(root, REVIEW_REQUIRED_FIELDS).join(', '))}`, REVIEW_REQUIRED_FIELDS);
-  }
-  if (typeof ownValue(root, 'required') !== 'boolean') fail('INVALID_FINAL_DECISION', 'reviewRequired.required', 'reviewRequired.required must be boolean', ['true', 'false']);
-  if (typeof ownValue(root, 'reason') !== 'string' || asNonEmptyString(ownValue(root, 'reason')) === undefined) fail('INVALID_FINAL_DECISION', 'reviewRequired.reason', 'reviewRequired.reason must be a non-empty string');
-  return ownValue(root, 'required') as boolean;
-}
-
 /**
  * Combine mechanical verification with the S4 fresh-review gate.
  * A rejected mechanical verdict always rejects. A passed verdict waits for a
@@ -299,7 +286,7 @@ function normalizeReviewRequired(input: boolean | FreshReviewDecision): boolean 
 export function decideFinalVerdict(
   verification: unknown,
   review?: unknown,
-  reviewRequired: boolean | FreshReviewDecision = false,
+  reviewRequired = false,
 ): 'passed' | 'rejected' | 'needs_review' {
   let mechanical: VerificationVerdict;
   try {
@@ -309,7 +296,6 @@ export function decideFinalVerdict(
     const detail = error instanceof Error ? error.message : 'verification verdict is invalid';
     fail('INVALID_FINAL_DECISION', 'verification', truncateForMessage(detail));
   }
-  const requiresReview = normalizeReviewRequired(reviewRequired);
   const normalizedReview = review === undefined ? undefined : validateReviewVerdict(review);
   if (mechanical.verdict === 'rejected') return 'rejected';
   if (normalizedReview !== undefined) {
@@ -318,16 +304,5 @@ export function decideFinalVerdict(
     }
     return normalizedReview.outcome === 'rejected' ? 'rejected' : 'passed';
   }
-  return requiresReview ? 'needs_review' : 'passed';
-}
-
-/**
- * Runtime-checked S2 bridge: only the state-machine verdict vocabulary crosses
- * this boundary; review reasons and prose never become lifecycle state.
- */
-export function s2VerdictInput(finalVerdict: unknown): 'passed' | 'rejected' {
-  if (finalVerdict !== 'passed' && finalVerdict !== 'rejected') {
-    fail('INVALID_FINAL_DECISION', 'finalVerdict', 'finalVerdict must be passed or rejected', ['passed', 'rejected']);
-  }
-  return finalVerdict;
+  return reviewRequired ? 'needs_review' : 'passed';
 }

@@ -4,7 +4,7 @@ import { deepFreeze, hasExactFields, isPlainObject, ownValue, truncateForMessage
 import { MAX_ARTIFACT_REVISION_LENGTH } from '../core/verification.ts';
 import { MAX_ATTEMPT_ID_LENGTH } from '../core/verification.ts';
 import { MAX_TASK_ID_LENGTH } from '../core/task-contract.ts';
-import { validateChangedPaths } from './scoped-context.ts';
+import { validateChangedPaths } from '../core/scope.ts';
 
 export const WORKTREE_MARKER_PREFIX = 'agent-orchestrator:s8:';
 export const MAX_WORKTREE_TOKEN_LENGTH = 128;
