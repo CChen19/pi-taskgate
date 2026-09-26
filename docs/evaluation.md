@@ -151,6 +151,16 @@ G1 as registered counts the reviewer's prompts. It does not check what the one p
 - New secondary metric, **brief fidelity**: for each review, whether the reviewer's context held the issued brief exactly. It is measured from the session files for every B0 and B1 review, as for round 1 above. For A there is no issued brief, so it is not applicable.
 - The G1 decision rule now also requires every B1 verdict that is accepted to have full brief fidelity.
 
+### Amendment 2 (2026-09-26, before any round-2 trial): master model
+
+The experimenter changed the model assignment. The master uses **`openai-codex/gpt-6-sol`** (thinking `high`), and workers and reviewers use **`zai/glm-5.3-flash`**. This applies to every arm and every cell, and replaces "`zai/glm-5.3-flash` for master, workers and reviewers" under [Model and environment](#model-and-environment).
+
+**Consequences:**
+- Arms stay comparable, because every arm uses the same split.
+- Quota now comes from two plans (codex and z.ai). A group is started only if both can finish it.
+- Cost is reported per role (master vs. children), because the two models are priced very differently.
+- A trial in which any role ran on another model is excluded and reported separately, as before.
+
 ## Question
 
 Given the same Pier setup, models, repository and task specs, do the deterministic task tools:
