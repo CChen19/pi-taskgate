@@ -21,6 +21,8 @@ export interface WorkerLedgerRow {
   readonly outcome: string | null;
   readonly createdAt: number;
   readonly revivedFrom: string | null;
+  /** The subagent's own Pi session file, as recorded by Pier. */
+  readonly sessionFile: string | null;
 }
 
 export interface WorkerLedger {
@@ -62,6 +64,7 @@ function coerceRow(value: unknown): WorkerLedgerRow | undefined {
     outcome: typeof row.outcome === 'string' ? row.outcome : null,
     createdAt: row.createdAt,
     revivedFrom: typeof row.revivedFrom === 'string' && row.revivedFrom.length > 0 ? row.revivedFrom : null,
+    sessionFile: typeof row.sessionFile === 'string' && row.sessionFile.length > 0 ? row.sessionFile : null,
   });
 }
 

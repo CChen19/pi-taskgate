@@ -54,6 +54,8 @@ export interface TaskServicePorts {
   randomId?(): string;
   /** Why a subagent could not run in this worktree cwd (e.g. Pier pipe path too long), or undefined. */
   checkWorkerCwd?(workspacePath: string): string | undefined;
+  /** User messages in a subagent's own Pi session file; throws when it cannot be read. */
+  sessionUserMessages(sessionFile: string): readonly string[];
 }
 
 export type ServiceErrorCode =
@@ -71,6 +73,7 @@ export type ServiceErrorCode =
   | 'ROLE_NOT_READ_ONLY'
   | 'REVIEW_NOT_REQUESTED'
   | 'REVIEWER_INVALID'
+  | 'REVIEWER_NOT_INDEPENDENT'
   | 'REVIEW_UNPARSEABLE'
   | 'REVISION_MISMATCH'
   | 'STATE_REJECTED'
@@ -520,6 +523,7 @@ export class TaskService {
     if (row.kind !== this.settings.reviewerRole) fail('REVIEWER_INVALID', `${agentId} ran role "${row.kind}", not the read-only reviewer role "${this.settings.reviewerRole}"`);
     if (row.revivedFrom !== null) fail('REVIEWER_INVALID', `${agentId} is a revived session, not a fresh reviewer`);
     if (row.createdAt < review.issuedAt) fail('REVIEWER_INVALID', `${agentId} was launched before review ${review.reviewId} was issued`);
+    this.requireBriefOnly(agentId, row.sessionFile, review.reviewId);
     if (row.outcome === null || row.outcome.trim().length === 0) fail('REVIEW_UNPARSEABLE', `reviewer ${agentId} has no closing output in the ledger`);
     const parsed = parseReviewerOutcome(row.outcome, review.reviewId);
     if (!parsed.ok) fail('REVIEW_UNPARSEABLE', `${parsed.reason}; a settled reviewer cannot be re-asked (subagent send revives it, and revived sessions are not fresh). Call task_review_brief again and spawn a new reviewer, or task_abandon the attempt if the reviewer's findings already warrant a retry`);
@@ -685,6 +689,21 @@ export class TaskService {
   }
 
   /** Re-read the input's review from Pier's ledger: fresh, read-only, passed, bound to the revision. */
+  /**
+   * A fresh review is one prompt: the brief. Anything the main agent sent the
+   * running reviewer afterwards (Pier records no revive for that) lands in the
+   * reviewer's own session as another user message and makes the verdict
+   * non-independent.
+   */
+  private requireBriefOnly(agentId: string, sessionFile: string | null, reviewId: string): void {
+    if (sessionFile === null) fail('REVIEWER_NOT_INDEPENDENT', `Pier's ledger has no session file for reviewer ${agentId}, so what it was told cannot be checked`);
+    let messages: readonly string[];
+    try { messages = this.ports.sessionUserMessages(sessionFile); } catch (error) { fail('REVIEWER_NOT_INDEPENDENT', `cannot read reviewer ${agentId}'s session ${sessionFile}: ${message(error)}`); }
+    const retry = 'Call task_review_brief again and spawn a new reviewer, and do not message it while it runs';
+    if (messages.length !== 1) fail('REVIEWER_NOT_INDEPENDENT', `reviewer ${agentId} received ${messages.length} prompts; a fresh review receives only the brief, so messages sent to it while it ran make its verdict non-independent. ${retry}`);
+    if (!messages[0]!.includes(reviewId)) fail('REVIEWER_NOT_INDEPENDENT', `reviewer ${agentId}'s prompt does not carry review id ${reviewId}, so it is not this review's brief. ${retry}`);
+  }
+
   private confirmReview(candidate: AcceptedCandidate): void {
     const row = this.ports.ledger.latest(candidate.workspacePath, candidate.reviewerAgentId);
     const label = `${candidate.taskId}@${candidate.revision}`;

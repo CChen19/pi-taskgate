@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { checkArtifact, findAddedAsserts, isTestSource } from '../src/adapters/artifact-check.ts';
+import { readSessionUserMessages } from '../src/host/pi-session.ts';
 import { PierHistoryLedger, pierPipePath, pierPipeProblem, pierSessionDirName, pierSessionDirNameLegacy } from '../src/host/pier-ledger.ts';
 import { WorktreeManager } from '../src/adapters/worktree-manager.ts';
 import { GitCleanRoom } from '../src/host/clean-room.ts';
@@ -134,11 +135,12 @@ describe('Pier ledger reader', () => {
       const dir = join(root, pierSessionDirName(cwd));
       mkdirSync(dir, { recursive: true });
       const row = (status: string, extra: Record<string, unknown> = {}) => JSON.stringify({ taskId: 'x', kind: 'worker-a', paneId: 'w1:p1', cwd, status, createdAt: 5, launchCommand: [], ...extra });
-      writeFileSync(join(dir, 'history.jsonl'), [row('running'), 'not json', row('settled', { outcome: 'done' }), JSON.stringify({ taskId: 'y', paneId: 'w1:p1', cwd: '/elsewhere', status: 'running', createdAt: 9 })].join('\n'));
+      writeFileSync(join(dir, 'history.jsonl'), [row('running'), 'not json', row('settled', { outcome: 'done', sessionFile: '/s/r.jsonl' }), JSON.stringify({ taskId: 'y', paneId: 'w1:p1', cwd: '/elsewhere', status: 'running', createdAt: 9 })].join('\n'));
       const ledger = new PierHistoryLedger({ roots: [root] });
       const latest = ledger.latest(cwd, 'w1:p1');
       assert.equal(latest?.status, 'settled');
       assert.equal(latest?.outcome, 'done');
+      assert.equal(latest?.sessionFile, '/s/r.jsonl');
       assert.equal(ledger.latest(cwd, 'w1:p2'), undefined);
       assert.equal(ledger.latest('/other', 'w1:p1'), undefined);
 
@@ -146,6 +148,34 @@ describe('Pier ledger reader', () => {
       mkdirSync(join(root, pierSessionDirNameLegacy(legacyCwd)), { recursive: true });
       writeFileSync(join(root, pierSessionDirNameLegacy(legacyCwd), 'history.jsonl'), JSON.stringify({ taskId: 'z', paneId: 'w1:p3', cwd: legacyCwd, status: 'consumed', createdAt: 1, revivedFrom: 'w1:p0' }));
       assert.equal(ledger.latest(legacyCwd, 'w1:p3')?.revivedFrom, 'w1:p0');
+      assert.equal(ledger.latest(legacyCwd, 'w1:p3')?.sessionFile, null);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Pi session reader', () => {
+  it('returns every user message in file order and fails on anything it cannot read', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ao-session-'));
+    try {
+      const file = join(root, 's.jsonl');
+      const entry = (type: string, extra: Record<string, unknown>) => JSON.stringify({ type, id: String(Math.random()), ...extra });
+      writeFileSync(file, [
+        JSON.stringify({ type: 'session', id: 's' }),
+        entry('custom', { customType: 'pi-herdr.role-manifest', data: {} }),
+        entry('message', { message: { role: 'user', content: 'brief REVIEW_VERDICT abc' } }),
+        entry('custom_message', { customType: 'pi-herdr.todo-read', content: 'Your todo list is empty.' }),
+        entry('message', { message: { role: 'assistant', content: [{ type: 'text', text: 'reading' }] } }),
+        entry('message', { message: { role: 'toolResult', content: [{ type: 'text', text: 'file' }] } }),
+        '{ broken',
+        entry('message', { message: { role: 'user', content: [{ type: 'text', text: 'Please settle ' }, { type: 'image', data: 'x' }, { type: 'text', text: 'now.' }] } }),
+        '',
+      ].join('\n'));
+      assert.deepEqual(readSessionUserMessages(file), ['brief REVIEW_VERDICT abc', 'Please settle now.']);
+      assert.throws(() => readSessionUserMessages('relative/s.jsonl'), /absolute/);
+      assert.throws(() => readSessionUserMessages(join(root, 's.json')), /\.jsonl/);
+      assert.throws(() => readSessionUserMessages(join(root, 'missing.jsonl')), /ENOENT/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

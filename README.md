@@ -40,7 +40,7 @@ Fail-closed 守卫的完整列表、状态机和 session 恢复见 [docs/archite
 | `task_bind` | 通过 Pier ledger 确认该 agent 确实在该 worktree 中启动 |
 | `task_verify` | 要求 worker 在 Pier ledger 中已不是 running；host 检查 HEAD、changed paths、clean、commits ahead、scope，然后在**该 revision 的全新临时 checkout**（`<workspaceRoot>/.verify/`，只由 git 对象生成，事后删除）中跑 allowlist 命令，worker worktree 里被 ignore 的构建产物不会被复用；并拒绝测试代码中**新增**的 `assert(`（Release/`-DNDEBUG` 会把它编译掉；只检查新增行，忽略注释、字符串和 `static_assert`）；失败只记一次 check（attempt 不消耗，超过 `maxChecksPerAttempt` 才判 attempt 失败），通过则 settle 为 candidate（不需要 review 时直接 PASSED） |
 | `task_review_brief` | 先确认 reviewer role 对所有写/执行类工具显式 deny，且 candidate 仍是 HEAD 且干净；生成绑定 revision + 一次性 review id 的 brief |
-| `task_review_record` | 从 **Pier ledger** 读取 reviewer 的收尾输出（不采信主 agent 转述）；要求 reviewer ≠ implementer、role 正确、非 revived、在 brief 之后启动、review id 与 revision 都匹配、worktree 未变，然后 PASSED 或 RETRYING/FAILED |
+| `task_review_record` | 从 **Pier ledger** 读取 reviewer 的收尾输出（不采信主 agent 转述）；要求 reviewer ≠ implementer、role 正确、非 revived、在 brief 之后启动、review id 与 revision 都匹配、worktree 未变，然后 PASSED 或 RETRYING/FAILED。**G1（2026-09-26）：** 还会读取 reviewer 自己的 Pi session 文件（ledger 行的 `sessionFile`），要求其中恰好一条 user 消息且带本次 review id；主 agent 在 reviewer 运行中 `subagent send` 的任何消息都会多出一条 user 消息，返回 `REVIEWER_NOT_INDEPENDENT`；session 文件缺失或读不了同样拒绝。回放第一轮真实数据：拒绝 mb1 与 i8b 的 4 条被催促/代答的 verdict，其余 14 条不受影响 |
 | `task_integrate` | P1：把精确的已验收 candidate revision（PASSED + clean-room 验证 + fresh review，并在 Pier ledger 里复核 reviewer verdict）按给定顺序 cherry-pick（`-x`）到基于**精确 base revision** 的新集成 worktree/分支；candidate 可以建在 base 上，也可以叠在更早的输入之上（如前置的 wiring 任务），只 pick 它自己的 commit；跨会话的 candidate 需要提供其 Pi session 文件作为证据（沿当前分支回放）。冲突即 abort、记录冲突文件并 FAILED，绝不自动解决。成功后集成任务走与普通任务相同的 `task_verify`（额外校验：集成历史与声明的源 commit 逐个 patch-id 相同且带 `-x` 来源）→ fresh reviewer → `task_review_record` |
 | `task_abandon` | 主 agent 放弃当前 attempt（受 retry 预算约束）或取消任务（依赖方变 BLOCKED） |
 
@@ -79,7 +79,8 @@ pi -e /path/to/pier/packages/pier-ext/src/index.ts -e /path/to/pi-taskgate/src/p
 ### 已知限制
 
 - 真机运行只有 2026-09-22 的五轮（TinyWebServer，deepseek-flash 与 kimi-for-coding），不是对照实验；离线测试覆盖真实 git worktree、真实 allowlist 进程、fake Pier ledger。
-- reviewer 没有 shell，需要命令结果时可能通过 `ask_user_question` 问人；这种回答不是 host 证据（见 field report）。
+- reviewer 没有 shell，需要命令结果时可能通过 `ask_user_question` 问人；这种回答不是 host 证据（见 field report）。它以 tool result 的形式进入 reviewer session，不是 user 消息，所以 G1 检查不拦它。
+- G1 只检查 reviewer 收到几条 prompt，不检查那条 prompt 是否就是签发的 brief：brief 由主 agent 作为 `subagent` 参数转写，第一轮 19 个 reviewer 收到的文本全都与签发版本不同（多数只差空白或 diff 行格式，个别被删掉整段 diff 或加了备注）。
 - `task_verify` 依赖 Pier ledger 的 `running` 状态判断 worker 是否结束；如果 `subagent send` 之后 Pier 没有写新的 running 行，过早 verify 可能看到半成品并记一次失败 check。
 - Pier 的 todo 自动对账会在 subagent settle 时勾掉描述匹配的 todo；task 状态只以 `task_status` 为准，建议 spawn description 用 `T1:impl` 这类不与 todo 重合的形式（工具返回的就是这种）。
 - integration 只做机械 cherry-pick，冲突时 fail closed，不提供冲突解决；worktree 和分支不自动清理；git 检查是同步调用，verification 命令是异步调用。
