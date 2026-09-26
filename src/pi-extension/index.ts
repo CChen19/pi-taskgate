@@ -363,14 +363,15 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
     tool({
       name: 'task_review_brief',
       label: 'Task Review Brief',
-      description: 'Issue a fresh-review brief for a VERIFYING task, bound to its exact candidate revision and a one-time review id. The host first checks the reviewer role is read-only and that the candidate is still HEAD and clean. Spawn a NEW reviewer with the returned role, cwd, and prompt (never reuse the implementer), then call task_review_record.',
+      description: 'Issue a fresh-review brief for a VERIFYING task, bound to its exact candidate revision and a one-time review id. The host first checks the reviewer role is read-only and that the candidate is still HEAD and clean, then writes the full brief (criteria, scope, verification evidence, patch) to a host-owned file. Spawn a NEW reviewer with the returned role, cwd, and short prompt copied verbatim (never reuse the implementer); the reviewer reads the brief file itself. task_review_record refuses reviewers whose prompt was edited, who were messaged while running, or who did not read the whole brief.',
       parameters: { type: 'object', properties: { task_id: TASK_ID_PARAM }, required: ['task_id'], additionalProperties: false },
     }, (svc, params) => {
       const result = svc.reviewBrief(taskId(params));
       if (result.outcome === 'rejected' || result.prompt === undefined || result.spawn === undefined) return text(`${result.taskId} → ${result.state}: candidate rejected: ${result.reasons.join('; ')}`, result);
       return text([
         `${result.taskId} review ${result.reviewId} for ${result.revision}`,
-        `Next: subagent spawn with role "${result.spawn.role}", description "${result.spawn.description}", cwd "${result.spawn.cwd}", run_in_background true, and exactly this prompt; after it settles call task_review_record ${result.taskId} with its agent id.`,
+        `brief file: ${result.briefPath ?? '-'} (the reviewer reads it; do not paste, summarize, or add to it)`,
+        `Next: subagent spawn with role "${result.spawn.role}", description "${result.spawn.description}", cwd "${result.spawn.cwd}", run_in_background true, and exactly this prompt, copied verbatim; do not message the reviewer while it runs. After it settles call task_review_record ${result.taskId} with its agent id.`,
         '',
         '--- reviewer prompt ---',
         result.prompt,

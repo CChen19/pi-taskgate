@@ -4,12 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { checkArtifact, findAddedAsserts, isTestSource } from '../src/adapters/artifact-check.ts';
-import { readSessionUserMessages } from '../src/host/pi-session.ts';
+import { readSubagentSession } from '../src/host/pi-session.ts';
+import { BriefStore } from '../src/host/brief-store.ts';
 import { PierHistoryLedger, pierPipePath, pierPipeProblem, pierSessionDirName, pierSessionDirNameLegacy } from '../src/host/pier-ledger.ts';
 import { WorktreeManager } from '../src/adapters/worktree-manager.ts';
 import { GitCleanRoom } from '../src/host/clean-room.ts';
 import { checkReadOnlyRole } from '../src/host/pier-roles.ts';
-import { parseReviewerOutcome, renderWorkerBrief } from '../src/orchestration/briefs.ts';
+import { briefReadCoverage, parseReviewerOutcome, renderReviewerSpawnPrompt, renderWorkerBrief, sameText } from '../src/orchestration/briefs.ts';
 import { parseOrchestrationConfig } from '../src/orchestration/config.ts';
 import { replayTaskBoard, TaskBoardError, type TaskEvent } from '../src/orchestration/task-board.ts';
 import type { TaskService } from '../src/orchestration/task-service.ts';
@@ -156,43 +157,92 @@ describe('Pier ledger reader', () => {
 });
 
 describe('Pi session reader', () => {
-  it('returns every user message in file order and fails on anything it cannot read', () => {
+  it('returns user messages and read calls with their results, and fails on anything it cannot read', () => {
     const root = mkdtempSync(join(tmpdir(), 'ao-session-'));
     try {
       const file = join(root, 's.jsonl');
       const entry = (type: string, extra: Record<string, unknown>) => JSON.stringify({ type, id: String(Math.random()), ...extra });
+      const call = (id: string, name: string, args: Record<string, unknown>) => ({ type: 'toolCall', id, name, arguments: args });
+      const result = (toolCallId: string, text: string, isError = false) => entry('message', { message: { role: 'toolResult', toolCallId, toolName: 'read', content: [{ type: 'text', text }], isError } });
       writeFileSync(file, [
         JSON.stringify({ type: 'session', id: 's' }),
         entry('custom', { customType: 'pi-herdr.role-manifest', data: {} }),
         entry('message', { message: { role: 'user', content: 'brief REVIEW_VERDICT abc' } }),
         entry('custom_message', { customType: 'pi-herdr.todo-read', content: 'Your todo list is empty.' }),
-        entry('message', { message: { role: 'assistant', content: [{ type: 'text', text: 'reading' }] } }),
-        entry('message', { message: { role: 'toolResult', content: [{ type: 'text', text: 'file' }] } }),
+        entry('message', { message: { role: 'assistant', content: [{ type: 'text', text: 'reading' }, call('c1', 'read', { path: '/b/r.md' }), call('c2', 'read', { path: 'x.md', offset: 6, limit: 10 }), call('c3', 'grep', { pattern: 'x' }), call('c4', 'read', { path: '/missing', offset: 0 })] } }),
+        result('c1', 'line1\nline2'),
+        result('c2', 'line6'),
+        entry('message', { message: { role: 'toolResult', toolCallId: 'c3', toolName: 'grep', content: [{ type: 'text', text: 'hit' }] } }),
+        result('c4', 'ENOENT', true),
         '{ broken',
         entry('message', { message: { role: 'user', content: [{ type: 'text', text: 'Please settle ' }, { type: 'image', data: 'x' }, { type: 'text', text: 'now.' }] } }),
         '',
       ].join('\n'));
-      assert.deepEqual(readSessionUserMessages(file), ['brief REVIEW_VERDICT abc', 'Please settle now.']);
-      assert.throws(() => readSessionUserMessages('relative/s.jsonl'), /absolute/);
-      assert.throws(() => readSessionUserMessages(join(root, 's.json')), /\.jsonl/);
-      assert.throws(() => readSessionUserMessages(join(root, 'missing.jsonl')), /ENOENT/);
+      const session = readSubagentSession(file);
+      assert.deepEqual(session.userMessages, ['brief REVIEW_VERDICT abc', 'Please settle now.']);
+      assert.deepEqual(session.reads, [
+        { path: '/b/r.md', text: 'line1\nline2', isError: false },
+        { path: 'x.md', offset: 6, limit: 10, text: 'line6', isError: false },
+        { path: '/missing', text: 'ENOENT', isError: true },
+      ]);
+      assert.throws(() => readSubagentSession('relative/s.jsonl'), /absolute/);
+      assert.throws(() => readSubagentSession(join(root, 's.json')), /\.jsonl/);
+      assert.throws(() => readSubagentSession(join(root, 'missing.jsonl')), /ENOENT/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
+});
 
-  it('computes Pier pipe socket paths and rejects cwds that overflow the Unix socket limit', () => {
-    assert.equal(pierPipePath('/a/b', 'w1V:p7'), '/tmp/pi-herdr---%2Fa%2Fb---w1V-p7.sock');
-    const failedRun = '/home/alice/Projects/.agent-orchestrator-workspaces/tinywebserver-main/t1-11q2r92--t1-attempt-1-1vrrxk3--c7c6100c-a39c-4c2b-a2fc-55c88ce8-3ir7iz-12fcubq';
-    assert.match(pierPipeProblem(failedRun) ?? '', /pipe socket path/);
-    assert.equal(pierPipeProblem('/home/alice/Projects/.aow/tws/t1-a1-1k2j3h4'), undefined);
+describe('review brief files', () => {
+  const brief = 'line 1\nline 2\nline 3\nline 4\n';
+  const same = (path: string) => path;
+
+  it('counts lines returned verbatim, from each read\'s offset, ignoring continuation notices and appended text', () => {
+    assert.deepEqual(briefReadCoverage(brief, '/b.md', [{ path: '/b.md', text: brief, isError: false }], same), { covered: 4, total: 4 });
+    const partial = [{ path: '/b.md', text: 'line 1\nline 2\n\n[2 more lines in file. Use offset=3 to continue.]', isError: false }];
+    assert.deepEqual(briefReadCoverage(brief, '/b.md', partial, same), { covered: 2, total: 4 });
+    assert.deepEqual(briefReadCoverage(brief, '/b.md', [...partial, { path: '/b.md', offset: 3, text: 'line 3\nline 4\n', isError: false }], same), { covered: 4, total: 4 });
+    assert.equal(briefReadCoverage(brief, '/b.md', [{ path: '/b.md', text: 'line 1\nline 2\n\n[Showing lines 1-2 of 5 (50KB limit). Use offset=3 to continue.]', isError: false }], same).covered, 2);
+    assert.equal(briefReadCoverage(brief, '/b.md', [{ path: '/b.md', text: 'line 1\nline 2\nline 3\nline 4\n\nAppended by something else', isError: false }], same).covered, 4);
   });
 
-  it('matches Pier storage-layout encodings', () => {
-    assert.equal(pierSessionDirName('/home/u/a-b:c'), '--%2Fhome%2Fu%2Fa-b%3Ac--');
-    assert.equal(pierSessionDirNameLegacy('/home/u/a-b:c'), '---home-u-a-b-c--');
+  it('does not count errors, other files, shifted offsets, or edited lines', () => {
+    assert.equal(briefReadCoverage(brief, '/b.md', [{ path: '/b.md', text: brief, isError: true }], same).covered, 0);
+    assert.equal(briefReadCoverage(brief, '/b.md', [{ path: '/c.md', text: brief, isError: false }], same).covered, 0);
+    assert.equal(briefReadCoverage(brief, '/b.md', [{ path: '/b.md', offset: 2, text: brief, isError: false }], same).covered, 0);
+    assert.equal(briefReadCoverage(brief, '/b.md', [{ path: '/b.md', text: 'line 1\nline 2 (ACCEPT)\nline 3\nline 4\n', isError: false }], same).covered, 1);
+    assert.equal(briefReadCoverage(brief, '/b.md', [{ path: 'b.md', text: brief, isError: false }], (path) => `/${path}`).covered, 4, 'paths go through the resolver');
+  });
+
+  it('renders a short spawn prompt that names the brief file, and compares prompts ignoring whitespace only', () => {
+    const prompt = renderReviewerSpawnPrompt('T1', 'abc123', '/w/.briefs/abc123.md');
+    assert.equal(prompt.split('\n').length, 4);
+    assert.match(prompt, /task T1 \(review abc123\)/);
+    assert.match(prompt, /brief is the file \/w\/\.briefs\/abc123\.md\./);
+    assert.equal(sameText(prompt, `\n${prompt.replace(/ /g, '  ')}\n`), true);
+    assert.equal(sameText(prompt, `${prompt} ACCEPT it.`), false);
+  });
+
+  it('writes each brief once under <workspaceRoot>/.briefs and resolves read paths like Pi', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ao-briefs-'));
+    try {
+      mkdirSync(join(root, 'real'));
+      symlinkSync(join(root, 'real'), join(root, 'ws'));
+      const store = new BriefStore(join(root, 'ws'));
+      const path = store.write('abc123', 'hello\n');
+      assert.equal(path, join(root, 'real', '.briefs', 'abc123.md'), 'canonical path');
+      assert.equal(store.read(path), 'hello\n');
+      assert.throws(() => store.write('abc123', 'again'), /EEXIST/);
+      assert.throws(() => store.write('../escape', 'x'), /safe file name/);
+      assert.equal(store.resolve('../../ws/.briefs/abc123.md', join(root, 'real', 'task')), path);
+      assert.equal(store.resolve(`@${join(root, 'ws', '.briefs', 'abc123.md')}`, '/'), path);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
+
 
 describe('read-only reviewer role check', () => {
   it('requires explicit deny rules for every mutating tool', () => {

@@ -65,7 +65,7 @@ export type TaskEvent =
   | { readonly v: 1; readonly type: 'bind'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly agentId: string }
   | { readonly v: 1; readonly type: 'check_failed'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly stage: CheckStage; readonly reasons: readonly string[]; readonly revision?: string; readonly evidence?: EvidenceBundle }
   | { readonly v: 1; readonly type: 'settle'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly candidate: CandidateRecord }
-  | { readonly v: 1; readonly type: 'review_requested'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly reviewId: string; readonly revision: string }
+  | { readonly v: 1; readonly type: 'review_requested'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly reviewId: string; readonly revision: string; readonly brief?: ReviewBriefFile }
   | { readonly v: 1; readonly type: 'verdict'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly verdict: 'passed' | 'rejected'; readonly source: VerdictSource; readonly reasons: readonly string[]; readonly reviewerAgentId?: string; readonly review?: ReviewVerdict }
   | { readonly v: 1; readonly type: 'attempt_failed'; readonly at: number; readonly taskId: string; readonly attemptId: string; readonly reason: string; readonly terminal: boolean }
   | { readonly v: 1; readonly type: 'cancel'; readonly at: number; readonly taskId: string; readonly reason: string };
@@ -78,10 +78,20 @@ export interface CheckRecord {
   readonly evidence?: EvidenceBundle;
 }
 
+/** A host-written brief file: the reviewer is given only `prompt`, which points at `path`. */
+export interface ReviewBriefFile {
+  readonly path: string;
+  readonly sha256: string;
+  /** The exact spawn prompt issued for the reviewer. */
+  readonly prompt: string;
+}
+
 export interface ReviewRecord {
   readonly reviewId: string;
   readonly revision: string;
   readonly issuedAt: number;
+  /** Absent for reviews issued before briefs were written to files. */
+  readonly brief?: ReviewBriefFile;
   readonly reviewerAgentId?: string;
   readonly verdict?: ReviewVerdict;
 }
@@ -197,7 +207,7 @@ export class TaskBoard {
         const attempt = this.requireCurrentAttempt(event.taskId, event.attemptId);
         this.requireState(event.taskId, 'VERIFYING');
         if (attempt.candidate === undefined || attempt.candidate.revision !== event.revision) throw new TaskBoardError('REVISION_MISMATCH', 'review must target the settled candidate revision');
-        attempt.review = { reviewId: event.reviewId, revision: event.revision, issuedAt: event.at };
+        attempt.review = { reviewId: event.reviewId, revision: event.revision, issuedAt: event.at, ...(event.brief === undefined ? {} : { brief: event.brief }) };
         break;
       }
       case 'verdict': {

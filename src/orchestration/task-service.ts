@@ -12,7 +12,7 @@
  * Every mutation is a TaskBoard event. An event is trial-applied to a replayed
  * board before it is persisted, so a refused operation leaves state unchanged.
  */
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { checkArtifact, findAddedAsserts } from '../adapters/artifact-check.ts';
 import type { WorktreeManager, WorktreePort, WorkspaceLease, WorkspaceInspection, WorktreeSessionBinding } from '../adapters/worktree-manager.ts';
 import { assembleReviewerBrief, decideFinalVerdict } from '../core/reviewer-brief.ts';
@@ -23,9 +23,10 @@ import type { AsyncVerificationRunner } from '../host/process-verification-runne
 import type { CleanRoomCheckout, CleanRoomPort } from '../host/clean-room.ts';
 import type { GitHistoryPort } from '../host/git-history.ts';
 import type { WorkerLedger } from '../host/pier-ledger.ts';
+import type { SubagentSession } from '../host/pi-session.ts';
 import type { RoleCheck } from '../host/pier-roles.ts';
-import { parseReviewerOutcome, renderReviewerPrompt, renderWorkerBrief } from './briefs.ts';
-import { replayTaskBoard, TaskBoard, TaskBoardError, type AppliedCommit, type AttemptRecord, type CandidateRecord, type CheckStage, type IntegrationInput, type TaskEvent, type TaskView } from './task-board.ts';
+import { briefReadCoverage, parseReviewerOutcome, renderReviewerPrompt, renderReviewerSpawnPrompt, renderWorkerBrief, sameText } from './briefs.ts';
+import { replayTaskBoard, TaskBoard, TaskBoardError, type AppliedCommit, type AttemptRecord, type CandidateRecord, type CheckStage, type IntegrationInput, type ReviewBriefFile, type TaskEvent, type TaskView } from './task-board.ts';
 
 export interface TaskServiceSettings {
   readonly verificationAllowlist: readonly string[];
@@ -54,8 +55,16 @@ export interface TaskServicePorts {
   randomId?(): string;
   /** Why a subagent could not run in this worktree cwd (e.g. Pier pipe path too long), or undefined. */
   checkWorkerCwd?(workspacePath: string): string | undefined;
-  /** User messages in a subagent's own Pi session file; throws when it cannot be read. */
-  sessionUserMessages(sessionFile: string): readonly string[];
+  /** A subagent's own Pi session file (prompts it received, files it read); throws when it cannot be read. */
+  readSubagentSession(sessionFile: string): SubagentSession;
+  /** Host-owned review brief files, outside every worktree. */
+  readonly briefs: {
+    /** Write the brief for `reviewId`; returns its canonical absolute path. */
+    write(reviewId: string, text: string): string;
+    read(path: string): string;
+    /** Resolve a path argument a subagent in `cwd` passed to its read tool. */
+    resolve(path: string, cwd: string): string;
+  };
 }
 
 export type ServiceErrorCode =
@@ -74,6 +83,8 @@ export type ServiceErrorCode =
   | 'REVIEW_NOT_REQUESTED'
   | 'REVIEWER_INVALID'
   | 'REVIEWER_NOT_INDEPENDENT'
+  | 'BRIEF_CHANGED'
+  | 'BRIEF_NOT_READ'
   | 'REVIEW_UNPARSEABLE'
   | 'REVISION_MISMATCH'
   | 'STATE_REJECTED'
@@ -144,7 +155,9 @@ export interface ReviewBriefResult {
   readonly state: string;
   readonly reviewId?: string;
   readonly revision?: string;
+  /** The spawn prompt to pass verbatim; it points the reviewer at `briefPath`. */
   readonly prompt?: string;
+  readonly briefPath?: string;
   readonly spawn?: SpawnHint;
   readonly reasons: readonly string[];
 }
@@ -493,14 +506,20 @@ export class TaskService {
     }
     const brief = assembleReviewerBrief({ spec: { objective: task.contract.objective, acceptance_criteria: task.contract.acceptance_criteria, files_in_scope: task.contract.files_in_scope ?? [] }, artifactRevision: candidate.revision, diff, evidence: candidate.evidence });
     const reviewId = this.ports.randomId?.() ?? randomBytes(8).toString('hex');
-    this.commit({ v: 1, type: 'review_requested', at: this.ports.clock(), taskId, attemptId: attempt.attemptId, reviewId, revision: candidate.revision });
+    const text = `${renderReviewerPrompt(brief, reviewId, taskId, this.integrationBriefLines(task, attempt))}\n`;
+    let path: string;
+    try { path = this.ports.briefs.write(reviewId, text); } catch (error) { fail('INSPECTION_FAILED', `could not write the review brief: ${message(error)}`); }
+    const prompt = renderReviewerSpawnPrompt(taskId, reviewId, path);
+    const sha256 = createHash('sha256').update(text).digest('hex');
+    this.commit({ v: 1, type: 'review_requested', at: this.ports.clock(), taskId, attemptId: attempt.attemptId, reviewId, revision: candidate.revision, brief: { path, sha256, prompt } });
     return {
       taskId,
       outcome: 'review_requested',
       state: this.task(taskId).state,
       reviewId,
       revision: candidate.revision,
-      prompt: renderReviewerPrompt(brief, reviewId, taskId, this.integrationBriefLines(task, attempt)),
+      prompt,
+      briefPath: path,
       spawn: { description: `${taskId}:review`, cwd: lease.workspacePath, role: this.settings.reviewerRole, run_in_background: true },
       reasons: [],
     };
@@ -523,7 +542,7 @@ export class TaskService {
     if (row.kind !== this.settings.reviewerRole) fail('REVIEWER_INVALID', `${agentId} ran role "${row.kind}", not the read-only reviewer role "${this.settings.reviewerRole}"`);
     if (row.revivedFrom !== null) fail('REVIEWER_INVALID', `${agentId} is a revived session, not a fresh reviewer`);
     if (row.createdAt < review.issuedAt) fail('REVIEWER_INVALID', `${agentId} was launched before review ${review.reviewId} was issued`);
-    this.requireBriefOnly(agentId, row.sessionFile, review.reviewId);
+    this.requireFreshBriefing(agentId, row.sessionFile, row.cwd, review);
     if (row.outcome === null || row.outcome.trim().length === 0) fail('REVIEW_UNPARSEABLE', `reviewer ${agentId} has no closing output in the ledger`);
     const parsed = parseReviewerOutcome(row.outcome, review.reviewId);
     if (!parsed.ok) fail('REVIEW_UNPARSEABLE', `${parsed.reason}; a settled reviewer cannot be re-asked (subagent send revives it, and revived sessions are not fresh). Call task_review_brief again and spawn a new reviewer, or task_abandon the attempt if the reviewer's findings already warrant a retry`);
@@ -690,18 +709,32 @@ export class TaskService {
 
   /** Re-read the input's review from Pier's ledger: fresh, read-only, passed, bound to the revision. */
   /**
-   * A fresh review is one prompt: the brief. Anything the main agent sent the
-   * running reviewer afterwards (Pier records no revive for that) lands in the
-   * reviewer's own session as another user message and makes the verdict
-   * non-independent.
+   * A fresh review is one prompt and one brief, both as issued. Anything the
+   * main agent sent the running reviewer afterwards (Pier records no revive for
+   * that) lands in the reviewer's own session as another user message. The
+   * prompt must be the issued spawn prompt, and the reviewer's own read calls
+   * must have returned every line of the unchanged host-written brief, so the
+   * main agent cannot trim, summarize, or add to what the reviewer judged.
+   * Reviews issued before briefs were files only need the review id.
    */
-  private requireBriefOnly(agentId: string, sessionFile: string | null, reviewId: string): void {
+  private requireFreshBriefing(agentId: string, sessionFile: string | null, cwd: string, review: { readonly reviewId: string; readonly brief?: ReviewBriefFile }): void {
+    const retry = 'Call task_review_brief again and spawn a new reviewer with exactly the returned prompt, and do not message it while it runs';
     if (sessionFile === null) fail('REVIEWER_NOT_INDEPENDENT', `Pier's ledger has no session file for reviewer ${agentId}, so what it was told cannot be checked`);
-    let messages: readonly string[];
-    try { messages = this.ports.sessionUserMessages(sessionFile); } catch (error) { fail('REVIEWER_NOT_INDEPENDENT', `cannot read reviewer ${agentId}'s session ${sessionFile}: ${message(error)}`); }
-    const retry = 'Call task_review_brief again and spawn a new reviewer, and do not message it while it runs';
-    if (messages.length !== 1) fail('REVIEWER_NOT_INDEPENDENT', `reviewer ${agentId} received ${messages.length} prompts; a fresh review receives only the brief, so messages sent to it while it ran make its verdict non-independent. ${retry}`);
-    if (!messages[0]!.includes(reviewId)) fail('REVIEWER_NOT_INDEPENDENT', `reviewer ${agentId}'s prompt does not carry review id ${reviewId}, so it is not this review's brief. ${retry}`);
+    let session: SubagentSession;
+    try { session = this.ports.readSubagentSession(sessionFile); } catch (error) { fail('REVIEWER_NOT_INDEPENDENT', `cannot read reviewer ${agentId}'s session ${sessionFile}: ${message(error)}`); }
+    const prompts = session.userMessages;
+    if (prompts.length !== 1) fail('REVIEWER_NOT_INDEPENDENT', `reviewer ${agentId} received ${prompts.length} prompts; a fresh review receives only the issued prompt, so messages sent to it while it ran make its verdict non-independent. ${retry}`);
+    const brief = review.brief;
+    if (brief === undefined) {
+      if (!prompts[0]!.includes(review.reviewId)) fail('REVIEWER_NOT_INDEPENDENT', `reviewer ${agentId}'s prompt does not carry review id ${review.reviewId}, so it is not this review's brief. ${retry}`);
+      return;
+    }
+    if (!sameText(prompts[0]!, brief.prompt)) fail('REVIEWER_NOT_INDEPENDENT', `reviewer ${agentId} was not spawned with the issued prompt for review ${review.reviewId} (it was edited, shortened, or extended). ${retry}`);
+    let text: string;
+    try { text = this.ports.briefs.read(brief.path); } catch (error) { fail('BRIEF_CHANGED', `review brief ${brief.path} cannot be read: ${message(error)}`); }
+    if (createHash('sha256').update(text).digest('hex') !== brief.sha256) fail('BRIEF_CHANGED', `review brief ${brief.path} changed after it was issued. ${retry}`);
+    const coverage = briefReadCoverage(text, brief.path, session.reads, (path) => this.ports.briefs.resolve(path, cwd));
+    if (coverage.covered < coverage.total) fail('BRIEF_NOT_READ', `reviewer ${agentId} read ${coverage.covered} of the ${coverage.total} lines of its brief ${brief.path} as issued, so its verdict does not rest on the whole brief. ${retry}`);
   }
 
   private confirmReview(candidate: AcceptedCandidate): void {

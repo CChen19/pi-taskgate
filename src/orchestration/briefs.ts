@@ -118,3 +118,54 @@ export function parseReviewerOutcome(text: string, reviewId: string): ParsedRevi
     return { ok: false, reason: error instanceof Error ? error.message : 'verdict is invalid' };
   }
 }
+
+/**
+ * The only text the main agent passes to a reviewer. It is short enough to be
+ * copied verbatim; the brief itself is a host-written file the reviewer reads,
+ * so the main agent cannot trim, summarize, or add to it.
+ */
+export function renderReviewerSpawnPrompt(taskId: string, reviewId: string, briefPath: string): string {
+  return [
+    `You are a fresh, independent reviewer for task ${taskId} (review ${reviewId}). You did not write this change and must not modify any file.`,
+    `Your complete review brief is the file ${briefPath}.`,
+    'Before anything else, read the whole file with the read tool; if the output says more lines remain, keep reading from the offset it gives until the end.',
+    'Then follow the brief exactly, including its final REVIEW_VERDICT line.',
+  ].join('\n');
+}
+
+/** Whitespace-insensitive comparison of an issued prompt with what a subagent received. */
+export function sameText(a: string, b: string): boolean {
+  return a.replace(/\s+/g, ' ').trim() === b.replace(/\s+/g, ' ').trim();
+}
+
+export interface BriefRead {
+  readonly path: string;
+  readonly offset?: number;
+  readonly text: string;
+  readonly isError: boolean;
+}
+
+/** Pi's read tool appends a continuation notice after the content when it stops early. */
+const READ_NOTICE = /\n\n\[(?:Showing lines \d+-\d+ of \d+|\d+ more lines in file)[^\n]*\]$/;
+
+/**
+ * How many lines of `brief` (stored at `briefPath`) the reviewer's successful
+ * reads returned verbatim. Pi's read returns the file split on "\n" from line
+ * `offset` (1-based), so each result is matched line by line from its offset;
+ * matching stops at the first differing line, so appended text cannot count.
+ */
+export function briefReadCoverage(brief: string, briefPath: string, reads: readonly BriefRead[], resolvePath: (path: string) => string): { readonly covered: number; readonly total: number } {
+  const lines = brief.split('\n');
+  const total = lines.length > 1 && lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+  const covered = new Set<number>();
+  for (const read of reads) {
+    if (read.isError || resolvePath(read.path) !== briefPath) continue;
+    const start = (read.offset ?? 1) - 1;
+    const returned = read.text.replace(READ_NOTICE, '').split('\n');
+    for (let i = 0; i < returned.length && start + i < total; i++) {
+      if (returned[i] !== lines[start + i]) break;
+      covered.add(start + i);
+    }
+  }
+  return { covered: covered.size, total };
+}

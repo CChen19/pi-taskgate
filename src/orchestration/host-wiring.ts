@@ -12,7 +12,8 @@ import { GitHistory } from '../host/git-history.ts';
 import { GitWorktreePort } from '../host/git-worktree-port.ts';
 import { join } from 'node:path';
 import { PierHistoryLedger, pierPipeProblem } from '../host/pier-ledger.ts';
-import { readSessionUserMessages } from '../host/pi-session.ts';
+import { readSubagentSession } from '../host/pi-session.ts';
+import { BriefStore } from '../host/brief-store.ts';
 import { checkReadOnlyRole, defaultPierRoleDirs } from '../host/pier-roles.ts';
 import { ProcessAsyncVerificationRunner } from '../host/process-verification-runner.ts';
 import type { OrchestrationConfig } from './config.ts';
@@ -60,7 +61,8 @@ export function createHostTaskService(options: HostWiringOptions): TaskService {
     clock: () => Date.now(),
     persist: options.persist,
     checkWorkerCwd: pierPipeProblem,
-    sessionUserMessages: readSessionUserMessages,
+    readSubagentSession,
+    briefs: new BriefStore(config.workspaceRoot),
   }, {
     verificationAllowlist: config.verificationAllowlist,
     verificationTimeoutMs: config.verificationTimeoutMs,
