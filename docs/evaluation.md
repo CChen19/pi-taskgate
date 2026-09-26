@@ -161,6 +161,52 @@ The experimenter changed the model assignment. The master uses **`openai-codex/g
 - Cost is reported per role (master vs. children), because the two models are priced very differently.
 - A trial in which any role ran on another model is excluded and reported separately, as before.
 
+### Amendment 3 (2026-09-26, after two uncounted dry runs, before the `v0.2-bench2` tag)
+
+Two uncounted dry runs were made on M2: `d1a` (A) and `d1b` (B1). Both passed the oracle. Both were hit by a network outage, and `d1b` more so (see [Provider outages](#provider-outages-void-rule)).
+
+A per-phase breakdown of the master sessions (`phases.py` in the bench kit) showed where the time and money went:
+- **Waiting accounts for most of the master's cost.** The `gpt-6-sol` master never ended its turn to wait. It polled with `sleep N` loops and repeated `subagent output` calls: 74% of master cost in A and 63% in B1. The master made 80 turns in A and 144 in B1. Round-1 Kimi masters on the same harness made 13–43.
+- **Pier had already delivered every settlement notice.** The polling was therefore redundant, and its cost grows with wall time in either arm.
+- **The task tools themselves were cheap.** The task-tool calls and clean-room verification cost little: verification took 1.6 min of tool time, and review calls came to 14% of master cost.
+
+Once the outage and the empty-`reasons` reviews below are removed, B1 took about 33 min against A's 16. The remaining gap is by design: G3 serializes the two tasks because they share `CMakeLists.txt`, and B1 reviews the integration as well.
+
+Changes, fixed before the tag:
+
+1. **No polling, in every arm.** The master prompt of every arm (A, B0, B1) gets the same sentence:
+
+   > While subagents run, end your turn and wait: Pier sends you a message when a subagent finishes, fails, closes, blocks on a question, or shows no progress for 10 minutes. Do not poll with sleep loops or repeated subagent output/list calls.
+
+   This is backed by Pier's own notices. A crashed subagent is covered: `d1b`'s integration reviewer died on provider timeouts and produced a notice. A hung subagent is covered by Pier's no-progress notice at 600 s (`PIER_SUBAGENT_TIMEOUT_MS` default), which does not depend on the arm. Polling turns that still happen are counted, not removed.
+
+2. **Empty `reasons`.** `glm-5.3-flash` reviewers twice passed a candidate with `"reasons": []`, which is `REVIEW_UNPARSEABLE`. The brief's closing instructions now say that `reasons` needs at least one concrete entry for `"passed"` as well. The validation is unchanged. Reviewers that B loses to `REVIEW_UNPARSEABLE` count as B overhead (time, cost, reviewer spawns), never as noise. A pays nothing for this because it does not parse verdicts, and that asymmetry is a cost of the constraint layer.
+
+3. **`sharedPaths` is set explicitly to `[]`.** This is the strictest setting: the human authorized no shared paths, which is what G3 means. Parallel tasks that register tests in the root `CMakeLists.txt` must therefore be ordered with `depends_on` or given separate files. The time this costs is part of what B1 measures. The alternative, `["CMakeLists.txt"]`, would run tasks in parallel but risk integration conflicts (round-1 F4). It is not run.
+
+4. **Timeouts are unchanged:** 60 min for M2 and single-task cells, 120 min for M6, for every arm. They are not raised to let B1 finish. A timeout means no delivery, and timeouts are reported per arm. Wall time remains an outcome, not a condition.
+
+<a id="provider-outages-void-rule"></a>
+5. **Provider outages (void rule).** For every session of a trial (master and children), outage time is computed from the session files:
+   - Each outage runs from an assistant message with `stopReason: "error"` to the next assistant message in that session that is not an error.
+   - If no such message follows, the outage runs to the session's last entry, or to the trial end if the session was still open then.
+   - Overlapping intervals from different sessions are merged, and the union is the trial's outage time.
+
+   A trial with more than 120 s of outage time is void. The rule is applied identically to all arms and computed by script, never by judgement. Void trials are reported per arm. A void trial is rerun once, and a rerun that is void again is recorded as invalid and not rerun, so a cell may end with fewer than 3 valid trials.
+
+   Because B1 runs longer, it is exposed to more outage time. The void count per arm is therefore reported next to the results, and the analysis states whether the surviving trials might be biased.
+
+6. **Only the operator may message a trial.** The `d1b` master session contains a user message that the operator did not send ("网络恢复", 20:37 UTC). The operator script is the only allowed sender. Any other user message in a trial session, found by the extractor, voids the trial.
+
+7. **Quota plan.** The dry-run pair used 14% of the codex 5-hour quota (A ≈ 6%, B1 ≈ 8%, outage included) and 3% of the z.ai 5-hour quota. Both quotas reset every 5 hours. Counted groups are scheduled per window, and a group starts only if both quotas can finish it.
+
+   Cells run in priority tiers:
+   - **Tier 1:** M6 (A, B0, B1), I6 (B0, B1), I7 (B0, B1). These answer the scale question and the fix question.
+   - **Tier 2:** M2 (A, B1), I2 (A, B1), I3′ (A, B1).
+   - **Tier 3:** I6 A, I7 A.
+
+   A tier starts only when the one before it is complete. The second dry-run pair (`d2a`, `d2b`) remeasures the quota per trial with polling removed. From that measurement, the tiers that fit by 2026-10-08 are fixed and recorded here before the tag. Tiers that do not fit are dropped in advance, not cut part-way through.
+
 ## Question
 
 Given the same Pier setup, models, repository and task specs, do the deterministic task tools:
