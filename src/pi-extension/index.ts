@@ -185,7 +185,7 @@ const STRING_ARRAY = { type: 'array', items: { type: 'string' } } as const;
 const WORKFLOW_GUIDELINES = [
   'Orchestration loop for multi-step coding work: plan tasks with task_plan, then repeatedly observe (task_status) → start ready tasks (task_start) → spawn each worker with Pier `subagent` using the returned prompt and cwd, run_in_background true → task_bind the returned agent id → on its settlement notice run task_verify → if a review is required, task_review_brief, spawn the reviewer with the returned role/cwd/prompt, then task_review_record → decide the next action.',
   'Small, single-file fixes that need no delegation do not need task tools or subagents; do them yourself and run the checks. Once a task is planned, git writes (commit, merge, cherry-pick, reset, ...) by you in the repository or task worktrees are blocked; the result to hand over is the DELIVERABLE revision in task_status.',
-  'Plan parallel tasks so they do not modify the same shared or coordination file (build files, registries, shared headers). Prefer per-task fragments; if shared wiring is needed first, make it a prerequisite task and start dependents with base_task.',
+  'Plan parallel tasks so they do not modify the same shared or coordination file (build files, registries, shared headers). Prefer per-task fragments; otherwise order them with depends_on: a task with one dependency is stacked on it automatically, so the two integrate without conflict (list the dependency first in task_integrate).',
   'A worker saying "done" is not acceptance. Only task_verify / task_review_record move a task toward PASSED. Never paraphrase a reviewer verdict; task_review_record reads it from Pier.',
   'When task_verify reports check_failed, send the worker the reasons with `subagent send` and verify again, or task_abandon the attempt. After a rejected review, task_start with reuse_worktree true continues on the same branch.',
 ];
@@ -305,13 +305,13 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
     tool({
       name: 'task_start',
       label: 'Task Start',
-      description: 'Start the next attempt of a READY (or RETRYING) task: the host creates a dedicated git worktree and branch from the main checkout HEAD (or from an accepted dependency with base_task), and returns the worker prompt plus the exact Pier `subagent` spawn arguments (cwd, description). Spawn the worker with those arguments, then call task_bind. reuse_worktree continues on the previous attempt\'s branch (e.g. after a rejected review).',
+      description: 'Start the next attempt of a READY (or RETRYING) task: the host creates a dedicated git worktree and branch and returns the worker prompt plus the exact Pier `subagent` spawn arguments (cwd, description). A task without dependencies starts from the main checkout HEAD; a task with one dependency is stacked on that dependency\'s accepted revision; a task with several dependencies needs base_task, and every dependency that changes the same files must already be in that base\'s stack. Integrate stacked tasks after the tasks they are stacked on. Spawn the worker with the returned arguments, then call task_bind. reuse_worktree continues on the previous attempt\'s branch (e.g. after a rejected review).',
       parameters: {
         type: 'object',
         properties: {
           task_id: TASK_ID_PARAM,
           reuse_worktree: { type: 'boolean', description: 'Continue on the previous attempt\'s worktree/branch' },
-          base_task: { type: 'string', description: 'Branch from this PASSED dependency\'s accepted revision instead of HEAD' },
+          base_task: { type: 'string', description: 'The PASSED dependency whose accepted revision the worktree starts from (required with several dependencies; defaults to the only dependency)' },
         },
         required: ['task_id'],
         additionalProperties: false,
@@ -322,7 +322,7 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
       if (result.prompt === undefined || result.spawn === undefined) return text(`${result.taskId} → ${result.state}: ${result.reason ?? 'not started'}`, result);
       return text([
         `${result.taskId} ${result.state} · ${result.attemptId}${result.reusedFrom === undefined ? '' : ` (continues ${result.reusedFrom})`}`,
-        `worktree ${result.workspacePath} · branch ${result.branch} · base ${result.baseRevision}`,
+        `worktree ${result.workspacePath} · branch ${result.branch} · base ${result.baseRevision}${result.stackedOn === undefined ? '' : ` (stacked on ${result.stackedOn}'s accepted revision; integrate ${result.stackedOn} before ${result.taskId})`}`,
         '',
         `Next: subagent spawn with description "${result.spawn.description}", cwd "${result.spawn.cwd}", run_in_background true, and exactly this prompt; then task_bind ${result.taskId} with the returned agent id.${result.reusedFrom === undefined ? '' : ' To keep the same worker, send it this prompt with `subagent send` instead of spawning.'}`,
         '',

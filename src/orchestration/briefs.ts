@@ -14,6 +14,8 @@ export interface WorkerBriefInput {
   readonly workspacePath: string;
   readonly branch: string;
   readonly baseRevision: string;
+  /** Accepted dependency this attempt is stacked on. */
+  readonly stackedOn?: string;
   readonly feedback?: readonly string[];
   readonly rejectTestAsserts?: boolean;
 }
@@ -25,6 +27,7 @@ export function renderWorkerBrief(input: WorkerBriefInput): string {
     '',
     `Working directory: ${input.workspacePath}`,
     `Branch: ${input.branch} (created from ${input.baseRevision})`,
+    ...(input.stackedOn === undefined ? [] : [`This branch starts from ${input.stackedOn}'s accepted revision: its changes are already here. Build on them; do not redo or revert them.`]),
     '',
     'Objective:',
     contract.objective,

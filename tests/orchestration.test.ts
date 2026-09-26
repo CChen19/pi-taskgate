@@ -413,6 +413,53 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
       assert.equal(resumed.task(result.taskId).attemptRecords[0]!.integration?.revision, result.integratedRevision);
     });
 
+    it('stacks a task on its only dependency, so ordered overlapping tasks integrate without conflict (dry run d2b)', async () => {
+      const svc = h.service();
+      const b = base();
+      svc.plan([
+        task('T1', { files_in_scope: ['README.md', 'src/a.txt'], verification: ['test -f README.md'] }),
+        task('T2', { depends_on: ['T1'], files_in_scope: ['README.md', 'src/b.txt'], verification: ['test -f README.md'] }),
+      ]);
+      const rev1 = await accept(h, svc, 'T1', { 'README.md': 'base\none\n', 'src/a.txt': 'a\n' });
+      const { started, verified, revision: rev2 } = await toCandidate(h, svc, 'T2', { 'README.md': 'base\none\ntwo\n', 'src/b.txt': 'b\n' });
+      assert.equal(started.baseRevision, rev1, 'no base_task needed with one dependency');
+      assert.equal(started.stackedOn, 'T1');
+      assert.match(started.prompt!, /starts from T1's accepted revision: its changes are already here/);
+      // Scope, commits ahead and the reviewer diff are measured from the stacked base: T1's src/a.txt is not T2's change.
+      assert.equal(verified.outcome, 'awaiting_review', verified.reasons.join('; '));
+      assert.deepEqual([...verified.changedPaths!].sort(), ['README.md', 'src/b.txt']);
+      const brief = svc.reviewBrief('T2');
+      assert.doesNotMatch(readFileSync(brief.briefPath!, 'utf8'), /src\/a\.txt/);
+      h.ledger.add({ paneId: 'r:T2', cwd: started.workspacePath!, kind: 'reviewer-readonly', status: 'settled', createdAt: h.now.value + 1, outcome: reviewerOutput(brief.reviewId!, 'passed', rev2) });
+      assert.equal(svc.recordReview('T2', 'r:T2').state, 'PASSED');
+
+      await assert.rejects(async () => svc.integrate({ baseRevision: b, revisions: [rev2, rev1] }), (error: unknown) => error instanceof TaskServiceError && error.code === 'NOT_ACCEPTED' && /list the candidate it is stacked on before it/.test(error.message));
+      const result = svc.integrate({ baseRevision: b, revisions: [rev1, rev2] });
+      assert.equal(result.conflict, undefined, 'the shared README.md no longer conflicts');
+      assert.equal(git(result.workspacePath, ['show', 'HEAD:README.md']), 'base\none\ntwo\n');
+      assert.equal((await svc.verify(result.taskId)).outcome, 'awaiting_review');
+    });
+
+    it('requires base_task with several dependencies, and a base whose stack holds every overlapping one', async () => {
+      const svc = h.service();
+      svc.plan([
+        task('T1', { files_in_scope: ['README.md'], verification: ['test -f README.md'] }),
+        task('T2', { depends_on: ['T1'], files_in_scope: ['README.md', 'src/b.txt'], verification: ['test -f README.md'] }),
+        task('T3', { files_in_scope: ['src/c.txt'], verification: ['test -f README.md'] }),
+        task('T4', { depends_on: ['T1', 'T2', 'T3'], files_in_scope: ['README.md'], verification: ['test -f README.md'] }),
+      ]);
+      await accept(h, svc, 'T1', { 'README.md': 'base\none\n' });
+      const rev2 = await accept(h, svc, 'T2', { 'README.md': 'base\none\ntwo\n', 'src/b.txt': 'b\n' });
+      await accept(h, svc, 'T3', { 'src/c.txt': 'c\n' });
+      const before = h.events.length;
+      assert.throws(() => svc.start('T4'), /depends on T1, T2, T3; give base_task/);
+      assert.throws(() => svc.start('T4', { baseTask: 'T1' }), /base_task T1 does not contain T2, which change the same files as T4/);
+      assert.throws(() => svc.start('T4', { baseTask: 'T3' }), /does not contain T1, T2/);
+      assert.equal(h.events.length, before, 'refused starts change nothing');
+      const started = svc.start('T4', { baseTask: 'T2' });
+      assert.equal(started.baseRevision, rev2, 'T2 is stacked on T1, so its stack holds both; T3 touches other files');
+    });
+
     it('delivers the only task\'s PASSED revision when nothing needs integrating', async () => {
       const svc = h.service();
       assert.deepEqual(svc.deliverable(), { reason: 'no tasks planned', notIncluded: [] });

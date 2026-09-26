@@ -122,6 +122,8 @@ export interface StartResult {
   readonly workspacePath?: string;
   readonly branch?: string;
   readonly baseRevision?: string;
+  /** The accepted task this attempt is stacked on (its changes are already in the worktree). */
+  readonly stackedOn?: string;
   readonly reusedFrom?: string;
   readonly prompt?: string;
   readonly spawn?: SpawnHint;
@@ -211,6 +213,11 @@ export interface IntegrateResult {
 
 const AGENT_ID = /^[A-Za-z0-9:._-]{1,128}$/;
 const FULL_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/** Scope paths overlap when equal or when one is a directory (trailing slash) containing the other. */
+function pathsOverlap(a: string, b: string): boolean {
+  return a === b || (a.endsWith('/') && b.startsWith(a)) || (b.endsWith('/') && a.startsWith(b));
+}
 const OUTPUT_TAIL = 2000;
 
 function tail(value: string | undefined): string {
@@ -379,6 +386,7 @@ export class TaskService {
     }
     this.leases.set(lease.ownershipToken, lease);
     const feedback = previous === undefined ? [] : this.feedbackFrom(previous);
+    const stackedOn = this.acceptedTaskAt(lease.baseRevision)?.id;
     return {
       taskId,
       state: this.task(taskId).state,
@@ -387,7 +395,8 @@ export class TaskService {
       branch: lease.branch,
       baseRevision: lease.baseRevision,
       ...(reusedFrom === undefined ? {} : { reusedFrom }),
-      prompt: renderWorkerBrief({ contract: task.contract, attemptId, workspacePath: lease.workspacePath, branch: lease.branch, baseRevision: lease.baseRevision, feedback, rejectTestAsserts: this.settings.rejectTestAsserts }),
+      ...(stackedOn === undefined ? {} : { stackedOn }),
+      prompt: renderWorkerBrief({ contract: task.contract, attemptId, workspacePath: lease.workspacePath, branch: lease.branch, baseRevision: lease.baseRevision, ...(stackedOn === undefined ? {} : { stackedOn }), feedback, rejectTestAsserts: this.settings.rejectTestAsserts }),
       spawn: { description: `${taskId}:impl`, cwd: lease.workspacePath, run_in_background: true },
     };
   }
@@ -617,7 +626,7 @@ export class TaskService {
       // A candidate is built on the integration base, or stacked on an earlier input (e.g. a
       // prerequisite wiring task); only its own base..revision commits are picked.
       const allowedBases = [base, ...inputs.map((input) => input.revision)];
-      if (!allowedBases.includes(candidate.baseRevision)) fail('NOT_ACCEPTED', `${candidate.taskId}@${candidate.revision} was built on ${candidate.baseRevision}, which is neither the integration base ${base} nor an earlier input`);
+      if (!allowedBases.includes(candidate.baseRevision)) fail('NOT_ACCEPTED', `${candidate.taskId}@${candidate.revision} was built on ${candidate.baseRevision}, which is neither the integration base ${base} nor an earlier input; list the candidate it is stacked on before it`);
       this.confirmReview(candidate);
       const unauthorized = candidate.verification.filter((command) => !this.settings.verificationAllowlist.includes(command));
       if (unauthorized.length > 0) fail('NOT_ACCEPTED', `${candidate.taskId} used verification commands outside the current allowlist: ${unauthorized.join(' | ')}`);
@@ -879,18 +888,54 @@ export class TaskService {
     return attempt;
   }
 
+  /**
+   * Where a new attempt's worktree starts. A task without dependencies starts
+   * from HEAD. depends_on means "needs that result", so a task with exactly one
+   * dependency is stacked on its accepted revision; with several, base_task
+   * must name one. Either way, every dependency that changes the same files
+   * must already be in the chosen base's stack, so ordering buys a
+   * conflict-free integration instead of relying on the main agent to stack.
+   */
   private resolveBase(task: TaskView, baseTask: string | undefined): string {
+    const dependencies = task.contract.depends_on;
     if (baseTask === undefined) {
-      let head: string;
-      try { head = this.ports.headRevision().trim(); } catch (error) { fail('INSPECTION_FAILED', `could not read HEAD: ${message(error)}`); }
-      if (!FULL_OBJECT_ID.test(head)) fail('INSPECTION_FAILED', 'HEAD is not a full object id');
-      return head;
+      if (dependencies.length === 0) {
+        let head: string;
+        try { head = this.ports.headRevision().trim(); } catch (error) { fail('INSPECTION_FAILED', `could not read HEAD: ${message(error)}`); }
+        if (!FULL_OBJECT_ID.test(head)) fail('INSPECTION_FAILED', 'HEAD is not a full object id');
+        return head;
+      }
+      if (dependencies.length > 1) fail('INVALID_INPUT', `${task.id} depends on ${dependencies.join(', ')}; give base_task, the dependency whose accepted revision its worktree starts from (its stack must contain every dependency that changes the same files)`);
+      baseTask = dependencies[0]!;
     }
-    if (!task.contract.depends_on.includes(baseTask)) fail('INVALID_INPUT', `base_task ${baseTask} is not a dependency of ${task.id}`);
-    const base = this.task(baseTask);
-    const revision = base.state === 'PASSED' ? base.attemptRecords[base.attemptRecords.length - 1]?.candidate?.revision : undefined;
+    if (!dependencies.includes(baseTask)) fail('INVALID_INPUT', `base_task ${baseTask} is not a dependency of ${task.id}`);
+    const revision = this.acceptedRevision(this.task(baseTask));
     if (revision === undefined) fail('INVALID_INPUT', `base_task ${baseTask} has no accepted revision`);
+    const stack = this.stackOf(baseTask);
+    const scope = task.contract.files_in_scope ?? [];
+    const missing = dependencies.filter((id) => !stack.has(id) && (this.task(id).contract.files_in_scope ?? []).some((a) => scope.some((b) => pathsOverlap(a, b))));
+    if (missing.length > 0) fail('INVALID_INPUT', `base_task ${baseTask} does not contain ${missing.join(', ')}, which change the same files as ${task.id}; their candidates would conflict at integration. Pick a base whose stack contains them, or stack them first`);
     return revision;
+  }
+
+  private acceptedRevision(task: TaskView): string | undefined {
+    return task.state === 'PASSED' ? task.attemptRecords[task.attemptRecords.length - 1]?.candidate?.revision : undefined;
+  }
+
+  /** The PASSED non-integration task whose accepted revision is `revision`, if any. */
+  private acceptedTaskAt(revision: string): TaskView | undefined {
+    return this.board.tasks().find((task) => task.integration === undefined && this.acceptedRevision(task) === revision);
+  }
+
+  /** `taskId` and every task its accepted candidate was stacked on, transitively. */
+  private stackOf(taskId: string): Set<string> {
+    const stack = new Set<string>();
+    for (let task: TaskView | undefined = this.task(taskId); task !== undefined && !stack.has(task.id);) {
+      stack.add(task.id);
+      const base: string | undefined = task.attemptRecords[task.attemptRecords.length - 1]?.lease.baseRevision;
+      task = base === undefined ? undefined : this.acceptedTaskAt(base);
+    }
+    return stack;
   }
 
   private feedbackFrom(previous: AttemptRecord): readonly string[] {
@@ -942,7 +987,6 @@ export class TaskService {
       ancestors.set(id, result);
       return result;
     };
-    const overlaps = (a: string, b: string) => a === b || (a.endsWith('/') && b.startsWith(a)) || (b.endsWith('/') && a.startsWith(b));
     const problems: string[] = [];
     for (let i = 0; i < all.length; i++) {
       for (let j = i + 1; j < all.length; j++) {
@@ -952,7 +996,7 @@ export class TaskService {
         if (ancestorsOf(a.contract.id).has(b.contract.id) || ancestorsOf(b.contract.id).has(a.contract.id)) continue;
         for (const pa of a.contract.files_in_scope ?? []) {
           for (const pb of b.contract.files_in_scope ?? []) {
-            if (!overlaps(pa, pb)) continue;
+            if (!pathsOverlap(pa, pb)) continue;
             const planned = (entry: typeof a) => entry.plannedOverlap.includes(pa) || entry.plannedOverlap.includes(pb);
             if (planned(a) && planned(b)) continue;
             problems.push(`${a.contract.id} and ${b.contract.id} can run in parallel but both touch ${pa === pb ? pa : `${pa} / ${pb}`}; their candidates would conflict at integration. Order them with depends_on, or give each its own file (e.g. a separate build fragment)`);
