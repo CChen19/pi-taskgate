@@ -62,7 +62,7 @@ task_plan ──► PENDING/READY ──task_start──► RUNNING ──task_b
 3. **Bind.** `task_bind` accepts only an agent id that Pier's ledger shows was launched in exactly that worktree.
 4. **Verify.** `task_verify` refuses while the ledger says the worker is still running. Otherwise it:
    1. inspects HEAD, changed paths, cleanliness and commits ahead;
-   2. rejects out-of-scope paths and newly added test `assert(`;
+   2. rejects out-of-scope paths and newly added test `assert(` when `rejectTestAsserts` is set;
    3. runs the allowlisted commands in a fresh detached checkout of exactly that revision;
    4. confirms the worker's HEAD did not move meanwhile.
 
@@ -95,7 +95,7 @@ Every refusal leaves the board unchanged: a mutation is trial-applied to a repla
 | Worktree path too long for Pier's pipe socket | `LEASE_UNAVAILABLE`; config load fails | Caused R0 before the fix |
 | Worker not launched in that worktree, or unbound | `WORKER_NOT_FOUND` / `WORKER_UNBOUND` | — |
 | Worker or reviewer still running | `WORKER_RUNNING` | 3× in R1/R4 |
-| Dirty tree, no commits, out-of-scope paths, added test `assert(` | Failed check recorded (no settle) | F2 replay: 23 asserts in `0d6c428` |
+| Dirty tree, no commits, out-of-scope paths, added test `assert(` (with `rejectTestAsserts`) | Failed check recorded (no settle) | F2 replay: 23 asserts in `0d6c428` |
 | Clean-room checkout cannot be made pristine | `VERIFICATION_ERROR` | — |
 | Worker HEAD moved during verification | Failed check recorded | — |
 | Candidate no longer HEAD or clean at review brief or record | Attempt rejected | — |
@@ -144,7 +144,7 @@ Every refusal leaves the board unchanged: a mutation is trial-applied to a repla
 - Parallel limits beyond Pier's own cap.
 - Metrics collection. The field report was extracted by hand from session files.
 - Porting stable pieces into Pier.
-- A larger controlled comparison against Pier alone. The first round is in [benchmark-2026-09-22.md](benchmark-2026-09-22.md); it found gaps G1–G3 (messages to running reviewers, a master bypassing a failed integration with its shell, and `planned_overlap` used by default).
+- A larger controlled comparison against Pier alone. The first round is in [benchmark-2026-09-22.md](benchmark-2026-09-22.md); it found gaps G1–G3 (messages to running reviewers, a master bypassing a failed integration with its shell, and `planned_overlap` used by default). Those are fixed in code (reviewer session check, git write guard plus `DELIVERABLE`, human-only `sharedPaths`), together with delivering review briefs as files, but not yet exercised live; round 2 is pre-registered in [evaluation.md](evaluation.md).
 
 ## Legacy: external vertical slice (removed)
 
