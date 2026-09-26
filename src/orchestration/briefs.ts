@@ -15,6 +15,7 @@ export interface WorkerBriefInput {
   readonly branch: string;
   readonly baseRevision: string;
   readonly feedback?: readonly string[];
+  readonly rejectTestAsserts?: boolean;
 }
 
 export function renderWorkerBrief(input: WorkerBriefInput): string {
@@ -49,7 +50,7 @@ export function renderWorkerBrief(input: WorkerBriefInput): string {
     '- Work only inside the working directory above. Do not touch the main checkout.',
     '- Commit your finished work to the current branch. Leave no uncommitted or untracked files.',
     '- Never push, never merge, never rebase onto other branches.',
-    '- Do not use assert() in test code: verification builds in Release (-DNDEBUG), which strips it; follow the repo\'s existing non-assert check pattern. New assert( lines in tests are rejected.',
+    ...(input.rejectTestAsserts === true ? ['- Do not use assert() in test code: verification builds in Release (-DNDEBUG), which strips it; follow the repo\'s existing non-assert check pattern. New assert( lines in tests are rejected.'] : []),
     '- Your own claims (done, revision, tests passed) are not evidence; the host inspects git and runs verification.',
     '- Finish with a short summary of what you changed and anything the coordinator should know.',
   );

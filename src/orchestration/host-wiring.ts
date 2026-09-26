@@ -70,5 +70,6 @@ export function createHostTaskService(options: HostWiringOptions): TaskService {
     maxChecksPerAttempt: config.maxChecksPerAttempt,
     defaultMaxAttempts: config.defaultMaxAttempts,
     sharedPaths: config.sharedPaths,
+    rejectTestAsserts: config.rejectTestAsserts,
   });
 }

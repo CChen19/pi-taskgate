@@ -36,6 +36,8 @@ export interface TaskServiceSettings {
   readonly defaultMaxAttempts: number;
   /** Human-configured paths that planned_overlap may name; nothing else may be shared by parallel tasks. */
   readonly sharedPaths: readonly string[];
+  /** Reject new assert( calls in C/C++ test sources (repos that verify with -DNDEBUG). */
+  readonly rejectTestAsserts: boolean;
 }
 
 export interface TaskServicePorts {
@@ -385,7 +387,7 @@ export class TaskService {
       branch: lease.branch,
       baseRevision: lease.baseRevision,
       ...(reusedFrom === undefined ? {} : { reusedFrom }),
-      prompt: renderWorkerBrief({ contract: task.contract, attemptId, workspacePath: lease.workspacePath, branch: lease.branch, baseRevision: lease.baseRevision, feedback }),
+      prompt: renderWorkerBrief({ contract: task.contract, attemptId, workspacePath: lease.workspacePath, branch: lease.branch, baseRevision: lease.baseRevision, feedback, rejectTestAsserts: this.settings.rejectTestAsserts }),
       spawn: { description: `${taskId}:impl`, cwd: lease.workspacePath, run_in_background: true },
     };
   }
@@ -754,18 +756,20 @@ export class TaskService {
     }
   }
 
-  /** Guards on the committed diff beyond scope: new assert() in tests, and integration history fidelity. */
+  /** Guards on the committed diff beyond scope: new assert() in tests (when configured), and integration history fidelity. */
   private artifactGuards(task: TaskView, attempt: AttemptRecord, lease: WorkspaceLease, revision: string): string[] {
     const reasons: string[] = [];
-    try {
-      const diff = this.ports.history.changedLineDiff(lease.workspacePath, lease.baseRevision, revision);
-      if (diff.truncated) reasons.push('diff is too large to scan for assert() in tests');
-      const asserts = findAddedAsserts(diff.text);
-      if (asserts.length > 0) {
-        reasons.push(`new assert() in test code is compiled out by Release builds (-DNDEBUG); use the repo's non-assert check pattern: ${asserts.slice(0, 5).map((entry) => `${entry.path}: ${entry.text}`).join(' | ')}`);
+    if (this.settings.rejectTestAsserts) {
+      try {
+        const diff = this.ports.history.changedLineDiff(lease.workspacePath, lease.baseRevision, revision);
+        if (diff.truncated) reasons.push('diff is too large to scan for assert() in tests');
+        const asserts = findAddedAsserts(diff.text);
+        if (asserts.length > 0) {
+          reasons.push(`new assert() in test code is compiled out by Release builds (-DNDEBUG); use the repo's non-assert check pattern: ${asserts.slice(0, 5).map((entry) => `${entry.path}: ${entry.text}`).join(' | ')}`);
+        }
+      } catch (error) {
+        reasons.push(`could not scan the diff: ${message(error)}`);
       }
-    } catch (error) {
-      reasons.push(`could not scan the diff: ${message(error)}`);
     }
     const spec = task.integration;
     const record = attempt.integration;

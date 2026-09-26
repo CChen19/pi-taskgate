@@ -35,10 +35,15 @@ export interface OrchestrationConfig {
    * can only reference these in planned_overlap; it cannot add new ones.
    */
   readonly sharedPaths: readonly string[];
+  /**
+   * Reject new assert( calls in C/C++ test sources. For repositories whose
+   * verification builds tests with -DNDEBUG, where assert() is compiled out.
+   */
+  readonly rejectTestAsserts: boolean;
   readonly pierHistoryRoots?: readonly string[];
 }
 
-const FIELDS = ['version', 'repoRoot', 'workspaceRoot', 'verificationAllowlist', 'verificationTimeoutMs', 'reviewerRole', 'maxChecksPerAttempt', 'defaultMaxAttempts', 'roleDirs', 'pierHistoryRoots', 'sharedPaths'] as const;
+const FIELDS = ['version', 'repoRoot', 'workspaceRoot', 'verificationAllowlist', 'verificationTimeoutMs', 'reviewerRole', 'maxChecksPerAttempt', 'defaultMaxAttempts', 'roleDirs', 'pierHistoryRoots', 'sharedPaths', 'rejectTestAsserts'] as const;
 const CREDENTIAL_KEY = /^(credentials?|token|password|api[_-]?key|secret|auth)$/i;
 
 export class OrchestrationConfigError extends Error {
@@ -67,6 +72,12 @@ function absoluteList(value: unknown, path: string): readonly string[] | undefin
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.length === 0) fail(`${path} must be a non-empty array`);
   return Object.freeze(value.map((entry, index) => absolute(entry, `${path}[${index}]`)));
+}
+
+function flag(value: unknown, path: string): boolean {
+  if (value === undefined) return false;
+  if (typeof value !== 'boolean') fail(`${path} must be true or false`);
+  return value;
 }
 
 /** Repository-relative paths (trailing slash = directory), as in files_in_scope. */
@@ -119,5 +130,6 @@ export function parseOrchestrationConfig(input: unknown): OrchestrationConfig {
     ...(roleDirs === undefined ? {} : { roleDirs }),
     ...(pierHistoryRoots === undefined ? {} : { pierHistoryRoots }),
     sharedPaths: repoPaths(ownValue(input, 'sharedPaths'), 'config.sharedPaths'),
+    rejectTestAsserts: flag(ownValue(input, 'rejectTestAsserts'), 'config.rejectTestAsserts'),
   });
 }

@@ -74,7 +74,7 @@ class FakeLedger implements WorkerLedger {
 
 const PROBE = 'pwd && git rev-parse HEAD && git status --porcelain --ignored && mkdir -p build && touch build/from-verify';
 const ALLOWLIST = ['test -f README.md', 'test -f src/a.txt', 'test -f src/b.txt', 'test -f src/missing.txt', 'grep -q hello src/a.txt', 'test -f build/marker', PROBE];
-const SETTINGS: TaskServiceSettings = { verificationAllowlist: ALLOWLIST, verificationTimeoutMs: 30_000, reviewerRole: 'reviewer-readonly', maxChecksPerAttempt: 3, defaultMaxAttempts: 2, sharedPaths: ['README.md', 'src/', 'CMakeLists.txt'] };
+const SETTINGS: TaskServiceSettings = { verificationAllowlist: ALLOWLIST, verificationTimeoutMs: 30_000, reviewerRole: 'reviewer-readonly', maxChecksPerAttempt: 3, defaultMaxAttempts: 2, sharedPaths: ['README.md', 'src/', 'CMakeLists.txt'], rejectTestAsserts: true };
 
 interface Harness {
   root: string;
@@ -560,6 +560,14 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
     commit(cwd, { 'tests/test_x.cpp': '// assert() would compile out under NDEBUG\nstatic_assert(sizeof(int) >= 2, "int");\nint main() { return 0; }\n', 'src/prod.cpp': 'void f() { assert(true); }\n' });
     const fixed = await svc.verify('T1');
     assert.equal(fixed.outcome, 'awaiting_review', fixed.reasons.join('; '));
+  });
+
+  it('neither briefs nor rejects test asserts when the repository config leaves the rule off', async () => {
+    const svc = new TaskService((h.service() as unknown as { ports: never }).ports, { ...SETTINGS, rejectTestAsserts: false });
+    svc.plan([task('T1', { files_in_scope: ['src/', 'tests/'] })]);
+    const { started, verified } = await toCandidate(h, svc, 'T1', { 'src/a.txt': 'hello\n', 'tests/test_x.cpp': 'int main() { assert(1 + 1 == 2); return 0; }\n' });
+    assert.doesNotMatch(started.prompt!, /assert/);
+    assert.equal(verified.outcome, 'awaiting_review', verified.reasons.join('; '));
   });
 
   it('passes mechanically-verified tasks directly when review is not required', async () => {

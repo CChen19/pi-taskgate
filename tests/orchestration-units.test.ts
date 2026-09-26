@@ -101,12 +101,15 @@ describe('orchestration config', () => {
     assert.equal(config.defaultMaxAttempts, 3);
     assert.equal(config.verificationTimeoutMs, 600_000);
     assert.deepEqual(config.sharedPaths, []);
+    assert.equal(config.rejectTestAsserts, false);
+    assert.equal(parseOrchestrationConfig({ ...base, rejectTestAsserts: true }).rejectTestAsserts, true);
     assert.deepEqual(parseOrchestrationConfig({ ...base, sharedPaths: ['CMakeLists.txt', 'cmake/'] }).sharedPaths, ['CMakeLists.txt', 'cmake/']);
   });
 
   it('fails closed on unknown fields, credentials, relative paths, nested workspaces, and empty allowlists', () => {
     assert.throws(() => parseOrchestrationConfig({ ...base, extra: 1 }), /unknown fields/);
     for (const sharedPaths of ['CMakeLists.txt', ['/abs'], ['../up'], ['']]) assert.throws(() => parseOrchestrationConfig({ ...base, sharedPaths }), /sharedPaths/);
+    assert.throws(() => parseOrchestrationConfig({ ...base, rejectTestAsserts: 'yes' }), /rejectTestAsserts/);
     assert.throws(() => parseOrchestrationConfig({ ...base, token: 'x' }), /credentials/);
     assert.throws(() => parseOrchestrationConfig({ ...base, repoRoot: 'repo' }), /absolute/);
     assert.throws(() => parseOrchestrationConfig({ ...base, workspaceRoot: '/repo/trees' }), /outside/);
