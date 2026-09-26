@@ -48,7 +48,7 @@ A worker saying "done" is not acceptance. Only `task_verify` and `task_review_re
 |---|---|
 | `task_status` | The board: state, unmet dependencies, attempts, bound agent, worktree, failed checks, candidate, review and verdict, plus the READY list and **`DELIVERABLE`**. The deliverable is the latest PASSED integration, or the single task's PASSED revision when there is only one task. Otherwise it is none, with a reason |
 | `task_plan` | Adds contracts atomically. Ids must be unique, dependencies must exist without cycles, `files_in_scope` must be non-empty, and verification commands must match the host allowlist verbatim. `review_required` defaults to true. **Planning rule:** tasks that can run in parallel must not have overlapping `files_in_scope`. The only exception is a path in the human-written `sharedPaths` config that both tasks list in `planned_overlap`. The model can reference shared paths but cannot add them |
-| `task_start` | Needs a READY or RETRYING task. The host creates a worktree and branch from HEAD, or from a PASSED dependency's revision, and returns the worker prompt and spawn arguments. `reuse_worktree` continues on the same branch |
+| `task_start` | Needs a READY or RETRYING task. The host creates a worktree and branch and returns the worker prompt and spawn arguments. A task without dependencies starts from HEAD. A task with one dependency is **stacked** on that dependency's accepted revision. With several dependencies, `base_task` is required, and every dependency that changes the same files must already be in that base's stack. `reuse_worktree` continues on the same branch |
 | `task_bind` | Confirms in Pier's ledger that the agent was launched in that worktree |
 | `task_verify` | The worker must have settled. The host checks HEAD, changed paths, a clean tree, commits ahead and scope, then runs the allowlisted commands in a **fresh checkout of that exact revision** (`<workspaceRoot>/.verify/`, built from git objects only). Ignored build output in the worker tree is never reused. Optionally rejects new `assert(` in C/C++ tests (`rejectTestAsserts`). A failure costs one check; passing settles a candidate |
 | `task_review_brief` | Checks that the reviewer role is read-only and that the candidate is still HEAD and clean. Writes the full brief (objective, criteria, scope, verification evidence, patch) to a host-owned file `<workspaceRoot>/.briefs/<reviewId>.md`, recording its sha256 and the issued prompt. The master gets only a 4-line spawn prompt that points at the file |
@@ -105,7 +105,7 @@ Evidence for each item is in [the round-1 benchmark](docs/benchmark-2026-09-22.m
 - **A read brief is not a careful review.** The checks prove that the reviewer saw the exact brief, not that it judged well. In round 1, one fresh reviewer caught a weak test (i3b) and one missed an `NDEBUG` problem (Pier-only i2a).
 - **The git write guard can be bypassed.** It covers only the master's `bash` command strings. `edit` and `write` can still change files, and aliases, scripts or other languages can still run git. The delivery rule is what holds.
 - **Reviewers have no shell.** They sometimes ask the human through `ask_user_question`. Those answers arrive as tool results, not prompts, so the one-prompt check does not catch them. The benchmark operator answered with a fixed "no human is available" text.
-- **Integration is mechanical.** It cherry-picks and fails closed on conflict, with no resolution. With empty `sharedPaths`, tasks that touch a shared build file must be serialized or split, which is slower.
+- **Integration is mechanical.** It cherry-picks and fails closed on conflict, with no resolution. With empty `sharedPaths`, tasks that touch a shared build file must be ordered with `depends_on` or split. Ordered tasks are stacked automatically, so they integrate cleanly but run one after another, which is slower.
 - **Settlement comes from Pier's ledger.** Verifying or recording before a subagent settles is refused with `WORKER_RUNNING`. This happened 11 times in round 1, always without effect.
 - **Pier's todo reconciliation** may tick todos whose text matches a spawn description. Use `task_status`, and the `T1:impl`-style descriptions the tools return.
 - **Housekeeping.** Worktrees and branches are not cleaned up automatically, and there are no built-in metrics: the evaluation extracts them from session files.
@@ -114,7 +114,7 @@ Evidence for each item is in [the round-1 benchmark](docs/benchmark-2026-09-22.m
 ## Development
 
 ```bash
-npm run check   # typecheck + 131 offline tests
+npm run check   # typecheck + 133 offline tests
 ```
 
 Tests use real temporary git repositories, worktrees and allowlisted processes, with a fake Pier ledger, roles and sessions. They never call a model, Pi, herdr or the network. Node 24 runs the TypeScript directly; there is no build step.
