@@ -69,5 +69,6 @@ export function createHostTaskService(options: HostWiringOptions): TaskService {
     reviewerRole: config.reviewerRole,
     maxChecksPerAttempt: config.maxChecksPerAttempt,
     defaultMaxAttempts: config.defaultMaxAttempts,
+    sharedPaths: config.sharedPaths,
   });
 }

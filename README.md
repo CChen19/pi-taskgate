@@ -35,7 +35,7 @@ Fail-closed 守卫的完整列表、状态机和 session 恢复见 [docs/archite
 | 工具 | 由代码保证的事实 |
 |---|---|
 | `task_status` | task board：state、未满足依赖、attempts、绑定的 Pier agent、worktree、失败的 check、candidate revision、review、verdict、READY 列表，以及 `DELIVERABLE`：最近一个 PASSED 的集成 revision；board 上只有一个非集成任务时是它的 PASSED revision；否则为 none 并给出原因。这是唯一应交付的结果 |
-| `task_plan` | 原子地加入 TaskContract（全部校验通过才写入）：id 唯一、依赖存在且无环、`files_in_scope` 非空、verification 命令必须逐字在 host allowlist 中；`review_required` 默认 true；**规划规则**：可以并行的任务（彼此之间没有 depends_on 路径）的 `files_in_scope` 不能重叠（含目录前缀），除非两个任务都在 `planned_overlap` 里显式声明该路径 |
+| `task_plan` | 原子地加入 TaskContract（全部校验通过才写入）：id 唯一、依赖存在且无环、`files_in_scope` 非空、verification 命令必须逐字在 host allowlist 中；`review_required` 默认 true；**规划规则**：可以并行的任务（彼此之间没有 depends_on 路径）的 `files_in_scope` 不能重叠（含目录前缀）。唯一例外：该路径在人写配置的 `sharedPaths` 里，且两个任务都在 `planned_overlap` 里声明了它。`planned_overlap` 只能引用 `sharedPaths` 中的路径，不能新增（G3，2026-09-26）；拒绝文案只给出 depends_on 或拆分文件两条出路 |
 | `task_start` | 任务必须 READY/RETRYING 且依赖已 PASSED；host 从主 checkout 的 HEAD（或某个已 PASSED 依赖的 revision）建独立 worktree+branch，返回 worker prompt 和 `subagent` spawn 参数；`reuse_worktree` 在同一分支上开下一个 attempt |
 | `task_bind` | 通过 Pier ledger 确认该 agent 确实在该 worktree 中启动 |
 | `task_verify` | 要求 worker 在 Pier ledger 中已不是 running；host 检查 HEAD、changed paths、clean、commits ahead、scope，然后在**该 revision 的全新临时 checkout**（`<workspaceRoot>/.verify/`，只由 git 对象生成，事后删除）中跑 allowlist 命令，worker worktree 里被 ignore 的构建产物不会被复用；并拒绝测试代码中**新增**的 `assert(`（Release/`-DNDEBUG` 会把它编译掉；只检查新增行，忽略注释、字符串和 `static_assert`）；失败只记一次 check（attempt 不消耗，超过 `maxChecksPerAttempt` 才判 attempt 失败），通过则 settle 为 candidate（不需要 review 时直接 PASSED） |
@@ -61,9 +61,12 @@ task 事件以 `agent-orchestrator.task-event` custom entry 写入 Pi session，
   "verificationTimeoutMs": 600000,
   "reviewerRole": "reviewer-readonly",
   "maxChecksPerAttempt": 5,
-  "defaultMaxAttempts": 3
+  "defaultMaxAttempts": 3,
+  "sharedPaths": []
 }
 ```
+
+`sharedPaths`（可选，默认空）列出允许并行任务同时修改的仓库相对路径，只能由人写入；为空时，任何并行重叠都必须用 `depends_on` 排序或拆成各自的文件。
 
 `workspaceRoot` 必须很短：Pier 为每个 subagent 创建 `/tmp/pi-herdr-<编码后的 cwd>-<pane>.sock`，Unix socket 路径上限约 108 字节，`/` 编码后占 3 字节。配置加载时和每次 `task_start` 都会检查，超长时 fail closed；worktree 使用紧凑命名 `<task≤12>-a<n>-<hash>`，分支为 `ao/...`。
 

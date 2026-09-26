@@ -34,6 +34,8 @@ export interface TaskServiceSettings {
   readonly reviewerRole: string;
   readonly maxChecksPerAttempt: number;
   readonly defaultMaxAttempts: number;
+  /** Human-configured paths that planned_overlap may name; nothing else may be shared by parallel tasks. */
+  readonly sharedPaths: readonly string[];
 }
 
 export interface TaskServicePorts {
@@ -306,6 +308,8 @@ export class TaskService {
       const unauthorized = contract.verification.filter((command) => !this.settings.verificationAllowlist.includes(command));
       if (unauthorized.length > 0) problems.push(`${contract.id}: verification commands not in the host allowlist: ${unauthorized.join(' | ')} (allowed: ${this.settings.verificationAllowlist.join(' | ')})`);
       const plannedOverlap = Array.isArray(overlapRaw) && overlapRaw.length > 0 ? [...new Set(overlapRaw as string[])] : undefined;
+      const unshared = (plannedOverlap ?? []).filter((path) => !this.settings.sharedPaths.includes(path));
+      if (unshared.length > 0) problems.push(`tasks[${index}].planned_overlap names ${unshared.join(', ')}, which the human-written config does not list in sharedPaths (${this.settings.sharedPaths.join(', ') || 'none configured'}); order the tasks with depends_on or give each its own file instead`);
       parsed.push({ contract, reviewRequired: reviewRaw === undefined ? true : reviewRaw as boolean, ...(plannedOverlap === undefined ? {} : { plannedOverlap }) });
     }
     const ids = new Set<string>();
@@ -911,8 +915,8 @@ export class TaskService {
   /**
    * Planning rule: tasks that may run in parallel (neither depends on the other,
    * directly or transitively) must not touch overlapping paths, because their
-   * candidates would conflict at integration. An overlap is allowed only when
-   * both tasks list the path in planned_overlap.
+   * candidates would conflict at integration. An overlap is allowed only on a
+   * human-configured shared path that both tasks list in planned_overlap.
    */
   private parallelOverlaps(items: readonly { contract: TaskContract; plannedOverlap?: readonly string[] }[]): string[] {
     const live = this.board.tasks()
@@ -947,7 +951,7 @@ export class TaskService {
             if (!overlaps(pa, pb)) continue;
             const planned = (entry: typeof a) => entry.plannedOverlap.includes(pa) || entry.plannedOverlap.includes(pb);
             if (planned(a) && planned(b)) continue;
-            problems.push(`${a.contract.id} and ${b.contract.id} can run in parallel but both touch ${pa === pb ? pa : `${pa} / ${pb}`}; their candidates would conflict at integration. Order them with depends_on, give each its own file (e.g. a separate build fragment), or list the path in planned_overlap on both tasks if the overlap is intended`);
+            problems.push(`${a.contract.id} and ${b.contract.id} can run in parallel but both touch ${pa === pb ? pa : `${pa} / ${pb}`}; their candidates would conflict at integration. Order them with depends_on, or give each its own file (e.g. a separate build fragment)`);
           }
         }
       }

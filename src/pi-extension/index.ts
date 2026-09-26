@@ -270,7 +270,7 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
     tool({
       name: 'task_plan',
       label: 'Task Plan',
-      description: 'Add tasks to the board (validated atomically; nothing is added if any task is invalid). Each task is a contract: id (T followed by lowercase letters/digits/hyphens, e.g. T1, Tapi-tests), objective, depends_on (ids that must PASS first), files_in_scope (paths the worker may change; trailing slash = directory; any other change fails verification), acceptance_criteria, verification (exact commands from the host allowlist; the host runs them, not the worker), optional context, retry.max_attempts, review_required (default true; set false only for low-risk mechanical tasks). Planning rule: tasks that can run in parallel (no depends_on path between them) must not have overlapping files_in_scope, because their candidates would conflict at integration; order them with depends_on, give each its own file (e.g. a separate build/test fragment instead of appending to a shared CMakeLists.txt), or declare the shared path in planned_overlap on both tasks.',
+      description: 'Add tasks to the board (validated atomically; nothing is added if any task is invalid). Each task is a contract: id (T followed by lowercase letters/digits/hyphens, e.g. T1, Tapi-tests), objective, depends_on (ids that must PASS first), files_in_scope (paths the worker may change; trailing slash = directory; any other change fails verification), acceptance_criteria, verification (exact commands from the host allowlist; the host runs them, not the worker), optional context, retry.max_attempts, review_required (default true; set false only for low-risk mechanical tasks). Planning rule: tasks that can run in parallel (no depends_on path between them) must not have overlapping files_in_scope, because their candidates would conflict at integration; order them with depends_on, or give each its own file (e.g. a separate build/test fragment instead of appending to a shared CMakeLists.txt). planned_overlap is only for paths the human listed in the config\'s sharedPaths.',
       parameters: {
         type: 'object',
         properties: {
@@ -288,7 +288,7 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
                 verification: STRING_ARRAY,
                 retry: { type: 'object', properties: { max_attempts: { type: 'integer', minimum: 1 } }, required: ['max_attempts'], additionalProperties: false },
                 review_required: { type: 'boolean' },
-                planned_overlap: { ...STRING_ARRAY, description: 'Paths this task intentionally shares with a parallel task (must be declared on both tasks)' },
+                planned_overlap: { ...STRING_ARRAY, description: 'Human-configured sharedPaths this task shares with a parallel task (both tasks must list them); any other path is refused' },
               },
               required: ['id', 'objective', 'depends_on', 'files_in_scope', 'acceptance_criteria', 'verification'],
             },

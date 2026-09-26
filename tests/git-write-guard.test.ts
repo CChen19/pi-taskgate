@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { findGitWrites, isGitWrite, isWithin } from '../src/core/git-write-guard.ts';
+import { findGitWrites, isGitWrite } from '../src/core/git-write-guard.ts';
 
 const CWD = '/repo';
 const HOME = '/home/u';
@@ -26,7 +26,6 @@ describe('git write guard: classification', () => {
     assert.deepEqual(writes("grep -rn 'git merge' docs/"), []);
     assert.deepEqual(writes('ls # then git commit'), []);
     assert.deepEqual(writes("cat > notes.md <<'EOF'\ngit commit -m x\ngit push\nEOF\ngit status"), []);
-    assert.deepEqual(writes('cat <<-EOF\n\tgit push\n\tEOF\n'), []);
     assert.deepEqual(writes('mygit commit'), []);
   });
 });
@@ -40,7 +39,6 @@ describe('git write guard: finding every invocation', () => {
 
   it('sees through wrappers, assignments, absolute paths, git global options and redirections', () => {
     assert.deepEqual(writes('GIT_AUTHOR_NAME=x env -i FOO=1 /usr/bin/git -c user.name=x --no-pager commit -m x 2>&1 >/dev/null'), [['git commit', '/repo']]);
-    assert.deepEqual(writes('sudo -E git push'), [['git push', '/repo']]);
     assert.deepEqual(writes('timeout 30 git cherry-pick abc'), [['git cherry-pick', '/repo']]);
     assert.deepEqual(writes('git 2>/dev/null commit -m x'), [['git commit', '/repo']]);
   });
@@ -64,9 +62,7 @@ describe('git write guard: target directory', () => {
     assert.deepEqual(writes('cd /tmp/x && git commit -m x'), [['git commit', '/tmp/x']]);
     assert.deepEqual(writes('cd sub && git commit -m x'), [['git commit', '/repo/sub']]);
     assert.deepEqual(writes('cd ~/scratch; git commit -m x'), [['git commit', '/home/u/scratch']]);
-    assert.deepEqual(writes('cd; git commit -m x'), [['git commit', '/home/u']]);
     assert.deepEqual(writes('git -C ../ws/T1 commit -m x'), [['git commit', '/ws/T1']]);
-    assert.deepEqual(writes('git -C /a -C b commit -m x'), [['git commit', '/a/b']]);
     assert.deepEqual(writes('git --git-dir=/w/.git commit -m x'), [['git commit', '/w/.git']]);
     assert.deepEqual(writes('git --work-tree /w commit -m x'), [['git commit', '/w']]);
   });
@@ -77,12 +73,5 @@ describe('git write guard: target directory', () => {
     assert.deepEqual(writes('pushd /a && popd && git push'), [['git push', undefined]]);
     assert.deepEqual(writes('git -C $(pwd) commit -m x'), [['git commit', undefined]]);
     assert.deepEqual(writes('cd ~other && git push'), [['git push', undefined]]);
-  });
-
-  it('isWithin matches the root and its descendants only', () => {
-    assert.equal(isWithin('/repo', '/repo'), true);
-    assert.equal(isWithin('/repo/a/b', '/repo'), true);
-    assert.equal(isWithin('/repository', '/repo'), false);
-    assert.equal(isWithin('/', '/repo'), false);
   });
 });

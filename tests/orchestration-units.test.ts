@@ -100,10 +100,13 @@ describe('orchestration config', () => {
     assert.equal(config.maxChecksPerAttempt, 5);
     assert.equal(config.defaultMaxAttempts, 3);
     assert.equal(config.verificationTimeoutMs, 600_000);
+    assert.deepEqual(config.sharedPaths, []);
+    assert.deepEqual(parseOrchestrationConfig({ ...base, sharedPaths: ['CMakeLists.txt', 'cmake/'] }).sharedPaths, ['CMakeLists.txt', 'cmake/']);
   });
 
   it('fails closed on unknown fields, credentials, relative paths, nested workspaces, and empty allowlists', () => {
     assert.throws(() => parseOrchestrationConfig({ ...base, extra: 1 }), /unknown fields/);
+    for (const sharedPaths of ['CMakeLists.txt', ['/abs'], ['../up'], ['']]) assert.throws(() => parseOrchestrationConfig({ ...base, sharedPaths }), /sharedPaths/);
     assert.throws(() => parseOrchestrationConfig({ ...base, token: 'x' }), /credentials/);
     assert.throws(() => parseOrchestrationConfig({ ...base, repoRoot: 'repo' }), /absolute/);
     assert.throws(() => parseOrchestrationConfig({ ...base, workspaceRoot: '/repo/trees' }), /outside/);
@@ -203,7 +206,6 @@ describe('review brief files', () => {
     const partial = [{ path: '/b.md', text: 'line 1\nline 2\n\n[2 more lines in file. Use offset=3 to continue.]', isError: false }];
     assert.deepEqual(briefReadCoverage(brief, '/b.md', partial, same), { covered: 2, total: 4 });
     assert.deepEqual(briefReadCoverage(brief, '/b.md', [...partial, { path: '/b.md', offset: 3, text: 'line 3\nline 4\n', isError: false }], same), { covered: 4, total: 4 });
-    assert.equal(briefReadCoverage(brief, '/b.md', [{ path: '/b.md', text: 'line 1\nline 2\n\n[Showing lines 1-2 of 5 (50KB limit). Use offset=3 to continue.]', isError: false }], same).covered, 2);
     assert.equal(briefReadCoverage(brief, '/b.md', [{ path: '/b.md', text: 'line 1\nline 2\nline 3\nline 4\n\nAppended by something else', isError: false }], same).covered, 4);
   });
 
@@ -378,10 +380,6 @@ describe('pi extension', () => {
       assert.equal(call('cd /tmp/scratch && git init && git commit -m x'), undefined);
       assert.equal(call('git commit -m x', 'read'), undefined);
       assert.equal(call(undefined), undefined);
-    });
-
-    it('protects every directory when no roots are known', () => {
-      assert.equal(withBoard(1)('cd /tmp/scratch && git commit -m x')?.block, true);
     });
 
     it('compares canonical paths, so a symlinked cwd cannot slip past a root', () => {

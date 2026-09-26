@@ -30,10 +30,15 @@ export interface OrchestrationConfig {
   /** Optional override of Pier's role directories (default: Pier's lookup order). */
   readonly roleDirs?: readonly string[];
   /** Optional override of Pier's history roots (default: Pier's storage layout). */
+  /**
+   * Paths parallel tasks may both change, written by a human. The main agent
+   * can only reference these in planned_overlap; it cannot add new ones.
+   */
+  readonly sharedPaths: readonly string[];
   readonly pierHistoryRoots?: readonly string[];
 }
 
-const FIELDS = ['version', 'repoRoot', 'workspaceRoot', 'verificationAllowlist', 'verificationTimeoutMs', 'reviewerRole', 'maxChecksPerAttempt', 'defaultMaxAttempts', 'roleDirs', 'pierHistoryRoots'] as const;
+const FIELDS = ['version', 'repoRoot', 'workspaceRoot', 'verificationAllowlist', 'verificationTimeoutMs', 'reviewerRole', 'maxChecksPerAttempt', 'defaultMaxAttempts', 'roleDirs', 'pierHistoryRoots', 'sharedPaths'] as const;
 const CREDENTIAL_KEY = /^(credentials?|token|password|api[_-]?key|secret|auth)$/i;
 
 export class OrchestrationConfigError extends Error {
@@ -62,6 +67,15 @@ function absoluteList(value: unknown, path: string): readonly string[] | undefin
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.length === 0) fail(`${path} must be a non-empty array`);
   return Object.freeze(value.map((entry, index) => absolute(entry, `${path}[${index}]`)));
+}
+
+/** Repository-relative paths (trailing slash = directory), as in files_in_scope. */
+function repoPaths(value: unknown, path: string): readonly string[] {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string' || entry.length === 0 || entry.includes('\0') || entry.startsWith('/') || entry.split('/').includes('..'))) {
+    fail(`${path} must be an array of repository-relative paths`);
+  }
+  return Object.freeze([...new Set(value as string[])]);
 }
 
 function rejectCredentials(value: unknown, path: string): void {
@@ -104,5 +118,6 @@ export function parseOrchestrationConfig(input: unknown): OrchestrationConfig {
     defaultMaxAttempts: positiveInteger(ownValue(input, 'defaultMaxAttempts'), 'config.defaultMaxAttempts', 3),
     ...(roleDirs === undefined ? {} : { roleDirs }),
     ...(pierHistoryRoots === undefined ? {} : { pierHistoryRoots }),
+    sharedPaths: repoPaths(ownValue(input, 'sharedPaths'), 'config.sharedPaths'),
   });
 }
