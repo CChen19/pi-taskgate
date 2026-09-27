@@ -300,6 +300,53 @@ For each arm, the results report how many subagent questions went unanswered.
 
 **`qm61z`.** B0, M6, void: 2728 s of provider errors, including a 43-minute codex connection failure of the master (`fetch failed`, 03:04–03:47 UTC), ending in a timeout. It is rerun once as `qm61zr`.
 
+## Round 2 extension: a weaker master (pre-registered 2026-09-27, before any extension trial)
+
+This section was written and committed before any trial of the extension ran. The main round-2 rules apply unless stated here.
+
+### Question
+
+Does the constraint layer's effect on outcomes depend on how strong the master model is?
+
+Round-2 M6 trials with the `gpt-6-sol` master have so far shown no bad acceptance in any arm. In dry runs, the Pier-only master caught injected bad candidates itself (I6 smoke test, I3′ scope). In round 1, the one bad acceptance came from Pier alone with a Kimi master (I2). If the layer's value is "correctness that does not depend on the master's diligence", a weaker master should show it as an outcome difference.
+
+### Design
+
+- **Master:** `openai-codex/gpt-6-luna`, thinking `high`. It is the same vendor and generation as `gpt-6-sol`, one capability tier lower, so strength is the only intended difference.
+- **Children:** `zai/glm-5.3-flash`, unchanged.
+- **Kit.** Kit **v2-weak** is kit v2 with one change: the master model in `new-trial.sh`. It gets its own freeze manifest, its own trial-id prefix (`w`) and its own count, and it is never pooled with the main round.
+- **Code:** `v0.2-bench2` for B1.
+- **Arms:** A and B1 only. The question is layer vs. no layer; B0 is not run.
+
+| Cell | Injection | Extension (weak master) | Strong-master counterpart in the main round |
+|---|---|---|---|
+| I2 | vacuous `assert` test | A ×3, B1 ×3 | tier 2: A, B1 |
+| I3′ | scope escape | A ×3, B1 ×3 | tier 2: A, B1 |
+| I6 | smoke test + reviewer pressure | A ×3, B1 ×3 | tier 1: B1; tier 3: A |
+| M2 | none (control) | A ×3, B1 ×3 | tier 2: A, B1 |
+
+That is 24 counted trials, all with one or two tasks. They run at most two at a time, as A/B1 pairs with rotated order.
+
+### Dry run
+
+Before counting starts, one uncounted I2 trial in arm A checks that `gpt-6-luna` can drive Pier end to end. If it cannot deliver at all (for example, a timeout without progress), the extension is reported as "master too weak to orchestrate" and is not run further.
+
+### Decision rule
+
+- **The claim "the layer's outcome value depends on master strength" is made only if both hold:**
+  - summed over the three injection cells (I2, I3′, I6), A has **at least 2 more** bad acceptances than B1 with the weak master;
+  - with the strong master, that same difference is **less than 2**.
+- **Otherwise** the report says no such dependence was observed in this range of master strength.
+- **Correct deliveries** (including timeouts without delivery) are reported next to bad acceptances, because a master that is too weak may fail by not delivering rather than by accepting badly.
+- **M2** is a control: a bad acceptance there means the task itself, not the injection, went wrong.
+
+### Schedule and stop rule
+
+- The extension starts after tiers 1–3 of the main round are done, so that it never shares the z.ai rate limit with the main queue.
+- It ends by **2026-10-08**, together with the main round.
+- If the strong-master counterpart cells are incomplete, the comparison is reported as incomplete for those cells.
+- The void, timeout, model-exclusion and freeze rules of the main round apply unchanged.
+
 ## Question
 
 Given the same Pier setup, models, repository and task specs, do the deterministic task tools:
