@@ -261,6 +261,30 @@ If a limit that is not visible now (for example a weekly cap) stops the round, i
 
 **Freeze.** The bench kit (operator, prompt, extractor, roles, oracle and reference tests) and the B0/B1 code snapshots are hashed in `KIT_FREEZE.sha256`. The manifest's own sha256 prefix is `581072f89f67c646`, and the files are read-only. The code under test is tag `v0.2-bench2`. Counted trials start after this commit.
 
+### Amendment 6 (2026-09-27): subagent cap, kit v2, and restarting the count
+
+**What happened under kit v1.** The first counted group (`km61a` A, `km61z` B0, `km61b` B1) ran three M6 trials at once.
+- **Concurrency.** A's master ran 6 workers in parallel and B0's ran 4, so up to 9 `glm-5.3-flash` sessions were live at the same time.
+- **Rate limit.** The z.ai account answered with 48 `429` responses (code 1302, "Rate limit reached for requests"). The first came at 6 concurrent sessions, and none came at 4 or fewer.
+- **Outcomes.**
+  - `km61a` (A) accumulated 444 s of provider errors and was void. It was stopped early, because the void rule can only grow the error total.
+  - `km61z` (B0) was void on outage time (139 s). Its master had also re-spawned children on `gpt-6-sol` to get round the limit, which the model rule excludes.
+  - `km61b` (B1) stacks its tasks and runs one worker at a time, so it was barely affected.
+
+**Earlier runs.** Every earlier run peaked at 1–3 concurrent GLM sessions and got no `429`: the round-1 trials, and the dry-run pairs `d1`, `d2` and `d5`.
+
+**Why this biases the comparison.** The arms that parallelize (A, and B0 in M6) are the ones that exceed the provider limit. Void trials would pile up in those arms, which is the survivor bias that amendment 3 guards against. Pier's own subagent semaphore is not configurable and did not hold the level; Pier is not modified by this project.
+
+**Changes (kit v2).**
+1. The master prompt of every arm and scenario gets the same sentence:
+   > Run at most 3 subagents (workers and reviewers together) at the same time; start another only when one has finished.
+
+   It only binds where a master would otherwise run more than 3 at once, which in this design means M6. M6 remains a six-task workload with shared-file conflicts: A and B0 still run up to 3 tasks in parallel.
+2. Scheduling: M6 trials run one at a time; I6 and I7 run at most two trials at a time. This keeps total GLM concurrency at the level of the earlier runs, which never hit the limit.
+3. The kit is re-frozen as v2 (`KIT_FREEZE_v2.sha256`, sha256 prefix `dc9a8c502ba03cd9`). The only file that changed is `prompt.py`. The code under test is unchanged (`v0.2-bench2`).
+4. Following the freeze rule, **counting restarts from zero under kit v2**, and v2 trial ids start with `q`. `km61a`, `km61z` and `km61b` are reported separately as pre-restart trials and are never pooled with v2 results. `km61b` was allowed to finish, because it is the only complete B1 run on M6 and its wall time informs the M6 timeout risk.
+5. The master re-spawning children on another model is now a known failure mode. The existing rule applies: any trial in which a role ran on another model is excluded and reported, per arm.
+
 ## Question
 
 Given the same Pier setup, models, repository and task specs, do the deterministic task tools:
