@@ -285,6 +285,21 @@ If a limit that is not visible now (for example a weekly cap) stops the round, i
 4. Following the freeze rule, **counting restarts from zero under kit v2**, and v2 trial ids start with `q`. `km61a`, `km61z` and `km61b` are reported separately as pre-restart trials and are never pooled with v2 results. `km61b` was allowed to finish, because it is the only complete B1 run on M6 and its wall time informs the M6 timeout risk.
 5. The master re-spawning children on another model is now a known failure mode. The existing rule applies: any trial in which a role ran on another model is excluded and reported, per arm.
 
+### Amendment 7 (2026-09-27): deviation: subagents' questions go unanswered
+
+**What happened.** In `qm61z`, a reviewer called `ask_user_question` while it was running, and the operator logged `ASK_UNANSWERABLE`.
+- **Cause.** Pier writes a subagent's `sessionFile` into its ledger row only when the subagent settles, and the row it writes while the subagent runs has none. The kit v2 operator maps a session file to a pane through that field. It therefore cannot find the pane of a subagent that asks while running, which is the only time a subagent can ask.
+- **Result.** Such questions are not answered with the fixed text. Pier aborts them within seconds, and the child continues ("This operation was aborted"). Round-1 `i7a` showed the same abort without any operator involvement.
+- **The master is not affected.** The operator finds the master's pane from the launch record, so the master's own questions are answered.
+
+**Decision.** The kit is not changed, so kit v2 stays frozen and counting does not restart. This is recorded as a deviation from the policy "answer every `ask_user_question`".
+- It affects every arm in the same way.
+- An aborted question tells the child the same thing as the fixed answer: no human is available.
+
+For each arm, the results report how many subagent questions went unanswered.
+
+**`qm61z`.** B0, M6, void: 2728 s of provider errors, including a 43-minute codex connection failure of the master (`fetch failed`, 03:04–03:47 UTC), ending in a timeout. It is rerun once as `qm61zr`.
+
 ## Question
 
 Given the same Pier setup, models, repository and task specs, do the deterministic task tools:
