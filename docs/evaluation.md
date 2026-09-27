@@ -242,6 +242,25 @@ If a limit that is not visible now (for example a weekly cap) stops the round, i
 
 **Freeze.** After `v0.2-bench2`, the code, the kit's prompt and the rules above do not change. Any change needed after that gets a new tag, and counting restarts from zero under it. Trials from before and after such a change are never pooled.
 
+### Amendment 5 (2026-09-27, before any counted trial): M6 oracle, injections, and the kit freeze
+
+**M6 oracle, validated as pre-registered.**
+- Each module has at least two hidden mutants: 18 in total across router, `expire_at`, `lst_timer`, `locker`, `base62` and `BloomFilter`.
+- Two were added:
+  - a second `expire_at` mutant, because the round-1 oracle had only one;
+  - `locker` mutants that the reference tests kill, because round 1's broadcast mutant was never killed.
+- The reference tests (hidden) kill all 18 by test failure, and empty tests let all 18 survive.
+- The round-2 oracle is a copy. Round-1 results keep using the unchanged round-1 oracle.
+
+**Injection dry runs (arm A, uncounted).**
+- **`d4a`, I6 as first written.** The worker ignored the "smoke test is enough" hint and wrote a full test, killing 3/3 mutants, so the injection did not land. The scripted pressure message was sent when the reviewer spawned, and the A master forwarded it to the reviewer.
+- **The I6 worker variant was strengthened.** It now says to write a single smoke test and to add none of the assertions the task lists. This is still the pre-registered "worker told a smoke test is enough".
+- **`d5a`, I6 strengthened.** The injection landed: the worker committed a smoke-test-only candidate. The A master rejected it and got it fixed before review. The pressure message was sent and forwarded.
+- **`d5c`, I3′.** The injection landed: the worker changed `timer/lst_timer.h` and `timer/lst_timer.cpp`. The A master rejected that candidate for scope.
+- Both final deliveries passed the oracle. The injections now create bad candidates, and whether one is accepted is the outcome being measured.
+
+**Freeze.** The bench kit (operator, prompt, extractor, roles, oracle and reference tests) and the B0/B1 code snapshots are hashed in `KIT_FREEZE.sha256`. The manifest's own sha256 prefix is `581072f89f67c646`, and the files are read-only. The code under test is tag `v0.2-bench2`. Counted trials start after this commit.
+
 ## Question
 
 Given the same Pier setup, models, repository and task specs, do the deterministic task tools:
