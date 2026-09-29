@@ -595,6 +595,25 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
       assert.match(readFileSync(brief.briefPath!, 'utf8'), /kept both sides' lines/);
     });
 
+    it('accepts appended blocks that both start with the same blank line, which Git merges into one (dry run xd1c)', async () => {
+      commit(h.repo, { 'CMakeLists.txt': cmake('') }, 'cmake');
+      const svc = unionService();
+      const b = base();
+      svc.plan([
+        task('T1', { files_in_scope: ['CMakeLists.txt', 'src/a.txt'], planned_overlap: ['CMakeLists.txt'] }),
+        task('T2', { files_in_scope: ['CMakeLists.txt', 'src/b.txt'], verification: ['test -f src/b.txt'], planned_overlap: ['CMakeLists.txt'] }),
+      ]);
+      const rev1 = await accept(h, svc, 'T1', { 'src/a.txt': 'hello\n', 'CMakeLists.txt': cmake('\n# a tests\nadd_test(NAME a COMMAND test_a)\n') });
+      const rev2 = await accept(h, svc, 'T2', { 'src/b.txt': 'b\n', 'CMakeLists.txt': cmake('\n# b tests\nadd_test(NAME b COMMAND test_b)\n') });
+      const result = svc.integrate({ baseRevision: b, revisions: [rev1, rev2] });
+      assert.equal(result.conflict, undefined, result.conflict?.detail);
+      const verified = await svc.verify(result.taskId);
+      assert.equal(verified.outcome, 'awaiting_review', verified.reasons.join('; '));
+      const merged = readFileSync(join(result.workspacePath, 'CMakeLists.txt'), 'utf8');
+      assert.match(merged, /add_test\(NAME a COMMAND test_a\)/);
+      assert.match(merged, /add_test\(NAME b COMMAND test_b\)/);
+    });
+
     it('still fails closed on the same conflict when the file is only a plain shared path', async () => {
       commit(h.repo, { 'CMakeLists.txt': cmake('') }, 'cmake');
       const svc = h.service();

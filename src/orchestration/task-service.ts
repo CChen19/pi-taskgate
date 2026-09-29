@@ -863,7 +863,7 @@ export class TaskService {
     const picked = lineChangesByPath(this.ports.history.commitLineDiff(entry.integrated));
     const problems: string[] = [];
     for (const path of new Set([...source.keys(), ...picked.keys()])) {
-      if (union.has(path)) { problems.push(...unionPickProblems(path, source.get(path), picked.get(path))); continue; }
+      if (union.has(path)) { problems.push(...unionPickProblems(path, source.get(path), picked.get(path), (this.ports.history.fileAt(entry.integrated, path) ?? '').split('\n'))); continue; }
       const want = source.get(path);
       const got = picked.get(path);
       if (want === undefined || got === undefined || want.added.join('\n') !== got.added.join('\n') || want.removed.join('\n') !== got.removed.join('\n')) {

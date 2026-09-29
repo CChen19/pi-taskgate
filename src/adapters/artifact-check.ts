@@ -147,15 +147,25 @@ function sameMultiset(a: readonly string[], b: readonly string[]): boolean {
 
 /**
  * Why a union-merged cherry-pick does not carry exactly its source's changes to
- * a union-merged file, or [] when it does: the same added lines and the same
- * removed lines (as multisets; positions may differ because the other side's
- * lines are kept too).
+ * a union-merged file, or [] when it does. The pick must remove exactly the
+ * source's removed lines, and add no line the source did not add. Git merges a
+ * line that both sides added identically (e.g. a separating blank line) into
+ * one, so a source-added line may be missing from the pick's own added lines;
+ * it is accepted only when the resulting file (`resultLines`) holds that line at
+ * least as often as the source added it.
  */
-export function unionPickProblems(path: string, source: FileLineChanges | undefined, picked: FileLineChanges | undefined): readonly string[] {
+export function unionPickProblems(path: string, source: FileLineChanges | undefined, picked: FileLineChanges | undefined, resultLines: readonly string[] = []): readonly string[] {
   const want = source ?? { added: [], removed: [] };
   const got = picked ?? { added: [], removed: [] };
   const problems: string[] = [];
-  if (!sameMultiset(want.added, got.added)) problems.push(`${path}: the picked commit adds ${got.added.length} line(s) where its source adds ${want.added.length}, or different lines`);
+  const count = (lines: readonly string[]) => { const map = new Map<string, number>(); for (const line of lines) map.set(line, (map.get(line) ?? 0) + 1); return map; };
+  const wantAdded = count(want.added);
+  const gotAdded = count(got.added);
+  const extra = [...gotAdded].filter(([line, n]) => n > (wantAdded.get(line) ?? 0)).map(([line]) => line);
+  if (extra.length > 0) problems.push(`${path}: the picked commit adds line(s) its source does not add: ${extra.slice(0, 3).map((line) => JSON.stringify(line)).join(', ')}`);
+  const inResult = count(resultLines);
+  const missing = [...wantAdded].filter(([line, n]) => n > (gotAdded.get(line) ?? 0) && (inResult.get(line) ?? 0) < n).map(([line]) => line);
+  if (missing.length > 0) problems.push(`${path}: line(s) the source adds are not in the merged file: ${missing.slice(0, 3).map((line) => JSON.stringify(line)).join(', ')}`);
   if (!sameMultiset(want.removed, got.removed)) problems.push(`${path}: the picked commit removes ${got.removed.length} line(s) where its source removes ${want.removed.length}, or different lines`);
   return problems;
 }

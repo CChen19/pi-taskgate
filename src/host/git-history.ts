@@ -35,6 +35,8 @@ export interface GitHistoryPort {
   cherryPick(cwd: string, commits: readonly string[], options?: { readonly unionPaths?: readonly string[] }): ApplyResult;
   /** `git show -U0` of one commit (no context lines), for line-level comparison of a pick with its source. */
   commitLineDiff(commit: string): string;
+  /** A file's content at a revision, or undefined when the path does not exist there. */
+  fileAt(revision: string, path: string): string | undefined;
   /** Stable patch id of one commit (content identity independent of parents and line numbers). */
   patchId(commit: string): string;
   /** Source commit named by the `-x` trailer, if any. */
@@ -113,6 +115,15 @@ export class GitHistory implements GitHistoryPort {
     } finally {
       if (attributesDir !== undefined) rmSync(attributesDir, { recursive: true, force: true });
     }
+  }
+
+  fileAt(revision: string, path: string): string | undefined {
+    requireId(revision, 'revision');
+    const result = this.options.commandRunner.run({ command: 'git', args: ['show', `${revision}:${path}`], cwd: this.options.repoRoot, env: minimalProcessEnv(undefined), timeoutMs: this.options.timeoutMs ?? 60_000, maxOutputBytes: DIFF_LIMIT });
+    if (result.status !== 'exited' || result.timedOut) throw new Error(`git show ${revision}:${path} could not run`);
+    if (result.exitCode !== 0) return undefined;
+    if (result.stdoutTruncated) throw new Error(`${path} at ${revision} is too large to check`);
+    return result.stdout;
   }
 
   commitLineDiff(commit: string): string {

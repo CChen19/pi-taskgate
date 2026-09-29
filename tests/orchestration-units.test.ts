@@ -106,10 +106,17 @@ describe('line changes for union-merged picks', () => {
   it('accepts the same lines in another order, and refuses extra, missing, or changed lines', () => {
     const source = { added: ['a', 'b', 'b'], removed: [] };
     assert.deepEqual(unionPickProblems('CMakeLists.txt', source, { added: ['b', 'a', 'b'], removed: [] }), []);
-    assert.equal(unionPickProblems('CMakeLists.txt', source, { added: ['a', 'b'], removed: [] }).length, 1);
+    assert.equal(unionPickProblems('CMakeLists.txt', source, { added: ['a', 'b'], removed: [] }, ['a']).length, 1, 'a missing b that is not in the merged file');
     assert.equal(unionPickProblems('CMakeLists.txt', source, { added: ['a', 'b', 'b', 'c'], removed: [] }).length, 1);
     assert.equal(unionPickProblems('CMakeLists.txt', source, { added: ['a', 'b', 'b'], removed: ['x'] }).length, 1);
     assert.deepEqual(unionPickProblems('CMakeLists.txt', undefined, undefined), []);
+  });
+
+  it('accepts a line both sides added identically, merged into one, when the merged file still has it (dry run xd1c)', () => {
+    const source = { added: ['', '# bloom', 'add_test(bloom)'], removed: [] };
+    const picked = { added: ['# bloom', 'add_test(bloom)'], removed: [] };
+    assert.deepEqual(unionPickProblems('CMakeLists.txt', source, picked, ['project(x)', '', '# base62', 'add_test(base62)', '# bloom', 'add_test(bloom)']), []);
+    assert.equal(unionPickProblems('CMakeLists.txt', source, { added: ['', '# bloom'], removed: [] }, ['project(x)', '', '# bloom']).length, 1, 'a dropped test registration is refused');
   });
 });
 
