@@ -103,3 +103,59 @@ export function findAddedAsserts(unifiedDiff: string): readonly AddedAssert[] {
   }
   return found;
 }
+
+export interface FileLineChanges {
+  readonly added: readonly string[];
+  readonly removed: readonly string[];
+}
+
+/**
+ * Added and removed lines per file of a unified diff (`git diff -U0` or
+ * `git show -U0`), in diff order. Renames are keyed by the new path.
+ */
+export function lineChangesByPath(unifiedDiff: string): ReadonlyMap<string, FileLineChanges> {
+  const byPath = new Map<string, { added: string[]; removed: string[] }>();
+  let oldPath: string | undefined;
+  let path: string | undefined;
+  for (const line of unifiedDiff.split('\n')) {
+    if (line.startsWith('diff --git ')) { oldPath = undefined; path = undefined; continue; }
+    if (line.startsWith('--- ')) { const source = line.slice(4).trim(); oldPath = source === '/dev/null' ? undefined : source.replace(/^a\//, ''); continue; }
+    if (line.startsWith('+++ ')) {
+      const target = line.slice(4).trim();
+      path = target === '/dev/null' ? oldPath : target.replace(/^b\//, '');
+      if (path !== undefined && !byPath.has(path)) byPath.set(path, { added: [], removed: [] });
+      continue;
+    }
+    if (path === undefined || line.startsWith('@@') || line.startsWith('\\')) continue;
+    if (line.startsWith('+')) byPath.get(path)!.added.push(line.slice(1));
+    else if (line.startsWith('-')) byPath.get(path)!.removed.push(line.slice(1));
+  }
+  return byPath;
+}
+
+function sameMultiset(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const counts = new Map<string, number>();
+  for (const line of a) counts.set(line, (counts.get(line) ?? 0) + 1);
+  for (const line of b) {
+    const count = counts.get(line) ?? 0;
+    if (count === 0) return false;
+    counts.set(line, count - 1);
+  }
+  return true;
+}
+
+/**
+ * Why a union-merged cherry-pick does not carry exactly its source's changes to
+ * a union-merged file, or [] when it does: the same added lines and the same
+ * removed lines (as multisets; positions may differ because the other side's
+ * lines are kept too).
+ */
+export function unionPickProblems(path: string, source: FileLineChanges | undefined, picked: FileLineChanges | undefined): readonly string[] {
+  const want = source ?? { added: [], removed: [] };
+  const got = picked ?? { added: [], removed: [] };
+  const problems: string[] = [];
+  if (!sameMultiset(want.added, got.added)) problems.push(`${path}: the picked commit adds ${got.added.length} line(s) where its source adds ${want.added.length}, or different lines`);
+  if (!sameMultiset(want.removed, got.removed)) problems.push(`${path}: the picked commit removes ${got.removed.length} line(s) where its source removes ${want.removed.length}, or different lines`);
+  return problems;
+}

@@ -13,7 +13,7 @@
  * board before it is persisted, so a refused operation leaves state unchanged.
  */
 import { createHash, randomBytes } from 'node:crypto';
-import { checkArtifact, findAddedAsserts } from '../adapters/artifact-check.ts';
+import { checkArtifact, findAddedAsserts, lineChangesByPath, unionPickProblems } from '../adapters/artifact-check.ts';
 import type { WorktreeManager, WorktreePort, WorkspaceLease, WorkspaceInspection, WorktreeSessionBinding } from '../adapters/worktree-manager.ts';
 import { assembleReviewerBrief, decideFinalVerdict } from '../core/reviewer-brief.ts';
 import { validateTaskContract, type TaskContract } from '../core/task-contract.ts';
@@ -38,7 +38,16 @@ export interface TaskServiceSettings {
   readonly sharedPaths: readonly string[];
   /** Reject new assert( calls in C/C++ test sources (repos that verify with -DNDEBUG). */
   readonly rejectTestAsserts: boolean;
+  /** Shared files merged with Git's union driver at integration; tasks may only add lines to them. */
+  readonly unionMergePaths?: readonly string[];
+  /** Most agents (workers and reviewers) running at once, counted by the host; unset means no cap. */
+  readonly maxParallelAgents?: number;
+  /** Directories whose Pier subagents count toward maxParallelAgents (the repository and the workspace root). */
+  readonly capacityRoots?: readonly string[];
 }
+
+/** A start or review granted this recently still holds a slot until Pier records its subagent. */
+const RESERVATION_MS = 120_000;
 
 export interface TaskServicePorts {
   readonly worktrees: WorktreeManager;
@@ -93,7 +102,8 @@ export type ServiceErrorCode =
   | 'REVISION_MISMATCH'
   | 'STATE_REJECTED'
   | 'NOT_ACCEPTED'
-  | 'INTEGRATION_FAILED';
+  | 'INTEGRATION_FAILED'
+  | 'CAPACITY';
 
 export class TaskServiceError extends Error {
   readonly code: ServiceErrorCode;
@@ -353,6 +363,7 @@ export class TaskService {
       }
       fail('BUDGET_EXHAUSTED', `${taskId} has used ${task.attemptRecords.length}/${limit} attempts`);
     }
+    this.requireCapacity(`start ${taskId}`);
     const attemptId = `${taskId}:attempt-${task.attemptRecords.length + 1}`;
     const previous = task.attemptRecords[task.attemptRecords.length - 1];
     let lease: WorkspaceLease;
@@ -396,7 +407,7 @@ export class TaskService {
       baseRevision: lease.baseRevision,
       ...(reusedFrom === undefined ? {} : { reusedFrom }),
       ...(stackedOn === undefined ? {} : { stackedOn }),
-      prompt: renderWorkerBrief({ contract: task.contract, attemptId, workspacePath: lease.workspacePath, branch: lease.branch, baseRevision: lease.baseRevision, ...(stackedOn === undefined ? {} : { stackedOn }), feedback, rejectTestAsserts: this.settings.rejectTestAsserts }),
+      prompt: renderWorkerBrief({ contract: task.contract, attemptId, workspacePath: lease.workspacePath, branch: lease.branch, baseRevision: lease.baseRevision, ...(stackedOn === undefined ? {} : { stackedOn }), feedback, rejectTestAsserts: this.settings.rejectTestAsserts, unionShared: this.unionPathsIn(task.contract.files_in_scope ?? []) }),
       spawn: { description: `${taskId}:impl`, cwd: lease.workspacePath, run_in_background: true },
     };
   }
@@ -513,6 +524,7 @@ export class TaskService {
     const lease = this.liveLease(attempt);
     const guard = this.guardCandidate(task, attempt, lease, candidate);
     if (guard !== undefined) return { taskId, outcome: 'rejected', state: this.task(taskId).state, reasons: guard };
+    this.requireCapacity(`review ${taskId}`);
     let diff: string;
     try {
       diff = this.ports.readDiff(lease.workspacePath, lease.baseRevision, candidate.revision);
@@ -677,7 +689,7 @@ export class TaskService {
     inputs.forEach((input) => input.commits.forEach((commit) => owner.set(commit, input.revision)));
     let applied;
     try {
-      applied = this.ports.history.cherryPick(lease.workspacePath, inputs.flatMap((input) => input.commits));
+      applied = this.ports.history.cherryPick(lease.workspacePath, inputs.flatMap((input) => input.commits), { unionPaths: this.settings.unionMergePaths ?? [] });
     } catch (error) {
       this.commit({ v: 1, type: 'attempt_failed', at: this.ports.clock(), taskId, attemptId, reason: `integration could not run: ${message(error)}`, terminal: true });
       return { taskId, state: this.task(taskId).state, baseRevision: base, branch: lease.branch, workspacePath: lease.workspacePath, inputs, applied: [], reason: message(error) };
@@ -765,16 +777,27 @@ export class TaskService {
     }
   }
 
-  /** Guards on the committed diff beyond scope: new assert() in tests (when configured), and integration history fidelity. */
+  /**
+   * Guards on the committed diff beyond scope: new assert() in tests (when configured),
+   * add-only changes to union-merged shared files, and integration history fidelity.
+   */
   private artifactGuards(task: TaskView, attempt: AttemptRecord, lease: WorkspaceLease, revision: string): string[] {
     const reasons: string[] = [];
-    if (this.settings.rejectTestAsserts) {
+    const unionOwn = task.integration === undefined ? this.unionPathsIn(task.contract.files_in_scope ?? []) : [];
+    if (this.settings.rejectTestAsserts || unionOwn.length > 0) {
       try {
         const diff = this.ports.history.changedLineDiff(lease.workspacePath, lease.baseRevision, revision);
-        if (diff.truncated) reasons.push('diff is too large to scan for assert() in tests');
-        const asserts = findAddedAsserts(diff.text);
-        if (asserts.length > 0) {
-          reasons.push(`new assert() in test code is compiled out by Release builds (-DNDEBUG); use the repo's non-assert check pattern: ${asserts.slice(0, 5).map((entry) => `${entry.path}: ${entry.text}`).join(' | ')}`);
+        if (diff.truncated) reasons.push('diff is too large to scan line by line');
+        if (this.settings.rejectTestAsserts) {
+          const asserts = findAddedAsserts(diff.text);
+          if (asserts.length > 0) {
+            reasons.push(`new assert() in test code is compiled out by Release builds (-DNDEBUG); use the repo's non-assert check pattern: ${asserts.slice(0, 5).map((entry) => `${entry.path}: ${entry.text}`).join(' | ')}`);
+          }
+        }
+        const changes = lineChangesByPath(diff.text);
+        for (const path of unionOwn) {
+          const removed = changes.get(path)?.removed ?? [];
+          if (removed.length > 0) reasons.push(`${path} is merged with parallel tasks by keeping every task's added lines, so a task may only add lines to it; this change removes or edits ${removed.length} existing line(s): ${removed.slice(0, 3).map((line) => JSON.stringify(line.trim())).join(', ')}`);
         }
       } catch (error) {
         reasons.push(`could not scan the diff: ${message(error)}`);
@@ -792,7 +815,9 @@ export class TaskService {
         if (actual.join(',') !== applied.map((entry) => entry.integrated).join(',')) reasons.push(`history ${spec.baseRevision}..HEAD does not match the recorded integrated commits`);
         for (const entry of applied) {
           if (this.ports.history.pickedFrom(entry.integrated) !== entry.source) reasons.push(`${entry.integrated} does not name ${entry.source} as its cherry-pick source`);
-          if (this.ports.history.patchId(entry.integrated) !== this.ports.history.patchId(entry.source)) reasons.push(`${entry.integrated} is not patch-identical to ${entry.source}`);
+          if (this.ports.history.patchId(entry.integrated) === this.ports.history.patchId(entry.source)) continue;
+          if (entry.resolved !== 'union') { reasons.push(`${entry.integrated} is not patch-identical to ${entry.source}`); continue; }
+          reasons.push(...this.unionPickCheck(entry));
         }
       } catch (error) {
         reasons.push(`could not check integration history: ${message(error)}`);
@@ -805,12 +830,66 @@ export class TaskService {
     const spec = task.integration;
     if (spec === undefined) return [];
     const byIntegrated = new Map((attempt.integration?.applied ?? []).map((entry) => [entry.source, entry.integrated]));
+    const merged = new Set((attempt.integration?.applied ?? []).filter((entry) => entry.resolved === 'union').map((entry) => entry.source));
     return [
       `This is an INTEGRATION review. Base revision: ${spec.baseRevision}. Integrated revision: ${attempt.integration?.revision ?? '(none)'}.`,
       'Declared inputs (each was separately verified and freshly reviewed; review how they combine):',
-      ...spec.inputs.map((input) => `- ${input.taskId} candidate ${input.revision} (built on ${input.baseRevision === undefined || input.baseRevision === spec.baseRevision ? 'the base' : input.baseRevision.slice(0, 12)}): ${input.commits.map((commit) => `${commit.slice(0, 12)} → ${byIntegrated.get(commit)?.slice(0, 12) ?? '?'}`).join(', ')}`),
+      ...spec.inputs.map((input) => `- ${input.taskId} candidate ${input.revision} (built on ${input.baseRevision === undefined || input.baseRevision === spec.baseRevision ? 'the base' : input.baseRevision.slice(0, 12)}): ${input.commits.map((commit) => `${commit.slice(0, 12)} → ${byIntegrated.get(commit)?.slice(0, 12) ?? '?'}${merged.has(commit) ? ' (union-merged)' : ''}`).join(', ')}`),
+      ...(merged.size === 0 ? [] : [`Picks marked (union-merged) conflicted in a human-declared shared file (${(this.settings.unionMergePaths ?? []).join(', ')}). The host kept both sides' lines and checked that each pick adds and removes exactly its source's lines; the order of the kept blocks is Git's. Check the combined file: nothing duplicated or interleaved, every target defined before use.`]),
       'Focus on: the combined diff; cross-task interactions; CMake/test wiring (every new test built and registered once); unexpected files; and whether the integrated history matches the declared revisions.',
     ];
+  }
+
+  /** The configured union-merged files among `scope` (exact file entries or files under a listed directory). */
+  private unionPathsIn(scope: readonly string[]): readonly string[] {
+    return (this.settings.unionMergePaths ?? []).filter((path) => scope.some((entry) => entry === path || (entry.endsWith('/') && path.startsWith(entry))));
+  }
+
+  /**
+   * A union-merged pick must carry exactly its source's changes: identical, in order,
+   * outside the union files; the same added and removed lines inside them (the other
+   * side's lines are kept too, so positions may differ).
+   */
+  private unionPickCheck(entry: AppliedCommit): string[] {
+    const union = new Set(this.settings.unionMergePaths ?? []);
+    const source = lineChangesByPath(this.ports.history.commitLineDiff(entry.source));
+    const picked = lineChangesByPath(this.ports.history.commitLineDiff(entry.integrated));
+    const problems: string[] = [];
+    for (const path of new Set([...source.keys(), ...picked.keys()])) {
+      if (union.has(path)) { problems.push(...unionPickProblems(path, source.get(path), picked.get(path))); continue; }
+      const want = source.get(path);
+      const got = picked.get(path);
+      if (want === undefined || got === undefined || want.added.join('\n') !== got.added.join('\n') || want.removed.join('\n') !== got.removed.join('\n')) {
+        problems.push(`${path}: ${entry.integrated} differs from its source ${entry.source} outside the union-merged files`);
+      }
+    }
+    return problems.map((problem) => `union-merged pick ${entry.integrated.slice(0, 12)}: ${problem}`);
+  }
+
+  /** Refuse to start another agent when the configured cap is reached. */
+  private requireCapacity(action: string): void {
+    const cap = this.settings.maxParallelAgents;
+    if (cap === undefined) return;
+    const roots = this.settings.capacityRoots ?? [];
+    if (this.ports.ledger.latestUnder === undefined || roots.length === 0) fail('CAPACITY', `maxParallelAgents is ${cap}, but the host cannot count running agents here`);
+    const rows = this.ports.ledger.latestUnder(roots);
+    const running = rows.filter((row) => row.status === 'running');
+    const now = this.ports.clock();
+    // Once Pier has any row for a subagent launched there since, the start is counted (or finished) through the ledger.
+    const recorded = (cwd: string, since: number) => rows.some((row) => row.cwd === cwd && row.createdAt >= since);
+    const reserved: string[] = [];
+    for (const task of this.board.tasks()) {
+      const attempt = task.attemptRecords[task.attemptRecords.length - 1];
+      if (attempt === undefined) continue;
+      const cwd = attempt.lease.workspacePath;
+      if (task.state === 'RUNNING' && task.integration === undefined && attempt.agentId === undefined && now - attempt.startedAt < RESERVATION_MS && !recorded(cwd, attempt.startedAt)) reserved.push(`${task.id} worker (just started)`);
+      const review = attempt.review;
+      if (task.state === 'VERIFYING' && review !== undefined && review.verdict === undefined && now - review.issuedAt < RESERVATION_MS && !recorded(cwd, review.issuedAt)) reserved.push(`${task.id} reviewer (just requested)`);
+    }
+    const busy = running.length + reserved.length;
+    if (busy < cap) return;
+    const listed = [...running.map((row) => `${row.paneId} (${row.kind}) in ${row.cwd}`), ...reserved];
+    fail('CAPACITY', `cannot ${action}: ${busy} agent(s) are running or were just started, and the human-configured cap is ${cap}: ${listed.join('; ')}. End your turn and wait for Pier's notice that one finished; abandon an attempt whose agent died`);
   }
 
   private nextIntegrationId(): string {

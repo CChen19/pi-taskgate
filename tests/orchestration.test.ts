@@ -50,6 +50,11 @@ class FakeLedger implements WorkerLedger {
   latest(cwd: string, paneId: string): WorkerLedgerRow | undefined {
     return [...this.rows].reverse().find((row) => row.cwd === cwd && row.paneId === paneId);
   }
+  latestUnder(roots: readonly string[]): readonly WorkerLedgerRow[] {
+    const latest = new Map<string, WorkerLedgerRow>();
+    for (const row of this.rows) if (roots.some((root) => row.cwd === root || row.cwd.startsWith(`${root}/`))) latest.set(row.paneId, row);
+    return [...latest.values()];
+  }
   /** A reviewer that received exactly the issued prompt and read its whole brief. */
   briefed(reviewId: string): { userMessages: string[]; reads: SessionReadCall[] } {
     const request = [...this.events].reverse().find((event) => event.type === 'review_requested' && event.reviewId === reviewId);
@@ -557,6 +562,111 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
       assert.equal(verified.outcome, 'attempt_failed');
       assert.match(verified.reasons.join(' '), /not the recorded integrated revision/);
       assert.equal(svc.task(result.taskId).state, 'FAILED');
+    });
+  });
+
+  describe('union-merged shared files (design batch 1)', () => {
+    const base = () => git(h.repo, ['rev-parse', 'HEAD']).trim();
+    const unionService = () => new TaskService((h.service() as unknown as { ports: never }).ports, { ...SETTINGS, unionMergePaths: ['CMakeLists.txt'] });
+    const cmake = (block: string) => `project(x)\nadd_library(core core.cpp)\n${block}`;
+
+    it('integrates parallel appends to a union-merged file, checks each pick line by line, and marks it for the reviewer', async () => {
+      commit(h.repo, { 'CMakeLists.txt': cmake('') }, 'cmake');
+      const svc = unionService();
+      const b = base();
+      svc.plan([
+        task('T1', { files_in_scope: ['CMakeLists.txt', 'src/a.txt'], planned_overlap: ['CMakeLists.txt'] }),
+        task('T2', { files_in_scope: ['CMakeLists.txt', 'src/b.txt'], verification: ['test -f src/b.txt'], planned_overlap: ['CMakeLists.txt'] }),
+      ]);
+      const rev1 = await accept(h, svc, 'T1', { 'src/a.txt': 'hello\n', 'CMakeLists.txt': cmake('add_executable(test_a a.cpp)\nadd_test(NAME a COMMAND test_a)\n') });
+      const rev2 = await accept(h, svc, 'T2', { 'src/b.txt': 'b\n', 'CMakeLists.txt': cmake('add_executable(test_b b.cpp)\nadd_test(NAME b COMMAND test_b)\n') });
+      const result = svc.integrate({ baseRevision: b, revisions: [rev1, rev2] });
+      assert.equal(result.conflict, undefined, result.conflict?.detail);
+      assert.equal(result.state, 'RUNNING');
+      assert.equal(result.applied[0]!.resolved, undefined, 'the first pick applies cleanly');
+      assert.equal(result.applied[1]!.resolved, 'union');
+      const merged = readFileSync(join(result.workspacePath, 'CMakeLists.txt'), 'utf8');
+      for (const line of ['add_library(core core.cpp)', 'add_test(NAME a COMMAND test_a)', 'add_test(NAME b COMMAND test_b)']) assert.equal(merged.split('\n').filter((entry) => entry === line).length, 1, line);
+      assert.equal(existsSync(join(h.repo, '.git', 'info', 'attributes')) && /union/.test(readFileSync(join(h.repo, '.git', 'info', 'attributes'), 'utf8')), false, 'the repository attributes are untouched');
+      const verified = await svc.verify(result.taskId);
+      assert.equal(verified.outcome, 'awaiting_review', verified.reasons.join('; '));
+      const brief = svc.reviewBrief(result.taskId);
+      assert.match(readFileSync(brief.briefPath!, 'utf8'), /\(union-merged\)/);
+      assert.match(readFileSync(brief.briefPath!, 'utf8'), /kept both sides' lines/);
+    });
+
+    it('still fails closed on the same conflict when the file is only a plain shared path', async () => {
+      commit(h.repo, { 'CMakeLists.txt': cmake('') }, 'cmake');
+      const svc = h.service();
+      svc.plan([
+        task('T1', { files_in_scope: ['CMakeLists.txt', 'src/a.txt'], planned_overlap: ['CMakeLists.txt'] }),
+        task('T2', { files_in_scope: ['CMakeLists.txt', 'src/b.txt'], verification: ['test -f src/b.txt'], planned_overlap: ['CMakeLists.txt'] }),
+      ]);
+      const b = base();
+      const rev1 = await accept(h, svc, 'T1', { 'src/a.txt': 'hello\n', 'CMakeLists.txt': cmake('add_test(NAME a COMMAND test_a)\n') });
+      const rev2 = await accept(h, svc, 'T2', { 'src/b.txt': 'b\n', 'CMakeLists.txt': cmake('add_test(NAME b COMMAND test_b)\n') });
+      const result = svc.integrate({ baseRevision: b, revisions: [rev1, rev2] });
+      assert.equal(result.state, 'FAILED');
+      assert.deepEqual(result.conflict?.paths, ['CMakeLists.txt']);
+    });
+
+    it('lets tasks only add lines to a union-merged file, and says so in the worker brief', async () => {
+      commit(h.repo, { 'CMakeLists.txt': cmake('') }, 'cmake');
+      const svc = unionService();
+      svc.plan([task('T1', { files_in_scope: ['CMakeLists.txt', 'src/a.txt'] })]);
+      const { started, verified } = await toCandidate(h, svc, 'T1', { 'src/a.txt': 'hello\n', 'CMakeLists.txt': 'project(y)\nadd_library(core core.cpp)\n' });
+      assert.match(started.prompt!, /CMakeLists\.txt is shared with tasks running in parallel\. .*only add lines there/);
+      assert.equal(verified.outcome, 'check_failed');
+      assert.match(verified.reasons.join(' '), /CMakeLists\.txt is merged with parallel tasks .* may only add lines to it; this change removes or edits 1 existing line\(s\): "project\(x\)"/);
+      const plain = h.service();
+      plain.plan([task('T9', { files_in_scope: ['CMakeLists.txt'] })]);
+      assert.doesNotMatch(plain.start('T9').prompt!, /shared with tasks running in parallel/);
+    });
+  });
+
+  describe('agent cap (design batch 1)', () => {
+    const capped = (cap: number, roots: readonly string[] = [h.workspaceRoot]) => new TaskService((h.service() as unknown as { ports: never }).ports, { ...SETTINGS, maxParallelAgents: cap, capacityRoots: roots });
+    const three = () => [task('T1', { files_in_scope: ['src/a.txt'] }), task('T2', { files_in_scope: ['src/b.txt'], verification: ['test -f src/b.txt'] }), task('T3', { files_in_scope: ['src/c.txt'] })];
+
+    it('counts Pier\'s running subagents and starts it has not recorded yet, and frees a slot when one settles', async () => {
+      const svc = capped(2);
+      svc.plan(three());
+      const one = svc.start('T1');
+      const two = svc.start('T2');
+      await assert.rejects(async () => svc.start('T3'), (error: unknown) => error instanceof TaskServiceError && error.code === 'CAPACITY' && /cap is 2/.test(error.message) && /T1 worker \(just started\)/.test(error.message));
+      h.ledger.add({ paneId: 'w:1', cwd: one.workspacePath!, createdAt: h.now.value + 1 });
+      h.ledger.add({ paneId: 'w:2', cwd: two.workspacePath!, createdAt: h.now.value + 1 });
+      await assert.rejects(async () => svc.start('T3'), (error: unknown) => error instanceof TaskServiceError && error.code === 'CAPACITY' && /w:1/.test(error.message) && !/\(just started\)/.test(error.message), 'recorded starts are not counted twice');
+      h.ledger.add({ paneId: 'w:1', cwd: one.workspacePath!, status: 'settled', outcome: 'done', createdAt: h.now.value });
+      assert.equal(svc.start('T3').state, 'RUNNING');
+    });
+
+    it('releases a start Pier never recorded after two minutes', async () => {
+      const svc = capped(1);
+      svc.plan(three());
+      svc.start('T1');
+      await rejectsCode(() => svc.start('T2'), 'CAPACITY');
+      h.now.value += 200_000;
+      assert.equal(svc.start('T2').state, 'RUNNING');
+    });
+
+    it('counts reviews: a review brief is refused at the cap', async () => {
+      const svc = capped(1);
+      svc.plan(three());
+      const { verified } = await toCandidate(h, svc, 'T1');
+      assert.equal(verified.outcome, 'awaiting_review');
+      const other = svc.start('T2');
+      h.ledger.add({ paneId: 'w:T2', cwd: other.workspacePath!, createdAt: h.now.value + 1 });
+      await rejectsCode(() => svc.reviewBrief('T1'), 'CAPACITY');
+      assert.equal(svc.task('T1').state, 'VERIFYING', 'a refused brief changes nothing');
+      h.ledger.add({ paneId: 'w:T2', cwd: other.workspacePath!, status: 'settled', outcome: 'done', createdAt: h.now.value });
+      assert.equal(svc.reviewBrief('T1').outcome, 'review_requested');
+    });
+
+    it('fails closed when a cap is set but running agents cannot be counted', async () => {
+      const svc = capped(3, []);
+      svc.plan(three());
+      await rejectsCode(() => svc.start('T1'), 'CAPACITY');
     });
   });
 

@@ -18,6 +18,8 @@ export interface WorkerBriefInput {
   readonly stackedOn?: string;
   readonly feedback?: readonly string[];
   readonly rejectTestAsserts?: boolean;
+  /** Union-merged shared files in this task's scope: parallel tasks change them too, so only additions are allowed. */
+  readonly unionShared?: readonly string[];
 }
 
 export function renderWorkerBrief(input: WorkerBriefInput): string {
@@ -54,6 +56,7 @@ export function renderWorkerBrief(input: WorkerBriefInput): string {
     '- Commit your finished work to the current branch. Leave no uncommitted or untracked files.',
     '- Never push, never merge, never rebase onto other branches.',
     ...(input.rejectTestAsserts === true ? ['- Do not use assert() in test code: verification builds in Release (-DNDEBUG), which strips it; follow the repo\'s existing non-assert check pattern. New assert( lines in tests are rejected.'] : []),
+    ...(input.unionShared !== undefined && input.unionShared.length > 0 ? [`- ${input.unionShared.join(', ')} ${input.unionShared.length === 1 ? 'is' : 'are'} shared with tasks running in parallel. Integration keeps every task's added lines, so only add lines there, in one contiguous block; do not edit, reorder, or delete existing lines (removed or edited lines are rejected).`] : []),
     '- Your own claims (done, revision, tests passed) are not evidence; the host inspects git and runs verification.',
     '- Finish with a short summary of what you changed and anything the coordinator should know.',
   );

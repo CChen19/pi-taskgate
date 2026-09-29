@@ -33,8 +33,17 @@ export interface OrchestrationConfig {
   /**
    * Paths parallel tasks may both change, written by a human. The main agent
    * can only reference these in planned_overlap; it cannot add new ones.
+   * In the file, an entry is a path or `{ "path": ..., "merge": "union" }`.
    */
   readonly sharedPaths: readonly string[];
+  /**
+   * The shared files (a subset of sharedPaths) that integration merges with
+   * Git's union driver, keeping every task's added lines. Tasks may only add
+   * lines to them.
+   */
+  readonly unionMergePaths: readonly string[];
+  /** Most agents (workers and reviewers) running at once, counted by the host; unset means no cap. */
+  readonly maxParallelAgents?: number;
   /**
    * Reject new assert( calls in C/C++ test sources. For repositories whose
    * verification builds tests with -DNDEBUG, where assert() is compiled out.
@@ -43,7 +52,7 @@ export interface OrchestrationConfig {
   readonly pierHistoryRoots?: readonly string[];
 }
 
-const FIELDS = ['version', 'repoRoot', 'workspaceRoot', 'verificationAllowlist', 'verificationTimeoutMs', 'reviewerRole', 'maxChecksPerAttempt', 'defaultMaxAttempts', 'roleDirs', 'pierHistoryRoots', 'sharedPaths', 'rejectTestAsserts'] as const;
+const FIELDS = ['version', 'repoRoot', 'workspaceRoot', 'verificationAllowlist', 'verificationTimeoutMs', 'reviewerRole', 'maxChecksPerAttempt', 'defaultMaxAttempts', 'roleDirs', 'pierHistoryRoots', 'sharedPaths', 'rejectTestAsserts', 'maxParallelAgents'] as const;
 const CREDENTIAL_KEY = /^(credentials?|token|password|api[_-]?key|secret|auth)$/i;
 
 export class OrchestrationConfigError extends Error {
@@ -89,6 +98,27 @@ function repoPaths(value: unknown, path: string): readonly string[] {
   return Object.freeze([...new Set(value as string[])]);
 }
 
+/** Plain file paths only, so they can be written to a Git attributes file as they are. */
+const UNION_PATH = /^[A-Za-z0-9._+-]+(?:\/[A-Za-z0-9._+-]+)*$/;
+
+/** `sharedPaths` entries: a repository-relative path, or `{ path, merge: "union" }` for a file. */
+function sharedPaths(value: unknown, path: string): { readonly all: readonly string[]; readonly union: readonly string[] } {
+  if (value === undefined) return { all: Object.freeze([]), union: Object.freeze([]) };
+  if (!Array.isArray(value)) fail(`${path} must be an array`);
+  const plain: unknown[] = [];
+  const union: string[] = [];
+  for (const [index, entry] of value.entries()) {
+    if (!isPlainObject(entry)) { plain.push(entry); continue; }
+    if (!hasExactFields(entry, ['path', 'merge'])) fail(`${path}[${index}] may only have the fields path and merge`);
+    const file = ownValue(entry, 'path');
+    if (ownValue(entry, 'merge') !== 'union') fail(`${path}[${index}].merge must be "union"`);
+    if (typeof file !== 'string' || !UNION_PATH.test(file) || file.split('/').some((segment) => segment === '.' || segment === '..')) fail(`${path}[${index}].path must be a plain repository-relative file path (letters, digits, . _ + - and /)`);
+    union.push(file);
+  }
+  const all = repoPaths([...plain, ...union], path);
+  return { all, union: Object.freeze([...new Set(union)]) };
+}
+
 function rejectCredentials(value: unknown, path: string): void {
   if (Array.isArray(value)) { value.forEach((entry, index) => rejectCredentials(entry, `${path}[${index}]`)); return; }
   if (!isPlainObject(value)) return;
@@ -118,6 +148,8 @@ export function parseOrchestrationConfig(input: unknown): OrchestrationConfig {
   if (typeof reviewerRole !== 'string' || !/^[a-z0-9-]+$/.test(reviewerRole)) fail('config.reviewerRole must be a Pier role name ([a-z0-9-]+)');
   const roleDirs = absoluteList(ownValue(input, 'roleDirs'), 'config.roleDirs');
   const pierHistoryRoots = absoluteList(ownValue(input, 'pierHistoryRoots'), 'config.pierHistoryRoots');
+  const shared = sharedPaths(ownValue(input, 'sharedPaths'), 'config.sharedPaths');
+  const maxParallelAgents = ownValue(input, 'maxParallelAgents') === undefined ? undefined : positiveInteger(ownValue(input, 'maxParallelAgents'), 'config.maxParallelAgents', 1);
   return Object.freeze({
     version: 1,
     repoRoot,
@@ -129,7 +161,9 @@ export function parseOrchestrationConfig(input: unknown): OrchestrationConfig {
     defaultMaxAttempts: positiveInteger(ownValue(input, 'defaultMaxAttempts'), 'config.defaultMaxAttempts', 3),
     ...(roleDirs === undefined ? {} : { roleDirs }),
     ...(pierHistoryRoots === undefined ? {} : { pierHistoryRoots }),
-    sharedPaths: repoPaths(ownValue(input, 'sharedPaths'), 'config.sharedPaths'),
+    sharedPaths: shared.all,
+    unionMergePaths: shared.union,
     rejectTestAsserts: flag(ownValue(input, 'rejectTestAsserts'), 'config.rejectTestAsserts'),
+    ...(maxParallelAgents === undefined ? {} : { maxParallelAgents }),
   });
 }

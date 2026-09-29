@@ -6,7 +6,7 @@
  * read from its session JSONL, written by Pier (the host), not relayed by the
  * main agent. This module never writes to Pier's storage.
  */
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -28,6 +28,12 @@ export interface WorkerLedgerRow {
 export interface WorkerLedger {
   /** Latest row for `paneId` among subagents launched with exactly `cwd`. */
   latest(cwd: string, paneId: string): WorkerLedgerRow | undefined;
+  /** The latest row of every subagent launched in any of `roots` or below them. */
+  latestUnder?(roots: readonly string[]): readonly WorkerLedgerRow[];
+}
+
+function within(path: string, root: string): boolean {
+  return path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`);
 }
 
 const MAX_LEDGER_BYTES = 32 * 1024 * 1024;
@@ -99,6 +105,35 @@ export class PierHistoryLedger implements WorkerLedger {
       if (found !== undefined) return found;
     }
     return undefined;
+  }
+
+  latestUnder(roots: readonly string[]): readonly WorkerLedgerRow[] {
+    // Directory names start with the encoded root; the rows' own cwd decides membership.
+    const prefixes = roots.flatMap((root) => [pierSessionDirName(root).slice(0, -2), pierSessionDirNameLegacy(root).slice(0, -2)]);
+    const latest = new Map<string, WorkerLedgerRow>();
+    for (const historyRoot of this.roots) {
+      let names: string[];
+      try { names = readdirSync(historyRoot); } catch { continue; }
+      for (const name of names) {
+        if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
+        const file = join(historyRoot, name, 'history.jsonl');
+        let text: string;
+        try {
+          if (statSync(file).size > MAX_LEDGER_BYTES) continue;
+          text = readFileSync(file, 'utf8');
+        } catch {
+          continue;
+        }
+        for (const line of text.split('\n')) {
+          if (line.trim().length === 0) continue;
+          let parsed: unknown;
+          try { parsed = JSON.parse(line); } catch { continue; }
+          const row = coerceRow(parsed);
+          if (row !== undefined && roots.some((root) => within(row.cwd, root))) latest.set(row.paneId, row);
+        }
+      }
+    }
+    return [...latest.values()];
   }
 
   private candidateFiles(cwd: string): readonly string[] {

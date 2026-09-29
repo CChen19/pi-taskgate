@@ -1,6 +1,10 @@
 # Design: parallel tasks on shared files, integration repair, and a concurrency cap
 
-**Status: proposed, not implemented.** This design follows from [critical-path-2026-09-29.md](critical-path-2026-09-29.md). Code changes need approval. Once approved, they get a new tag and a new pre-registered round, and results are never pooled with round 2.
+**Status:**
+- **Changes 1 and 3 are implemented.** They are covered by offline tests only, and are not yet tagged or run live.
+- **Change 2 is proposed, not implemented.**
+
+**Background.** This design follows from [critical-path-2026-09-29.md](critical-path-2026-09-29.md). Code changes need approval. Once approved, they get a new tag and a new pre-registered round, and results are never pooled with round 2.
 
 **Approved order (2026-09-29).**
 - **First batch:** changes 1 (union merge) and 3 (concurrency cap).
@@ -30,6 +34,8 @@ In round 2, B1 was slow on multi-task work because every task that touched `CMak
 ```
 
 A plain string keeps today's meaning. Planned overlap is allowed on it, and a conflict fails the integration, which change 2 then handles.
+
+**Tasks.** A task may only add lines to a union file. `task_verify` refuses a candidate that removes or edits a line there, and the worker brief says so.
 
 **Planning.** Tasks may declare `planned_overlap` on a union path and run in parallel. Nothing else changes. Overlap on any other file still needs `depends_on`, or a plain `sharedPaths` entry.
 
@@ -85,6 +91,7 @@ The event records `resolved: "union"` for each such commit.
 **Config.** `maxParallelAgents` (an integer; optional; unset means no cap, as today).
 
 **Check.**
+- The count uses the latest Pier ledger row of every subagent under the roots. A start or review counts as a reservation only until Pier has any row for that directory.
 - `task_start` and `task_review_brief` count the live agents, and refuse with `CAPACITY` when the count has reached the cap. The count is:
   - Pier ledger rows with status `running` whose working directory is inside `repoRoot` or `workspaceRoot`;
   - plus attempts started or reviews requested in the last 120 s that have no ledger row yet, so that a start just granted cannot be double-counted as free.

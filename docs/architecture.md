@@ -57,7 +57,7 @@ task_plan ──► PENDING/READY ──task_start──► RUNNING ──task_b
    - non-empty `files_in_scope`;
    - verification commands that match the human-authored allowlist exactly;
    - review required by default;
-   - no path overlap between tasks that can run in parallel, unless both declare it in `planned_overlap`.
+   - no path overlap between tasks that can run in parallel, unless both declare it in `planned_overlap`. Such a path must be in the human-written `sharedPaths`. A file marked `merge: "union"` there is add-only for tasks, and integration merges it with Git's union driver.
 2. **Start.** `task_start` needs READY (all dependencies PASSED) or RETRYING. The host creates the worktree from the main checkout's HEAD, from a PASSED dependency's accepted revision (`base_task`), or from the previous attempt's branch (`reuse_worktree`). It returns the worker brief and the `subagent` arguments.
 3. **Bind.** `task_bind` accepts only an agent id that Pier's ledger shows was launched in exactly that worktree.
 4. **Verify.** `task_verify` refuses while the ledger says the worker is still running. Otherwise it:

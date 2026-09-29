@@ -49,6 +49,8 @@ export interface IntegrationSpec {
 export interface AppliedCommit {
   readonly source: string;
   readonly integrated: string;
+  /** The pick is not patch-identical to its source because Git's union driver merged a configured shared file. */
+  readonly resolved?: 'union';
 }
 
 export interface IntegrationRecord {

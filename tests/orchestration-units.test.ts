@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { checkArtifact, findAddedAsserts, isTestSource } from '../src/adapters/artifact-check.ts';
+import { checkArtifact, findAddedAsserts, isTestSource, lineChangesByPath, unionPickProblems } from '../src/adapters/artifact-check.ts';
 import { readSubagentSession } from '../src/host/pi-session.ts';
 import { BriefStore } from '../src/host/brief-store.ts';
 import { PierHistoryLedger, pierPipePath, pierPipeProblem, pierSessionDirName, pierSessionDirNameLegacy } from '../src/host/pier-ledger.ts';
@@ -92,6 +92,27 @@ describe('reviewer verdict parsing', () => {
   });
 });
 
+describe('line changes for union-merged picks', () => {
+  const show = (path: string, added: string[], removed: string[] = []) => [`diff --git a/${path} b/${path}`, `--- a/${path}`, `+++ b/${path}`, '@@ -1 +1 @@', ...removed.map((line) => `-${line}`), ...added.map((line) => `+${line}`)].join('\n');
+
+  it('collects added and removed lines per file, including new and deleted files', () => {
+    const diff = [show('CMakeLists.txt', ['add_test(a)'], ['old']), 'diff --git a/new.txt b/new.txt', '--- /dev/null', '+++ b/new.txt', '@@ -0,0 +1 @@', '+x', 'diff --git a/gone.txt b/gone.txt', '--- a/gone.txt', '+++ /dev/null', '@@ -1 +0,0 @@', '-y'].join('\n');
+    const changes = lineChangesByPath(diff);
+    assert.deepEqual(changes.get('CMakeLists.txt'), { added: ['add_test(a)'], removed: ['old'] });
+    assert.deepEqual(changes.get('new.txt'), { added: ['x'], removed: [] });
+    assert.deepEqual(changes.get('gone.txt'), { added: [], removed: ['y'] });
+  });
+
+  it('accepts the same lines in another order, and refuses extra, missing, or changed lines', () => {
+    const source = { added: ['a', 'b', 'b'], removed: [] };
+    assert.deepEqual(unionPickProblems('CMakeLists.txt', source, { added: ['b', 'a', 'b'], removed: [] }), []);
+    assert.equal(unionPickProblems('CMakeLists.txt', source, { added: ['a', 'b'], removed: [] }).length, 1);
+    assert.equal(unionPickProblems('CMakeLists.txt', source, { added: ['a', 'b', 'b', 'c'], removed: [] }).length, 1);
+    assert.equal(unionPickProblems('CMakeLists.txt', source, { added: ['a', 'b', 'b'], removed: ['x'] }).length, 1);
+    assert.deepEqual(unionPickProblems('CMakeLists.txt', undefined, undefined), []);
+  });
+});
+
 describe('orchestration config', () => {
   const base = { version: 1, repoRoot: '/repo', workspaceRoot: '/work/trees', verificationAllowlist: ['make test'], reviewerRole: 'reviewer-readonly' };
 
@@ -104,6 +125,19 @@ describe('orchestration config', () => {
     assert.equal(config.rejectTestAsserts, false);
     assert.equal(parseOrchestrationConfig({ ...base, rejectTestAsserts: true }).rejectTestAsserts, true);
     assert.deepEqual(parseOrchestrationConfig({ ...base, sharedPaths: ['CMakeLists.txt', 'cmake/'] }).sharedPaths, ['CMakeLists.txt', 'cmake/']);
+    assert.deepEqual(config.unionMergePaths, []);
+    assert.equal(config.maxParallelAgents, undefined);
+  });
+
+  it('reads union-merged shared files and the agent cap, and fails closed on anything else', () => {
+    const config = parseOrchestrationConfig({ ...base, sharedPaths: ['cmake/', { path: 'CMakeLists.txt', merge: 'union' }], maxParallelAgents: 3 });
+    assert.deepEqual(config.sharedPaths, ['cmake/', 'CMakeLists.txt'], 'a union file is also a shared path');
+    assert.deepEqual(config.unionMergePaths, ['CMakeLists.txt']);
+    assert.equal(config.maxParallelAgents, 3);
+    for (const entry of [{ path: 'CMakeLists.txt' }, { path: 'CMakeLists.txt', merge: 'ours' }, { path: 'cmake/', merge: 'union' }, { path: 'my file.txt', merge: 'union' }, { path: '*.txt', merge: 'union' }, { path: '../x', merge: 'union' }, { path: 'a', merge: 'union', extra: 1 }]) {
+      assert.throws(() => parseOrchestrationConfig({ ...base, sharedPaths: [entry] }), /sharedPaths/, JSON.stringify(entry));
+    }
+    for (const maxParallelAgents of [0, -1, 1.5, '3']) assert.throws(() => parseOrchestrationConfig({ ...base, maxParallelAgents }), /maxParallelAgents/);
   });
 
   it('fails closed on unknown fields, credentials, relative paths, nested workspaces, and empty allowlists', () => {
@@ -135,6 +169,30 @@ describe('orchestration config', () => {
 });
 
 describe('Pier ledger reader', () => {
+  it('lists the latest row of every subagent launched under the given roots', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ao-ledger-running-'));
+    try {
+      const put = (cwd: string, rows: object[]) => {
+        const dir = join(root, pierSessionDirName(cwd));
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, 'history.jsonl'), rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+      };
+      const row = (paneId: string, cwd: string, status: string) => ({ paneId, taskId: 'p', kind: 'worker', cwd, status, createdAt: 1, outcome: null });
+      put('/w/t1-a1-x', [row('w:1', '/w/t1-a1-x', 'running')]);
+      put('/w/t2-a1-y', [row('w:2', '/w/t2-a1-y', 'running'), row('w:2', '/w/t2-a1-y', 'settled')]);
+      put('/w/t3-a1-z', [row('w:3', '/w/t3-a1-z', 'settled'), row('w:3', '/w/t3-a1-z', 'running')]);
+      put('/elsewhere', [row('w:4', '/elsewhere', 'running')]);
+      put('/wide', [row('w:5', '/wide', 'running')]);
+      const ledger = new PierHistoryLedger({ roots: [root] });
+      const running = (roots: string[]) => ledger.latestUnder(roots).filter((entry) => entry.status === 'running').map((entry) => entry.paneId).sort();
+      assert.deepEqual(running(['/w']), ['w:1', 'w:3']);
+      assert.deepEqual(running(['/w', '/elsewhere']), ['w:1', 'w:3', 'w:4']);
+      assert.deepEqual(ledger.latestUnder(['/w']).map((entry) => `${entry.paneId}:${entry.status}`).sort(), ['w:1:running', 'w:2:settled', 'w:3:running'], 'one latest row per subagent');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('reads the latest row for a pane launched in the exact cwd, across both encodings', () => {
     const root = mkdtempSync(join(tmpdir(), 'ao-ledger-'));
     try {

@@ -71,5 +71,8 @@ export function createHostTaskService(options: HostWiringOptions): TaskService {
     defaultMaxAttempts: config.defaultMaxAttempts,
     sharedPaths: config.sharedPaths,
     rejectTestAsserts: config.rejectTestAsserts,
+    unionMergePaths: config.unionMergePaths,
+    ...(config.maxParallelAgents === undefined ? {} : { maxParallelAgents: config.maxParallelAgents }),
+    capacityRoots: [config.repoRoot, config.workspaceRoot],
   });
 }
