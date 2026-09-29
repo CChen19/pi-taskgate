@@ -2,7 +2,7 @@
 
 Status: **first round run on 2026-09-22.** Results are in [benchmark-2026-09-22.md](benchmark-2026-09-22.md): the main comparison (3 trials per arm) and injections I2, I3, I7 and I8 (one trial per arm). What was run differs from the plan below in three ways. The main workload used two tasks (router tests + `expire_at` fix, integrated) rather than W1–W5. I7 used the W1/W2 pair. I8 ran on `gpt-5.6-luna`, because the Kimi quota ran out. The historical evidence is in [field-report-2026-09.md](field-report-2026-09.md).
 
-**Round 2 was run on 2026-09-27 – 09-29, with its weak-master extension.** Results and deviations are in [benchmark-2026-09-29.md](benchmark-2026-09-29.md).
+**Round 2 was run on 2026-09-27 – 09-29, with its weak-master extension.** Results and deviations are in [benchmark-2026-09-29.md](benchmark-2026-09-29.md). **Round 3** (parallel work on a shared build file) is pre-registered in [Round 3 pre-registration](#round-3-pre-registration-parallel-work-on-a-shared-build-file-2026-09-29).
 
 **Round 2 is pre-registered below.** Everything from [Round 2 pre-registration](#round-2-pre-registration) to the end of that section was written and committed before any round-2 code change or trial. Deviations found later are reported as deviations in the results, not edited in here.
 
@@ -348,6 +348,83 @@ Before counting starts, one uncounted I2 trial in arm A checks that `gpt-6-luna`
 - It ends by **2026-10-08**, together with the main round.
 - If the strong-master counterpart cells are incomplete, the comparison is reported as incomplete for those cells.
 - The void, timeout, model-exclusion and freeze rules of the main round apply unchanged.
+
+## Round 3 pre-registration: parallel work on a shared build file (2026-09-29)
+
+This section was written and committed before the `v0.3-bench3` tag and before any round-3 trial. Deviations found later are reported in the results, not edited in here.
+
+### Question
+
+Round 2 found that B1 is correct but slow on multi-task work. `sharedPaths: []` forces every task that registers a test in `CMakeLists.txt` into a single chain ([critical-path-2026-09-29.md](critical-path-2026-09-29.md)).
+
+Does the first batch of [design-parallel-recovery.md](design-parallel-recovery.md) recover that time without losing correctness? The first batch is a union merge for a human-declared append-only shared file, plus a host-side agent cap.
+
+### Arms
+
+| Arm | Code | Config |
+|---|---|---|
+| **A** | Pier only; the extension is not loaded | — |
+| **B2** | Tag `v0.3-bench3` | B1's round-2 config plus `sharedPaths: [{ "path": "CMakeLists.txt", "merge": "union" }]` and `maxParallelAgents: 3` |
+
+B1 is not rerun. Its round-2 numbers are shown as a reference only, and never pooled: the environment differs, see below.
+
+### Environment
+
+The same as round 2's main round, with the following changes:
+
+- **Pier observation window, every arm:** `PIER_OBSERVATION_WINDOW_MS=5000`, set in the environment of the master's pane. Round 2 measured Pier's fixed 30 s wait after each subagent finished. This is an experiment condition, applied identically to both arms; Pier's code is not changed.
+- **Models:** master `openai-codex/gpt-6-sol`, thinking `high`; children `zai/glm-5.3-flash`.
+- **Prompts:** kit v2's prompts. The prompt for B2 is B1's prompt (the same tools paragraph). Both keep the no-polling and the at-most-3-subagents sentences.
+- **Kit:** kit v3 is kit v2 with three changes.
+  1. The B2 arm, in the trial setup and the extractor's delivery rule, which is the same as B1's.
+  2. The launch-timing fixes from kit v2-weak. The launcher waits for the pane's shell, and falls back to the newest session file in the trial's own session directory.
+  3. The observation-window variable.
+
+  Kit v3 is hashed in `KIT_FREEZE_v3.sha256` before the first counted trial. Trial ids start with `x`: `…a` is A, `…c` is B2.
+
+### Cells
+
+| Cell | A | B2 | Scheduling |
+|---|---|---|---|
+| **M6** (six tasks, each registering a test in `CMakeLists.txt`) | 3 | 3 | one trial at a time, alternating the arm that goes first |
+| **I7** (`lst_timer` ∥ `locker`, both registering in `CMakeLists.txt`) | 3 | 3 | A/B2 pairs, order rotated |
+
+That is 12 counted trials.
+
+- **Timeouts:** 120 min for M6 and 60 min for I7.
+- **Void rule:** unchanged. Outage above 120 s, a foreign message or a wrong model voids a trial. A void trial is rerun once, and a void rerun is invalid.
+- **Excluded trials:** a trial whose harness fails to observe the master's end, or any trial in which a person acts, is excluded and rerun once. It is reported with the reason, as in round 2.
+
+**Dry run.** Before counting, one uncounted B2 M6 trial checks that the union merge and the cap work live. If it shows a code defect, the defect is fixed under a new tag and recorded here before counting. If the master simply does not use `planned_overlap`, that is a result, not a defect, and counting proceeds.
+
+### Metrics
+
+- **Primary:** bad acceptances and correct deliveries, judged by the hidden oracle on the delivered revision, as in round 2.
+- **Secondary:**
+  - wall time (median and range);
+  - the critical-path buckets and the maximum number of concurrent children, from `critical_path.py`, frozen with the kit;
+  - Pi-reported cost;
+  - union-merged picks;
+  - integration outcomes: a conflict outside union files, a failed integration check, or a rejected integration review;
+  - `CAPACITY` refusals;
+  - `429` responses.
+
+### Decision rules
+
+- **Correctness.** B2 must have no more bad acceptances than A in either cell. Any B2 bad acceptance is reported as a bug.
+- **Parallelism recovered.** This claim is made only if both of these hold:
+  - B2's median M6 wall time is at most 1.2 × A's median M6 wall time, from this round;
+  - B2 runs at least 2 children at once in at least 2 of its 3 M6 trials. This checks the mechanism, not just the time.
+
+  Otherwise the report says the first batch did not recover the time, with the measured ratio.
+- **Integration repair (design change 2).**
+  - If B2 has at least one integration failure in M6 or I7 (a conflict outside union files, a failed integration check, or a rejected integration review), that is the evidence for building repair and running round 4 (I9, a semantic conflict).
+  - Otherwise repair is not built. The report says that no integration failure was observed.
+
+### Schedule
+
+- **Run:** 2026-09-29/30.
+- **Write-up:** with the round-2 material, by 2026-10-10.
 
 ## Question
 
