@@ -144,6 +144,7 @@ Tests use real temporary git repositories, worktrees and allowlisted processes, 
 - [docs/evaluation.md](docs/evaluation.md): evaluation method and the round-2 pre-registration.
 - [docs/benchmark-2026-09-22.md](docs/benchmark-2026-09-22.md): round-1 results.
 - [docs/benchmark-2026-09-29.md](docs/benchmark-2026-09-29.md): round-2 results, including the weak-master extension.
+- [docs/critical-path-2026-09-29.md](docs/critical-path-2026-09-29.md): where round-2 wall time went.
 - [docs/field-report-2026-09.md](docs/field-report-2026-09.md): the live runs that motivated the design.
 - [docs/observations-2026-09-22.md](docs/observations-2026-09-22.md): operator observations (Chinese).
 
