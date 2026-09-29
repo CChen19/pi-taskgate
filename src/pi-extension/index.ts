@@ -264,7 +264,8 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
       const deliver = deliverable.revision === undefined
         ? `DELIVERABLE: none (${deliverable.reason ?? 'not ready'})`
         : `DELIVERABLE: ${deliverable.revision} (${deliverable.taskId})${deliverable.notIncluded.length > 0 ? `; PASSED but not included: ${deliverable.notIncluded.join(', ')}` : ''}`;
-      return text(`${body}\nREADY: ${svc.readySet().join(', ') || '(none)'}\n${deliver}${extra}`, { tasks: tasks.map((task) => ({ id: task.id, state: task.state, unmetDependencies: task.unmetDependencies, attempts: task.attemptRecords.length })), deliverable });
+      const shared = svc.sharedPathsNote?.();
+      return text(`${body}\nREADY: ${svc.readySet().join(', ') || '(none)'}\n${deliver}${shared === undefined ? '' : `\n${shared}`}${extra}`, { tasks: tasks.map((task) => ({ id: task.id, state: task.state, unmetDependencies: task.unmetDependencies, attempts: task.attemptRecords.length })), deliverable });
     });
 
     tool({

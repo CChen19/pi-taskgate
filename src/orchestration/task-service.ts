@@ -282,6 +282,13 @@ export class TaskService {
     return view;
   }
 
+  /** The human-configured shared paths, for the board view; undefined when there are none. */
+  sharedPathsNote(): string | undefined {
+    if (this.settings.sharedPaths.length === 0) return undefined;
+    const union = new Set(this.settings.unionMergePaths ?? []);
+    return `SHARED PATHS (human config; parallel tasks may both list these in planned_overlap): ${this.settings.sharedPaths.map((path) => union.has(path) ? `${path} (union-merged: tasks only add lines)` : path).join(', ')}`;
+  }
+
   readySet(): readonly string[] {
     return this.board.readySet();
   }
@@ -1078,6 +1085,12 @@ export class TaskService {
             if (!pathsOverlap(pa, pb)) continue;
             const planned = (entry: typeof a) => entry.plannedOverlap.includes(pa) || entry.plannedOverlap.includes(pb);
             if (planned(a) && planned(b)) continue;
+            const shared = [pa, pb].find((path) => this.settings.sharedPaths.includes(path));
+            if (shared !== undefined) {
+              const union = (this.settings.unionMergePaths ?? []).includes(shared);
+              problems.push(`${a.contract.id} and ${b.contract.id} can run in parallel but both touch ${shared}, which the human config lists in sharedPaths: to run them in parallel, list ${shared} in planned_overlap on both tasks${union ? ` (integration merges ${shared} by keeping every task's added lines, so each task may only add lines to it)` : ' (a conflict there still fails the integration)'}; otherwise order them with depends_on`);
+              continue;
+            }
             problems.push(`${a.contract.id} and ${b.contract.id} can run in parallel but both touch ${pa === pb ? pa : `${pa} / ${pb}`}; their candidates would conflict at integration. Order them with depends_on, or give each its own file (e.g. a separate build fragment)`);
           }
         }

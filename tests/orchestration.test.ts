@@ -610,6 +610,15 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
       assert.deepEqual(result.conflict?.paths, ['CMakeLists.txt']);
     });
 
+    it('tells the master which shared paths the human configured, in the board and in the overlap refusal', () => {
+      const svc = unionService();
+      assert.match(svc.sharedPathsNote()!, /CMakeLists\.txt \(union-merged: tasks only add lines\)/);
+      assert.throws(() => svc.plan([task('T1', { files_in_scope: ['CMakeLists.txt'] }), task('T2', { files_in_scope: ['CMakeLists.txt'] })]), /both touch CMakeLists\.txt, which the human config lists in sharedPaths: to run them in parallel, list CMakeLists\.txt in planned_overlap on both tasks \(integration merges/);
+      assert.throws(() => svc.plan([task('T1', { files_in_scope: ['tests/x.cpp'] }), task('T2', { files_in_scope: ['tests/x.cpp'] })]), (error: unknown) => error instanceof TaskServiceError && !/planned_overlap/.test(error.message), 'unshared paths still get no planned_overlap hint');
+      const none = new TaskService((h.service() as unknown as { ports: never }).ports, { ...SETTINGS, sharedPaths: [] });
+      assert.equal(none.sharedPathsNote(), undefined);
+    });
+
     it('lets tasks only add lines to a union-merged file, and says so in the worker brief', async () => {
       commit(h.repo, { 'CMakeLists.txt': cmake('') }, 'cmake');
       const svc = unionService();
@@ -673,8 +682,9 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
   describe('planning rule: parallel tasks must not overlap', () => {
     it('rejects exact and directory overlaps between tasks that can run in parallel', () => {
       const svc = h.service();
-      assert.throws(() => svc.plan([task('T1', { files_in_scope: ['CMakeLists.txt', 'tests/a.cpp'] }), task('T2', { files_in_scope: ['CMakeLists.txt', 'tests/b.cpp'] })]), (error: unknown) => error instanceof TaskServiceError && /T1 and T2 can run in parallel but both touch CMakeLists\.txt/.test(error.message) && !/planned_overlap/.test(error.message), 'the refusal does not offer planned_overlap as a way out');
-      assert.throws(() => svc.plan([task('T1', { files_in_scope: ['src/'] }), task('T2', { files_in_scope: ['src/b.txt'] })]), /both touch src\/ \/ src\/b\.txt/);
+      assert.throws(() => svc.plan([task('T1', { files_in_scope: ['build/tests.cmake', 'tests/a.cpp'] }), task('T2', { files_in_scope: ['build/tests.cmake', 'tests/b.cpp'] })]), (error: unknown) => error instanceof TaskServiceError && /T1 and T2 can run in parallel but both touch build\/tests\.cmake/.test(error.message) && !/planned_overlap/.test(error.message), 'for a path the human did not share, the refusal does not offer planned_overlap as a way out');
+      assert.throws(() => svc.plan([task('T1', { files_in_scope: ['lib/'] }), task('T2', { files_in_scope: ['lib/b.txt'] })]), /both touch lib\/ \/ lib\/b\.txt/);
+      assert.throws(() => svc.plan([task('T1', { files_in_scope: ['CMakeLists.txt', 'tests/a.cpp'] }), task('T2', { files_in_scope: ['CMakeLists.txt', 'tests/b.cpp'] })]), /both touch CMakeLists\.txt, which the human config lists in sharedPaths: to run them in parallel, list CMakeLists\.txt in planned_overlap on both tasks \(a conflict there still fails the integration\); otherwise order them with depends_on/, 'a human-shared path is named as such');
       assert.equal(svc.status().length, 0);
     });
 
