@@ -17,6 +17,7 @@ It does not make agents smarter. It turns safeguards that Pier leaves to prompt 
 - **Round 2** ([results](docs/benchmark-2026-09-29.md), pre-registered in [docs/evaluation.md](docs/evaluation.md)).
   - **Strong master (`gpt-6-sol`), 44 valid trials:** Pier alone and both versions of the tools had no bad acceptance at all, up to a 6-task workload. The fixed tools held G1–G3, and cost less than the round-1 code. They took about 1.6× Pier-alone's wall time at 6 tasks.
   - **Weaker master (`gpt-6-luna`):** Pier alone accepted a vacuous `assert` test in 3 of 3 trials, and the tools in 0 of 3. That meets the pre-registered rule "the layer's outcome value depends on master strength".
+- **Round 3** ([results](docs/benchmark-round3-2026-09-29.md)): with a union merge for the shared `CMakeLists.txt` and a cap of 3 agents, the tools ran 6-task work in parallel again. Median wall time was 0.74× Pier-alone's, against 1.6× in round 2, with 0 bad acceptances (Pier alone: 1 of 6). No integration failed, so integration repair was not built.
 
 ## What Pier provides and what this adds
 
@@ -103,13 +104,13 @@ Task events are stored as `agent-orchestrator.task-event` custom entries in the 
 
 ## Known limitations
 
-Evidence for each item is in the benchmarks ([round 1](docs/benchmark-2026-09-22.md), [round 2](docs/benchmark-2026-09-29.md)) and [the field report](docs/field-report-2026-09.md).
+Evidence for each item is in the benchmarks ([round 1](docs/benchmark-2026-09-22.md), [round 2](docs/benchmark-2026-09-29.md), [round 3](docs/benchmark-round3-2026-09-29.md)) and [the field report](docs/field-report-2026-09.md).
 
 - **The outcome benefit is narrow.**
-  - With a strong master, round 2 found no outcome difference: 0 bad acceptances in every arm. The tools cost wall time on multi-task work, because shared files force tasks to run in order.
+  - With a strong master, round 2 found no outcome difference: 0 bad acceptances in every arm. The tools cost wall time on multi-task work, because shared files forced tasks to run in order; round 3's union merge removed that cost for append-only files.
   - With a weaker master, the one difference came from one fault type: `assert` tests compiled out in Release. The worker brief's assert rule prevented it.
   - Scope escapes and smoke-test-only candidates were caught by every master tried, with or without the tools.
-  - Logic errors that neither the tests nor the reviewer notice get through in both arms.
+  - Interface slips that neither the tests nor the reviewer notice get through in both arms: in rounds 2 and 3, three `expire_at` headers put the function in a namespace the task did not ask for, so the hidden oracle did not compile.
 - **Some fixes held but were never exercised live.**
   - In round 2, no master messaged a reviewer after its brief, and none tried a git write. The G1 check and the git write guard therefore never had to refuse anything live. They are covered by offline tests.
   - Brief-as-file worked in all 60 round-2 B1 reviews: every reviewer received the issued prompt, and every accepted verdict passed the read-coverage check.
@@ -120,7 +121,7 @@ Evidence for each item is in the benchmarks ([round 1](docs/benchmark-2026-09-22
   - It cherry-picks, and fails closed on any conflict outside union-merged files, with no repair step.
   - A failing check or a rejected review also ends the integration. Integration repair is designed but not implemented ([design](docs/design-parallel-recovery.md)).
   - With empty `sharedPaths`, tasks that touch a shared build file must be ordered with `depends_on` or split. They are stacked automatically, but run one after another. Round 2 measured the cost: B1's 6-task runs were fully serial.
-  - The union merge (`merge: "union"`) and `maxParallelAgents` are meant to recover that parallelism. They are covered by offline tests only, not yet by a live run.
+  - The union merge (`merge: "union"`) and `maxParallelAgents` recover that parallelism. In round 3 the 6-task runs ran 3 children at once and took 0.74× Pier-alone's median wall time. The rule that tasks may only add lines to a union file was never exercised live.
 - **Settlement comes from Pier's ledger.** Verifying or recording before a subagent settles is refused with `WORKER_RUNNING`. This happened 11 times in round 1, always without effect.
 - **Pier's todo reconciliation** may tick todos whose text matches a spawn description. Use `task_status`, and the `T1:impl`-style descriptions the tools return.
 - **Housekeeping.** Worktrees and branches are not cleaned up automatically, and there are no built-in metrics: the evaluation extracts them from session files.

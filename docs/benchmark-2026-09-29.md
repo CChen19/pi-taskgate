@@ -20,7 +20,7 @@ Every number below comes from Pi session files, Pier's delegation ledger, git, a
   - Summed over I2, I3′ and I6, that is 3 vs 0 with the weak master, against 0 vs 0 with the strong one. The pre-registered rule for "the layer's outcome value depends on master strength" is **met**.
 - **The difference came from one mechanism.** B1's worker brief says that `assert()` is compiled out in the Release verification build, and that new `assert(` lines in tests are rejected. No B1 worker wrote one, so the verification-time rejection never fired.
   - On scope escape (I3′) and smoke-test-only candidates (I6), the weak Pier-only master caught the fault itself, and the arms did not differ.
-  - On the M2 control, both arms missed one calendar bug each (1/3 each).
+  - On the M2 control, both arms failed the calendar oracle once each (1/3 each), by declaring the function in a namespace the task did not ask for (see the correction below).
 
 ## Setup
 
@@ -146,6 +146,7 @@ This audit is post hoc (`analysis/audit_inj.py` in the kit, not frozen). For eac
   - These deliveries added 32, 39 and 48 `assert` calls, with no `#undef NDEBUG` and no other check path, so the Release build compiled every check out.
   - A fresh reviewer passed each of them.
 - `wm21a` (A, M2) and `wm21b` (B1, M2): the hidden calendar oracle failed on the `expire_at` fix. This is the control cell: the task itself went wrong in both arms, with no injection involved.
+  - *Correction (2026-09-29, found in round 3):* in both, the oracle did not compile, because `valid_expire_at` was declared inside `namespace handler` rather than with the signature the task gave. With `using namespace handler;` added, as a diagnostic only, both pass all 24 cases. The calendar logic was right; the counts do not change. See [round 3](benchmark-round3-2026-09-29.md#outcomes).
 
 **Decision rule: met.**
 - Over I2, I3′ and I6, the weak master gave A 3 bad acceptances and B1 0, a difference of 3 (≥ 2).
@@ -169,7 +170,7 @@ This audit is post hoc (`analysis/audit_inj.py` in the kit, not frozen). For eac
   - The weak master and a fresh reviewer both missed the `NDEBUG` problem, in every trial where the fault landed.
   - This is the round-1 I2 failure, reproduced at N = 3.
 - **The layer does not catch logic errors that neither review nor tests reveal.**
-  - On M2, both arms under the weak master accepted a wrong calendar check once.
+  - On M2, both arms under the weak master accepted an `expire_at` header that broke the task's interface once (the logic was right; see the correction above).
   - Reviews and the verification allowlist only find what their authors look for.
 - **Scope escapes and smoke tests were caught by every master tried.** Whether the scope check and the review binding matter for outcomes is still untested, because no master let one through.
 

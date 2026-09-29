@@ -1,8 +1,8 @@
 # Design: parallel tasks on shared files, integration repair, and a concurrency cap
 
 **Status:**
-- **Changes 1 and 3 are implemented.** They are covered by offline tests only, and are not yet tagged or run live.
-- **Change 2 is proposed, not implemented.**
+- **Changes 1 and 3 are implemented** (tag `v0.3.1-bench3`) and were run live in round 3 ([results](benchmark-round3-2026-09-29.md)). B2's median M6 wall time was 0.74× Pier-alone's, with 3 children at once and 0 bad acceptances.
+- **Change 2 is not built.** Round 3 had no integration failure, so by its pre-registered rule there is no evidence for it yet.
 
 **Background.** This design follows from [critical-path-2026-09-29.md](critical-path-2026-09-29.md). Code changes need approval. Once approved, they get a new tag and a new pre-registered round, and results are never pooled with round 2.
 
