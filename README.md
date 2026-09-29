@@ -145,6 +145,7 @@ Tests use real temporary git repositories, worktrees and allowlisted processes, 
 - [docs/benchmark-2026-09-22.md](docs/benchmark-2026-09-22.md): round-1 results.
 - [docs/benchmark-2026-09-29.md](docs/benchmark-2026-09-29.md): round-2 results, including the weak-master extension.
 - [docs/critical-path-2026-09-29.md](docs/critical-path-2026-09-29.md): where round-2 wall time went.
+- [docs/design-parallel-recovery.md](docs/design-parallel-recovery.md): proposed next changes (union merge for shared build files, a concurrency cap, integration repair); not implemented yet.
 - [docs/field-report-2026-09.md](docs/field-report-2026-09.md): the live runs that motivated the design.
 - [docs/observations-2026-09-22.md](docs/observations-2026-09-22.md): operator observations (Chinese).
 
