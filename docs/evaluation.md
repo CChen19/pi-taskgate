@@ -2,6 +2,8 @@
 
 Status: **first round run on 2026-09-22.** Results are in [benchmark-2026-09-22.md](benchmark-2026-09-22.md): the main comparison (3 trials per arm) and injections I2, I3, I7 and I8 (one trial per arm). What was run differs from the plan below in three ways. The main workload used two tasks (router tests + `expire_at` fix, integrated) rather than W1–W5. I7 used the W1/W2 pair. I8 ran on `gpt-5.6-luna`, because the Kimi quota ran out. The historical evidence is in [field-report-2026-09.md](field-report-2026-09.md).
 
+**Round 2 was run on 2026-09-27 – 09-29, with its weak-master extension.** Results and deviations are in [benchmark-2026-09-29.md](benchmark-2026-09-29.md).
+
 **Round 2 is pre-registered below.** Everything from [Round 2 pre-registration](#round-2-pre-registration) to the end of that section was written and committed before any round-2 code change or trial. Deviations found later are reported as deviations in the results, not edited in here.
 
 ## Round 2 pre-registration

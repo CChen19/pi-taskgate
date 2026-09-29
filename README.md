@@ -12,10 +12,11 @@ The Pi main session (the Pier master) stays the only semantic orchestrator and t
 
 It does not make agents smarter. It turns safeguards that Pier leaves to prompt discipline into refusals.
 
-**Status (2026-09-26).**
-- **Round 1.** The extension ran on real TinyWebServer tasks, and a first controlled comparison against Pier alone was run ([results](docs/benchmark-2026-09-22.md)).
-- **Since round 1.** The three gaps that comparison found (G1–G3) have been fixed, and the review brief is now delivered as a file. These changes are covered by offline tests only, not yet by a live run.
-- **Round 2.** Pre-registered in [docs/evaluation.md](docs/evaluation.md), not yet run.
+**Status (2026-09-29).**
+- **Round 1.** The extension ran on real TinyWebServer tasks, and a first controlled comparison against Pier alone was run ([results](docs/benchmark-2026-09-22.md)). It found three gaps (G1–G3), which have since been fixed. The review brief is now also delivered as a file.
+- **Round 2** ([results](docs/benchmark-2026-09-29.md), pre-registered in [docs/evaluation.md](docs/evaluation.md)).
+  - **Strong master (`gpt-6-sol`), 44 valid trials:** Pier alone and both versions of the tools had no bad acceptance at all, up to a 6-task workload. The fixed tools held G1–G3, and cost less than the round-1 code. They took about 1.6× Pier-alone's wall time at 6 tasks.
+  - **Weaker master (`gpt-6-luna`):** Pier alone accepted a vacuous `assert` test in 3 of 3 trials, and the tools in 0 of 3. That meets the pre-registered rule "the layer's outcome value depends on master strength".
 
 ## What Pier provides and what this adds
 
@@ -98,10 +99,16 @@ Task events are stored as `agent-orchestrator.task-event` custom entries in the 
 
 ## Known limitations
 
-Evidence for each item is in [the round-1 benchmark](docs/benchmark-2026-09-22.md) and [the field report](docs/field-report-2026-09.md).
+Evidence for each item is in the benchmarks ([round 1](docs/benchmark-2026-09-22.md), [round 2](docs/benchmark-2026-09-29.md)) and [the field report](docs/field-report-2026-09.md).
 
-- **Evidence is thin.** Round 1 had 14 trials: 3 per arm on a 2-task workload, and one trial per arm for each of four injections. Both arms delivered correct code on the 2-task workload. The only bad acceptance was in the Pier-only arm (a vacuous test that Release builds compiled out). The task tools cost about twice the wall time (median 21.0 vs 10.8 min) and about 40% more money ($0.50 vs $0.35 per trial), mostly in the master session. Whether the tools pay off at larger scale is the open question for round 2.
-- **Fixes since round 1 are unproven live.** The G1–G3 fixes and brief-as-file are covered by offline tests only. Round-1 sessions can replay the G1 check (it rejects the 4 nudged verdicts and none of the other 14), but not the brief checks. Masters that edit the spawn prompt, or reviewers that do not read the whole brief, will be refused and retried, which costs time.
+- **The outcome benefit is narrow.**
+  - With a strong master, round 2 found no outcome difference: 0 bad acceptances in every arm. The tools cost wall time on multi-task work, because shared files force tasks to run in order.
+  - With a weaker master, the one difference came from one fault type: `assert` tests compiled out in Release. The worker brief's assert rule prevented it.
+  - Scope escapes and smoke-test-only candidates were caught by every master tried, with or without the tools.
+  - Logic errors that neither the tests nor the reviewer notice get through in both arms.
+- **Some fixes held but were never exercised live.**
+  - In round 2, no master messaged a reviewer after its brief, and none tried a git write. The G1 check and the git write guard therefore never had to refuse anything live. They are covered by offline tests.
+  - Brief-as-file worked in all 60 round-2 B1 reviews: every reviewer received the issued prompt, and every accepted verdict passed the read-coverage check.
 - **A read brief is not a careful review.** The checks prove that the reviewer saw the exact brief, not that it judged well. In round 1, one fresh reviewer caught a weak test (i3b) and one missed an `NDEBUG` problem (Pier-only i2a).
 - **The git write guard can be bypassed.** It covers only the master's `bash` command strings. `edit` and `write` can still change files, and aliases, scripts or other languages can still run git. The delivery rule is what holds.
 - **Reviewers have no shell.** They sometimes ask the human through `ask_user_question`. Those answers arrive as tool results, not prompts, so the one-prompt check does not catch them. The benchmark operator answered with a fixed "no human is available" text.
@@ -136,9 +143,14 @@ Tests use real temporary git repositories, worktrees and allowlisted processes, 
 - [docs/architecture.md](docs/architecture.md): design and invariants.
 - [docs/evaluation.md](docs/evaluation.md): evaluation method and the round-2 pre-registration.
 - [docs/benchmark-2026-09-22.md](docs/benchmark-2026-09-22.md): round-1 results.
+- [docs/benchmark-2026-09-29.md](docs/benchmark-2026-09-29.md): round-2 results, including the weak-master extension.
 - [docs/field-report-2026-09.md](docs/field-report-2026-09.md): the live runs that motivated the design.
 - [docs/observations-2026-09-22.md](docs/observations-2026-09-22.md): operator observations (Chinese).
 
 ## 中文简介
 
-pi-taskgate 是一个与 Pier 并列加载的 Pi 扩展。Pi 主会话仍是唯一的编排者；本扩展只提供由 host 观察到的事实和拒绝：任务状态、worktree 隔离、scope 检查、干净环境里的 allowlist 验证、绑定 revision 的独立 review，以及唯一的 `DELIVERABLE` 交付 revision。第一轮对照实验与第二轮预注册见 `docs/`。
+pi-taskgate 是一个与 Pier 并列加载的 Pi 扩展。Pi 主会话仍是唯一的编排者；本扩展只提供由 host 观察到的事实和拒绝：任务状态、worktree 隔离、scope 检查、干净环境里的 allowlist 验证、绑定 revision 的独立 review，以及唯一的 `DELIVERABLE` 交付 revision。第一、二轮对照实验见 `docs/`。
+
+第二轮结论：
+- **强 master（gpt-6-sol）：** 各组都没有错误接受。
+- **弱 master（gpt-6-luna）：** 只用 Pier 的一组在 3 次试验中都接受了在 Release 下失效的 `assert` 测试，加载本扩展的一组为 0 次。
