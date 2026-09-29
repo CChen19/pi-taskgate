@@ -12,7 +12,7 @@ The Pi main session (the Pier master) stays the only semantic orchestrator and t
 
 It does not make agents smarter. It turns safeguards that Pier leaves to prompt discipline into refusals.
 
-**Status (2026-09-29).**
+**Status (2026-09-29).** A summary of all three rounds is in [docs/summary-rounds-1-3.md](docs/summary-rounds-1-3.md).
 - **Round 1.** The extension ran on real TinyWebServer tasks, and a first controlled comparison against Pier alone was run ([results](docs/benchmark-2026-09-22.md)). It found three gaps (G1–G3), which have since been fixed. The review brief is now also delivered as a file.
 - **Round 2** ([results](docs/benchmark-2026-09-29.md), pre-registered in [docs/evaluation.md](docs/evaluation.md)).
   - **Strong master (`gpt-6-sol`), 44 valid trials:** Pier alone and both versions of the tools had no bad acceptance at all, up to a 6-task workload. The fixed tools held G1–G3, and cost less than the round-1 code. They took about 1.6× Pier-alone's wall time at 6 tasks.
