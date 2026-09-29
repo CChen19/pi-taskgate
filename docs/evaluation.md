@@ -421,6 +421,18 @@ That is 12 counted trials.
   - If B2 has at least one integration failure in M6 or I7 (a conflict outside union files, a failed integration check, or a rejected integration review), that is the evidence for building repair and running round 4 (I9, a semantic conflict).
   - Otherwise repair is not built. The report says that no integration failure was observed.
 
+### Amendment R3-1 (2026-09-29, after dry run `xd1c`, before any counted trial): union check fixed, tag `v0.3.1-bench3`
+
+- **What happened.** Dry run `xd1c` (B2, M6) planned all six tasks in parallel with `planned_overlap: ["CMakeLists.txt"]`, and the union merge applied. `task_verify` then refused the integration: one pick added 9 lines where its source added 10.
+- **Cause.** Every task appended a block that started with a blank line, and Git's merge keeps one copy of a line both sides added identically. The merged file was correct, but the line-by-line check required identical added lines.
+- **Fix.** The check now requires:
+  - no line the source did not add;
+  - the same removed lines;
+  - every source-added line that the pick lacks already present in the merged file, as often as the source added it.
+- **Consequences.**
+  - The code under test is tag `v0.3.1-bench3`; kit v3 is re-frozen with it.
+  - `xd1c` delivered nothing and is not counted. One more uncounted B2 M6 dry run (`xd2c`) is made before counting.
+
 ### Schedule
 
 - **Run:** 2026-09-29/30.
