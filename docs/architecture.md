@@ -2,6 +2,8 @@
 
 Status: P0 (task tools) and P1 (integration) are implemented and have run for real on TinyWebServer (2026-09-22). What happened, including every failure the tools caught, is in [field-report-2026-09.md](field-report-2026-09.md). How the benefit against Pier alone was measured across three rounds is summarized in [summary-rounds-1-3.md](summary-rounds-1-3.md); the round-2 method and pre-registration are in [evaluation.md](evaluation.md).
 
+**Repository composition.** The full delivery composes three slices: the summary base `22b7e217be4bba067aa210c63127156eadff007b` (this branch builds on it), the interface-probe slice `891b6391287042f8d56e16df931cfe360a4b3515` (supplies [interface-probe.md](interface-probe.md) and `examples/interface-probe/`), and this branch's documentation and regression work. This branch alone is an intermediate artifact, not the full delivery: it does not ship the probe files, so cross-links to the probe reference resolve only in the integrated checkout. The probe's design, evidence and limits are described in this tree in [interview-case-study.md](interview-case-study.md).
+
 ## Target: the Pi main session orchestrates; code enforces
 
 ```text
@@ -145,7 +147,7 @@ Every refusal leaves the board unchanged: a mutation is trial-applied to a repla
 - Automatic cleanup of worktrees and branches (done by hand after the TinyWebServer rounds).
 - Metrics collection. The field report was extracted by hand from session files.
 - Porting stable pieces into Pier.
-- Automatic interface-probe generation. The shipped probe ([interface-probe.md](interface-probe.md)) checks one fixed, human-chosen contract; covering a new contract means hand-writing another probe and adding it to the allowlist.
+- Automatic interface-probe generation. The probe ([interface-probe.md](interface-probe.md); supplied by the probe slice, see Repository composition) checks one fixed, human-chosen contract; covering a new contract means hand-writing another probe and adding it to the allowlist.
 - A controlled comparison against Pier alone has run three times ([summary](summary-rounds-1-3.md): rounds 1–3). The G1 reviewer-session check and the git write guard have still never had to refuse anything live; they are covered by offline tests.
 
 ## Legacy: external vertical slice (removed)

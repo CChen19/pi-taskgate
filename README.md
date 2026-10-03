@@ -20,6 +20,8 @@ It does not make agents smarter. It turns safeguards that Pier leaves to prompt 
 - **Round 3** ([results](docs/benchmark-round3-2026-09-29.md)): with a union merge for the shared `CMakeLists.txt` and a cap of 3 agents, the tools ran 6-task work in parallel again. Median wall time was 0.74× Pier-alone's, against 1.6× in round 2, with 0 bad acceptances (Pier alone: 1 of 6). No integration failed, so integration repair was not built.
 - **After round 3.** `task_status` gained a read-only delivery summary and plan-coverage report ([docs/delivery-summary.md](docs/delivery-summary.md)), and a minimal compile-time interface probe now covers the one known namespace-slip contract from rounds 2–3 ([docs/interface-probe.md](docs/interface-probe.md); the failure and its evidence are walked through in [docs/interview-case-study.md](docs/interview-case-study.md)).
 
+**Repository composition.** This checkout is one slice of a composed delivery, not the full tree: it carries documentation and regression work on top of the summary base `22b7e217be4bba067aa210c63127156eadff007b`. The interface-probe slice — accepted revision `891b6391287042f8d56e16df931cfe360a4b3515` — supplies `docs/interface-probe.md` and `examples/interface-probe/`; this branch alone does not ship them, so links to that document resolve in the integrated checkout, not here. On this branch, the probe's design, evidence and limits are described in [docs/interview-case-study.md](docs/interview-case-study.md#the-minimal-independent-probe).
+
 ## What Pier provides and what this adds
 
 | | Pier (used as shipped, public surfaces only) | pi-taskgate |
@@ -111,7 +113,7 @@ Evidence for each item is in the benchmarks ([round 1](docs/benchmark-2026-09-22
   - With a strong master, round 2 found no outcome difference: 0 bad acceptances in every arm. The tools cost wall time on multi-task work, because shared files forced tasks to run in order; round 3's union merge removed that cost for append-only files.
   - With a weaker master, the one difference came from one fault type: `assert` tests compiled out in Release. The worker brief's assert rule prevented it.
   - Scope escapes and smoke-test-only candidates were caught by every master tried, with or without the tools.
-  - Interface slips that neither the tests nor the reviewer notice get through in both arms: in rounds 2 and 3, three `expire_at` headers put the function in a namespace the task did not ask for, so the hidden oracle did not compile. A minimal compile-time probe now exists for that one known contract ([docs/interface-probe.md](docs/interface-probe.md)): the human adds its exact command to the verification allowlist and `task_verify` runs it in the clean room. It is evidenced only for that contract — the failure, the probe, and the limits are in [docs/interview-case-study.md](docs/interview-case-study.md).
+  - Interface slips that neither the tests nor the reviewer notice get through in both arms: in rounds 2 and 3, three `expire_at` headers put the function in a namespace the task did not ask for, so the hidden oracle did not compile. A minimal compile-time probe now exists for that one known contract ([docs/interface-probe.md](docs/interface-probe.md), reference in the integrated checkout — see Repository composition): the human adds its exact command to the verification allowlist and `task_verify` runs it in the clean room. It is evidenced only for that contract — the failure, the probe, and the limits are in [docs/interview-case-study.md](docs/interview-case-study.md).
 - **Some fixes held but were never exercised live.**
   - In round 2, no master messaged a reviewer after its brief, and none tried a git write. The G1 check and the git write guard therefore never had to refuse anything live. They are covered by offline tests.
   - Brief-as-file worked in all 60 round-2 B1 reviews: every reviewer received the issued prompt, and every accepted verdict passed the read-coverage check.
@@ -152,7 +154,7 @@ Tests use real temporary git repositories, worktrees and allowlisted processes, 
 
 - [docs/architecture.md](docs/architecture.md): design and invariants.
 - [docs/delivery-summary.md](docs/delivery-summary.md): the `task_status` delivery-evidence and plan-coverage report.
-- [docs/interface-probe.md](docs/interface-probe.md): the fixed-contract compile probe (reference).
+- [docs/interface-probe.md](docs/interface-probe.md): the fixed-contract compile probe (reference; supplied by the probe slice, see Repository composition — not present in this branch's tree).
 - [docs/interview-case-study.md](docs/interview-case-study.md): the interface failure, the probe built for it, and what an accepted revision does and does not claim.
 - [docs/summary-rounds-1-3.md](docs/summary-rounds-1-3.md): conclusions from all three benchmark rounds.
 - [docs/evaluation.md](docs/evaluation.md): evaluation method and the round-2 pre-registration.
@@ -171,4 +173,4 @@ pi-taskgate 是一个与 Pier 并列加载的 Pi 扩展。Pi 主会话仍是唯�
 - **强 master（gpt-6-sol）：** 各组都没有错误接受。
 - **弱 master（gpt-6-luna）：** 只用 Pier 的一组在 3 次试验中都接受了在 Release 下失效的 `assert` 测试，加载本扩展的一组为 0 次。
 
-第三轮之后：`task_status` 增加了只读的交付摘要（`docs/delivery-summary.md`）；针对第二、三轮反复出现的接口滑误（`valid_expire_at` 的 namespace 滑误）加入了最小编译探针（`docs/interface-probe.md`，失败分析与证据见 `docs/interview-case-study.md`）。它只覆盖这一个已知契约，不声称一般性的正确性或安全性保证。
+第三轮之后：`task_status` 增加了只读的交付摘要（`docs/delivery-summary.md`）；针对第二、三轮反复出现的接口滑误（`valid_expire_at` 的 namespace 滑误）加入了最小编译探针（`docs/interface-probe.md`，失败分析与证据见 `docs/interview-case-study.md`）。它只覆盖这一个已知契约，不声称一般性的正确性或安全性保证。`docs/interface-probe.md` 参考文档由探针切片（已接受 revision `891b6391287042f8d56e16df931cfe360a4b3515`）提供，仅在组合后的完整交付树中出现，本分支单独不含该文件。

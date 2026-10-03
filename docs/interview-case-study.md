@@ -2,7 +2,10 @@
 
 A self-contained walkthrough of a failure the benchmark rounds observed three times, the
 minimal tool built afterwards, and the exact claim each piece of evidence carries. The
-probe reference is [interface-probe.md](interface-probe.md); the gate mechanics are in
+probe reference is [interface-probe.md](interface-probe.md), which ships with the
+interface-probe slice (accepted revision `891b6391287042f8d56e16df931cfe360a4b3515`) and
+resolves in the integrated checkout, not in this branch slice; the probe's design and
+limits are in "The minimal independent probe" below, and the gate mechanics are in
 [architecture.md](architecture.md). Historical experiment records (pre-registrations and
 benchmark reports) are left untouched; this document only interprets them.
 
