@@ -7,9 +7,9 @@
 // compile-time conversion of the function's address to the caller's
 // function-pointer type. No assert() is used, so -DNDEBUG changes nothing,
 // and the probe is never linked or executed. Compiler errors ARE the failure
-// evidence (run-probe.sh prints them verbatim):
-//   * namespace-only slip -> "valid_expire_at has not been declared;
-//     did you mean handler::valid_expire_at?"
+// evidence (run-probe.sh prints them verbatim, for any compiler):
+//   * namespace-only slip -> the compiler reports the missing global name
+//     (GCC adds: did you mean 'handler::valid_expire_at'?);
 //   * wrong parameter/return type -> function-pointer conversion error.
 #include "handler/expire_at.h"
 

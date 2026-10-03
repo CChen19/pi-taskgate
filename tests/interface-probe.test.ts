@@ -1,24 +1,28 @@
 // Offline fixture tests for the host-owned interface-contract probe
-// (examples/interface-probe). The suite synthesizes tiny candidate trees in
-// the OS temp dir, runs the runner via bash, and asserts exit codes,
-// diagnostics, `--` argument handling, and temp-dir cleanup. It never reads
-// or writes data outside its own fixtures and never calls models or agents.
+// (examples/interface-probe). Hermetic by construction:
+//
+//   * every case gets its own sandbox: a fixture root plus an EXCLUSIVE
+//     TMPDIR handed to that single runner invocation, so nothing is ever
+//     asserted about shared global temp state;
+//   * each sandbox is removed recursively in the case's t.after hook, so
+//     fixtures do not leak;
+//   * assertions are compiler-agnostic (exit codes, our own PASS/FAIL
+//     lines, and the generic "error:" marker) — c++ may be GCC or clang.
 //
 // Compiler availability is probed once from `c++` and documented: when no
-// compiler is installed, compile-dependent cases are skipped with an explicit
+// compiler is installed, compile-dependent cases skip with an explicit
 // reason, while argument/error handling (including the explicit
-// missing-compiler case) still runs everywhere.
+// missing-compiler case) still runs everywhere. No test reads or writes
+// outside its own sandbox, calls models, or starts agents.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it } from 'node:test';
+import { describe, it, type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const RUN_PROBE = fileURLToPath(new URL('../examples/interface-probe/run-probe.sh', import.meta.url));
-/** The runner's private temp dir prefix; leftovers after a run are a bug. */
-const RUNNER_TEMP_PREFIX = 'interface-probe.';
 const SKIP_NO_COMPILER = 'no C++ compiler found as c++ on PATH; compile-dependent cases are skipped (missing-compiler behavior is tested separately)';
 
 function compilerAvailable(): boolean {
@@ -55,16 +59,33 @@ inline bool valid_expire_at(std::string expire_at) { return expire_at.size() == 
 #endif
 `;
 
-/** Writes a synthetic candidate tree holding only handler/expire_at.h. */
-function candidate(base: string, header: string): string {
-  const root = join(base, 'candidate root');
-  mkdirSync(join(root, 'handler'), { recursive: true });
-  writeFileSync(join(root, 'handler', 'expire_at.h'), header);
-  return root;
+interface Sandbox {
+  /** Case fixture root (contains the candidate tree when a header is written). */
+  readonly root: string;
+  /** Private TMPDIR for exactly one runner invocation; must be empty after it. */
+  readonly tmp: string;
 }
 
-function freshBase(label: string): string {
-  return mkdtempSync(join(tmpdir(), `iface-probe-test-${label}-`));
+/**
+ * Per-case sandbox under one mkdtemp base. t.after removes the whole base
+ * recursively, so neither fixtures nor runner temp dirs can leak.
+ */
+function makeSandbox(t: TestContext, label: string): Sandbox {
+  const base = mkdtempSync(join(tmpdir(), `iface-probe-${label}-`));
+  t.after(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+  const root = join(base, 'root');
+  const tmp = join(base, 'tmp');
+  mkdirSync(root);
+  mkdirSync(tmp);
+  return { root, tmp };
+}
+
+/** Writes the synthetic candidate tree (only handler/expire_at.h). */
+function writeCandidate(sandbox: Sandbox, header: string): void {
+  mkdirSync(join(sandbox.root, 'handler'));
+  writeFileSync(join(sandbox.root, 'handler', 'expire_at.h'), header);
 }
 
 interface ProbeRun {
@@ -73,10 +94,11 @@ interface ProbeRun {
   readonly stderr: string;
 }
 
-function spawnProbe(args: readonly string[], cwd?: string): ProbeRun {
+function spawnProbe(args: readonly string[], sandbox: Sandbox, cwd?: string): ProbeRun {
   const result = spawnSync('bash', [RUN_PROBE, ...args], {
     encoding: 'utf8',
     timeout: 120_000,
+    env: { ...process.env, TMPDIR: sandbox.tmp },
     ...(cwd === undefined ? {} : { cwd }),
   });
   return {
@@ -86,16 +108,9 @@ function spawnProbe(args: readonly string[], cwd?: string): ProbeRun {
   };
 }
 
-function runProbe(args: readonly string[]): ProbeRun {
-  return spawnProbe(args);
-}
-
-function runnerTempEntries(): string[] {
-  return readdirSync(tmpdir()).filter((name) => name.startsWith(RUNNER_TEMP_PREFIX)).sort();
-}
-
-function assertRunnerCleanedTemp(before: readonly string[]): void {
-  assert.deepEqual(runnerTempEntries(), before, 'runner left temporary directories behind');
+/** The runner must consume its private TMPDIR completely: empty means cleaned. */
+function assertTempCleaned(sandbox: Sandbox): void {
+  assert.deepEqual(readdirSync(sandbox.tmp), [], 'runner left entries in its private TMPDIR');
 }
 
 /** Relative file list, proving the runner never writes into the candidate tree. */
@@ -110,92 +125,115 @@ function listFiles(root: string, prefix = ''): string[] {
 }
 
 describe('interface contract probe (examples/interface-probe)', () => {
-  it('documents missing-compiler behavior: unknown compiler exits 4 with a clear message', () => {
-    const before = runnerTempEntries();
-    const base = freshBase('missing-compiler');
-    const run = runProbe(['--compiler', 'definitely-not-a-compiler-xyz', candidate(base, GOOD_HEADER)]);
+  it('documents missing-compiler behavior: unknown compiler exits 4 with a clear message', (t) => {
+    const sandbox = makeSandbox(t, 'missing-compiler');
+    writeCandidate(sandbox, GOOD_HEADER);
+    const run = spawnProbe(['--compiler', 'definitely-not-a-compiler-xyz', sandbox.root], sandbox);
     assert.equal(run.status, 4);
     assert.match(run.stderr, /compiler not found: 'definitely-not-a-compiler-xyz'/);
-    assertRunnerCleanedTemp(before);
+    assertTempCleaned(sandbox);
   });
 
-  it('reports a missing candidate header as exit 3 before invoking any compiler', () => {
-    const before = runnerTempEntries();
-    const base = freshBase('missing-header');
-    const run = runProbe([base]);
+  it('reports a missing candidate header as exit 3 before invoking any compiler', (t) => {
+    const sandbox = makeSandbox(t, 'missing-header');
+    const run = spawnProbe([sandbox.root], sandbox);
     assert.equal(run.status, 3);
     assert.match(run.stderr, /candidate header not found/);
-    assertRunnerCleanedTemp(before);
+    assertTempCleaned(sandbox);
   });
 
-  it('treats a dash-prefixed ROOT after "--" as a path, not an option', () => {
-    const before = runnerTempEntries();
-    const base = freshBase('dash');
-    const dashRoot = join(base, '-dash-root');
-    mkdirSync(dashRoot, { recursive: true });
-    // The argument must be dash-leading relative to the runner's cwd, so run
-    // with cwd = base and pass the bare name.
-    const spawn = (args: readonly string[]): ProbeRun =>
-      spawnProbe(args, base);
-    const withoutMarker = spawn(['-dash-root']);
-    assert.equal(withoutMarker.status, 2, 'dash-prefixed ROOT without "--" must be a usage error');
-    assert.match(withoutMarker.stderr, /unknown option: -dash-root/);
-    const withMarker = spawn(['--', '-dash-root']);
-    assert.equal(withMarker.status, 3, '"--" must pass the dash-prefixed ROOT through (fails later on missing header)');
-    assert.match(withMarker.stderr, /-dash-root/);
-    assertRunnerCleanedTemp(before);
-  });
-
-  it('rejects unknown options with exit 2', () => {
-    const run = runProbe(['--header', 'whatever']);
+  it('rejects unknown options with exit 2', (t) => {
+    const sandbox = makeSandbox(t, 'unknown-option');
+    const run = spawnProbe(['--header', 'whatever'], sandbox);
     assert.equal(run.status, 2);
     assert.match(run.stderr, /unknown option: --header/);
+    assertTempCleaned(sandbox);
   });
 
-  it('accepts a candidate with the exact global interface (path with spaces)', compileTest, () => {
-    const before = runnerTempEntries();
-    const base = freshBase('good');
-    const root = candidate(base, GOOD_HEADER);
-    const files = listFiles(root);
-    const run = runProbe([root]);
+  it('rejects a second ROOT with a usage error', (t) => {
+    const sandbox = makeSandbox(t, 'extra-root');
+    const other = join(sandbox.root, 'second-root');
+    mkdirSync(other);
+    const run = spawnProbe(['--', sandbox.root, other], sandbox);
+    assert.equal(run.status, 2);
+    assert.match(run.stderr, /unexpected extra arguments/);
+    assertTempCleaned(sandbox);
+  });
+
+  it('treats a dash-prefixed ROOT after "--" as a path, not an option', (t) => {
+    const sandbox = makeSandbox(t, 'dash');
+    const dashRoot = join(sandbox.root, '-dash-root');
+    mkdirSync(dashRoot);
+    // The argument must be dash-leading relative to the runner's cwd, so run
+    // with cwd = sandbox.root and pass the bare name.
+    const withoutMarker = spawnProbe(['-dash-root'], sandbox, sandbox.root);
+    assert.equal(withoutMarker.status, 2, 'dash-prefixed ROOT without "--" must be a usage error');
+    assert.match(withoutMarker.stderr, /unknown option: -dash-root/);
+    const withMarker = spawnProbe(['--', '-dash-root'], sandbox, sandbox.root);
+    assert.equal(withMarker.status, 3, '"--" must pass the dash-prefixed ROOT through (fails later on missing header)');
+    assert.match(withMarker.stderr, /-dash-root/);
+    assertTempCleaned(sandbox);
+  });
+
+  it('accepts a candidate with the exact global interface (path with spaces)', compileTest, (t) => {
+    const sandbox = makeSandbox(t, 'good');
+    writeCandidate(sandbox, GOOD_HEADER);
+    const files = listFiles(sandbox.root);
+    const run = spawnProbe([sandbox.root], sandbox);
     assert.equal(run.status, 0, `expected pass, stderr: ${run.stderr}`);
     assert.match(run.stdout, /PASS/);
     assert.match(run.stdout, /valid_expire_at\(const std::string&\)/);
-    assert.deepEqual(listFiles(root), files, 'runner wrote into the candidate tree');
-    assertRunnerCleanedTemp(before);
+    assert.deepEqual(listFiles(sandbox.root), files, 'runner wrote into the candidate tree');
+    assertTempCleaned(sandbox);
   });
 
-  it('accepts a dash-prefixed candidate root passed after "--"', compileTest, () => {
-    const before = runnerTempEntries();
-    const base = freshBase('dash-good');
-    const dashRoot = join(base, '-dash-root');
+  it('accepts a dash-prefixed candidate root passed after "--"', compileTest, (t) => {
+    const sandbox = makeSandbox(t, 'dash-good');
+    const dashRoot = join(sandbox.root, '-dash-root');
     mkdirSync(join(dashRoot, 'handler'), { recursive: true });
     writeFileSync(join(dashRoot, 'handler', 'expire_at.h'), GOOD_HEADER);
-    const run = spawnProbe(['--', '-dash-root'], base);
+    const run = spawnProbe(['--', '-dash-root'], sandbox, sandbox.root);
     assert.equal(run.status, 0, `expected pass, stderr: ${run.stderr}`);
     assert.match(run.stdout, /PASS/);
-    assertRunnerCleanedTemp(before);
+    assertTempCleaned(sandbox);
   });
 
-  it('rejects a namespace-only slip with a targeted hint and compiler evidence', compileTest, () => {
-    const before = runnerTempEntries();
-    const base = freshBase('slip');
-    const run = runProbe([candidate(base, NAMESPACE_SLIP_HEADER)]);
-    assert.equal(run.status, 1);
-    assert.match(run.stderr, /has not been declared/);
-    assert.match(run.stderr, /did you mean 'handler::valid_expire_at'/);
-    assert.match(run.stderr, /namespace-only slip/);
-    assertRunnerCleanedTemp(before);
+  it('keeps working when TMPDIR contains shell-special characters', compileTest, (t) => {
+    const sandbox = makeSandbox(t, 'special-tmp');
+    writeCandidate(sandbox, NAMESPACE_SLIP_HEADER);
+    // Replace the plain private TMPDIR with one carrying specials; the
+    // mkdtemp base is still cleaned by t.after.
+    const specialTmp = join(sandbox.tmp, "tm p|&;'\"()$");
+    mkdirSync(specialTmp);
+    const special: Sandbox = { root: sandbox.root, tmp: specialTmp };
+    const run = spawnProbe([sandbox.root], special);
+    assert.equal(run.status, 1, `expected contract violation, stdout: ${run.stdout}`);
+    assert.match(run.stderr, /interface-probe: FAIL:/);
+    assert.match(run.stderr, /error:/);
+    assert.match(run.stderr, /valid_expire_at/);
+    assertTempCleaned(special);
   });
 
-  it('rejects an incompatible signature (parameter by value) as a contract violation', compileTest, () => {
-    const before = runnerTempEntries();
-    const base = freshBase('byval');
-    const run = runProbe([candidate(base, BY_VALUE_HEADER)]);
+  it('rejects a namespace-only slip with compiler evidence', compileTest, (t) => {
+    const sandbox = makeSandbox(t, 'slip');
+    writeCandidate(sandbox, NAMESPACE_SLIP_HEADER);
+    const run = spawnProbe([sandbox.root], sandbox);
     assert.equal(run.status, 1);
     assert.match(run.stderr, /error:/);
-    assert.match(run.stderr, /interface contract violated/);
-    assert.doesNotMatch(run.stderr, /namespace-only slip/, 'signature failure must not be misclassified as a slip');
-    assertRunnerCleanedTemp(before);
+    assert.match(run.stderr, /valid_expire_at/);
+    assert.match(run.stderr, /interface-probe: FAIL:/);
+    assert.doesNotMatch(run.stdout, /PASS/);
+    assertTempCleaned(sandbox);
+  });
+
+  it('rejects an incompatible signature (parameter by value) as a contract violation', compileTest, (t) => {
+    const sandbox = makeSandbox(t, 'byval');
+    writeCandidate(sandbox, BY_VALUE_HEADER);
+    const run = spawnProbe([sandbox.root], sandbox);
+    assert.equal(run.status, 1);
+    assert.match(run.stderr, /error:/);
+    assert.match(run.stderr, /interface-probe: FAIL:/);
+    assert.doesNotMatch(run.stdout, /PASS/);
+    assertTempCleaned(sandbox);
   });
 });
