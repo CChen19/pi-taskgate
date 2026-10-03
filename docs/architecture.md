@@ -1,6 +1,6 @@
 # Architecture
 
-Status: P0 (task tools) and P1 (integration) are implemented and have run for real on TinyWebServer (2026-09-22). What happened, including every failure the tools caught, is in [field-report-2026-09.md](field-report-2026-09.md). How we plan to measure the benefit against Pier alone is in [evaluation.md](evaluation.md).
+Status: P0 (task tools) and P1 (integration) are implemented and have run for real on TinyWebServer (2026-09-22). What happened, including every failure the tools caught, is in [field-report-2026-09.md](field-report-2026-09.md). How the benefit against Pier alone was measured across three rounds is summarized in [summary-rounds-1-3.md](summary-rounds-1-3.md); the round-2 method and pre-registration are in [evaluation.md](evaluation.md).
 
 ## Target: the Pi main session orchestrates; code enforces
 
@@ -58,7 +58,7 @@ task_plan ──► PENDING/READY ──task_start──► RUNNING ──task_b
    - verification commands that match the human-authored allowlist exactly;
    - review required by default;
    - no path overlap between tasks that can run in parallel, unless both declare it in `planned_overlap`. Such a path must be in the human-written `sharedPaths`. A file marked `merge: "union"` there is add-only for tasks, and integration merges it with Git's union driver.
-2. **Start.** `task_start` needs READY (all dependencies PASSED) or RETRYING. The host creates the worktree from the main checkout's HEAD, from a PASSED dependency's accepted revision (`base_task`), or from the previous attempt's branch (`reuse_worktree`). It returns the worker brief and the `subagent` arguments.
+2. **Start.** `task_start` needs READY (all dependencies PASSED) or RETRYING. It is refused with `CAPACITY` while the human-configured `maxParallelAgents` cap is reached (workers and running reviews count; a refused start creates no worktree, reservation, or event). The host creates the worktree from the main checkout's HEAD, from a PASSED dependency's accepted revision (`base_task`), or from the previous attempt's branch (`reuse_worktree`). It returns the worker brief and the `subagent` arguments.
 3. **Bind.** `task_bind` accepts only an agent id that Pier's ledger shows was launched in exactly that worktree.
 4. **Verify.** `task_verify` refuses while the ledger says the worker is still running. Otherwise it:
    1. inspects HEAD, changed paths, cleanliness and commits ahead;
@@ -95,10 +95,11 @@ Every refusal leaves the board unchanged: a mutation is trial-applied to a repla
 | Worktree path too long for Pier's pipe socket | `LEASE_UNAVAILABLE`; config load fails | Caused R0 before the fix |
 | Worker not launched in that worktree, or unbound | `WORKER_NOT_FOUND` / `WORKER_UNBOUND` | — |
 | Worker or reviewer still running | `WORKER_RUNNING` | 3× in R1/R4 |
-| Dirty tree, no commits, out-of-scope paths, added test `assert(` (with `rejectTestAsserts`) | Failed check recorded (no settle) | F2 replay: 23 asserts in `0d6c428` |
+| Dirty tree, no commits, out-of-scope paths, added test `assert(` (with `rejectTestAsserts`), removed or edited lines in a union-merged shared file | Failed check recorded (no settle) | F2 replay: 23 asserts in `0d6c428` |
 | Clean-room checkout cannot be made pristine | `VERIFICATION_ERROR` | — |
 | Worker HEAD moved during verification | Failed check recorded | — |
 | Candidate no longer HEAD or clean at review brief or record | Attempt rejected | — |
+| Start or review brief at or over the human-configured `maxParallelAgents` | `CAPACITY` (nothing is created or persisted) | — |
 | Reviewer role allows a mutating tool | `ROLE_NOT_READ_ONLY` | — |
 | Reviewer is the implementer, revived, launched before the brief, or a stale review | `REVIEWER_INVALID` / `REVISION_MISMATCH` | F3 (revived reviewer) |
 | No parseable `REVIEW_VERDICT` line | `REVIEW_UNPARSEABLE` | F3 |
@@ -120,6 +121,7 @@ Every refusal leaves the board unchanged: a mutation is trial-applied to a repla
 
 - **`src/orchestration/task-board.ts`** — pure reducer. It combines `TaskGraph` (dependencies, `task-state` lifecycle with settled ≠ accepted) with per-attempt evidence: worktree lease, bound Pier agent, failed checks, candidate revision with its `EvidenceBundle`, and review request/verdict. Every mutation is a versioned `TaskEvent`; `replayTaskBoard` rebuilds identical state.
 - **`src/orchestration/task-service.ts`** — the deterministic operations behind the tools, with the checks listed above.
+- **`src/orchestration/delivery-summary.ts`** — the read-only delivery-evidence and plan-coverage summary behind `task_status` ([delivery-summary.md](delivery-summary.md)). It derives from persisted board state only and never changes the DELIVERABLE selection.
 - **`src/pi-extension/index.ts`** — registers the nine tools: `task_status`, `task_plan`, `task_start`, `task_bind`, `task_verify`, `task_review_brief`, `task_review_record`, `task_integrate`, `task_abandon`. It also persists and replays events.
 - **`src/orchestration/config.ts`** — human-authored config: repo root, short workspace root outside the repo, verification allowlist, reviewer role, budgets. The model never supplies allowlist entries.
 - **`src/orchestration/host-wiring.ts`** — real git, verification processes and Pier adapters.
@@ -141,10 +143,10 @@ Every refusal leaves the board unchanged: a mutation is trial-applied to a repla
 
 - Conflict resolution for integration.
 - Automatic cleanup of worktrees and branches (done by hand after the TinyWebServer rounds).
-- Parallel limits beyond Pier's own cap.
 - Metrics collection. The field report was extracted by hand from session files.
 - Porting stable pieces into Pier.
-- A larger controlled comparison against Pier alone. The first round is in [benchmark-2026-09-22.md](benchmark-2026-09-22.md); it found gaps G1–G3 (messages to running reviewers, a master bypassing a failed integration with its shell, and `planned_overlap` used by default). Those are fixed in code (reviewer session check, git write guard plus `DELIVERABLE`, human-only `sharedPaths`), together with delivering review briefs as files, but not yet exercised live; round 2 is pre-registered in [evaluation.md](evaluation.md).
+- Automatic interface-probe generation. The shipped probe ([interface-probe.md](interface-probe.md)) checks one fixed, human-chosen contract; covering a new contract means hand-writing another probe and adding it to the allowlist.
+- A controlled comparison against Pier alone has run three times ([summary](summary-rounds-1-3.md): rounds 1–3). The G1 reviewer-session check and the git write guard have still never had to refuse anything live; they are covered by offline tests.
 
 ## Legacy: external vertical slice (removed)
 

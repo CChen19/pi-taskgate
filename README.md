@@ -18,6 +18,7 @@ It does not make agents smarter. It turns safeguards that Pier leaves to prompt 
   - **Strong master (`gpt-6-sol`), 44 valid trials:** Pier alone and both versions of the tools had no bad acceptance at all, up to a 6-task workload. The fixed tools held G1–G3, and cost less than the round-1 code. They took about 1.6× Pier-alone's wall time at 6 tasks.
   - **Weaker master (`gpt-6-luna`):** Pier alone accepted a vacuous `assert` test in 3 of 3 trials, and the tools in 0 of 3. That meets the pre-registered rule "the layer's outcome value depends on master strength".
 - **Round 3** ([results](docs/benchmark-round3-2026-09-29.md)): with a union merge for the shared `CMakeLists.txt` and a cap of 3 agents, the tools ran 6-task work in parallel again. Median wall time was 0.74× Pier-alone's, against 1.6× in round 2, with 0 bad acceptances (Pier alone: 1 of 6). No integration failed, so integration repair was not built.
+- **After round 3.** `task_status` gained a read-only delivery summary and plan-coverage report ([docs/delivery-summary.md](docs/delivery-summary.md)), and a minimal compile-time interface probe now covers the one known namespace-slip contract from rounds 2–3 ([docs/interface-probe.md](docs/interface-probe.md); the failure and its evidence are walked through in [docs/interview-case-study.md](docs/interview-case-study.md)).
 
 ## What Pier provides and what this adds
 
@@ -48,7 +49,7 @@ A worker saying "done" is not acceptance. Only `task_verify` and `task_review_re
 
 | Tool | What the code guarantees |
 |---|---|
-| `task_status` | The board: state, unmet dependencies, attempts, bound agent, worktree, failed checks, candidate, review and verdict, plus the READY list and **`DELIVERABLE`**. The deliverable is the latest PASSED integration, or the single task's PASSED revision when there is only one task. Otherwise it is none, with a reason |
+| `task_status` | The board: state, unmet dependencies, attempts, bound agent, worktree, failed checks, candidate, review and verdict, plus the READY list and **`DELIVERABLE`**. The deliverable is the latest PASSED integration, or the single task's PASSED revision when there is only one task. Otherwise it is none, with a reason. It also appends a read-only **DELIVERY SUMMARY**: which verification and review evidence binds to the delivered revision, and which planned tasks it does not include ([docs/delivery-summary.md](docs/delivery-summary.md)). Queries never mutate the board |
 | `task_plan` | Adds contracts atomically. Ids must be unique, dependencies must exist without cycles, `files_in_scope` must be non-empty, and verification commands must match the host allowlist verbatim. `review_required` defaults to true. **Planning rule:** tasks that can run in parallel must not have overlapping `files_in_scope`. The only exception is a path in the human-written `sharedPaths` config that both tasks list in `planned_overlap`. The model can reference shared paths but cannot add them |
 | `task_start` | Needs a READY or RETRYING task. Refused with `CAPACITY` when `maxParallelAgents` is reached. The host creates a worktree and branch and returns the worker prompt and spawn arguments. A task without dependencies starts from HEAD. A task with one dependency is **stacked** on that dependency's accepted revision. With several dependencies, `base_task` is required, and every dependency that changes the same files must already be in that base's stack. `reuse_worktree` continues on the same branch |
 | `task_bind` | Confirms in Pier's ledger that the agent was launched in that worktree |
@@ -110,7 +111,7 @@ Evidence for each item is in the benchmarks ([round 1](docs/benchmark-2026-09-22
   - With a strong master, round 2 found no outcome difference: 0 bad acceptances in every arm. The tools cost wall time on multi-task work, because shared files forced tasks to run in order; round 3's union merge removed that cost for append-only files.
   - With a weaker master, the one difference came from one fault type: `assert` tests compiled out in Release. The worker brief's assert rule prevented it.
   - Scope escapes and smoke-test-only candidates were caught by every master tried, with or without the tools.
-  - Interface slips that neither the tests nor the reviewer notice get through in both arms: in rounds 2 and 3, three `expire_at` headers put the function in a namespace the task did not ask for, so the hidden oracle did not compile.
+  - Interface slips that neither the tests nor the reviewer notice get through in both arms: in rounds 2 and 3, three `expire_at` headers put the function in a namespace the task did not ask for, so the hidden oracle did not compile. A minimal compile-time probe now exists for that one known contract ([docs/interface-probe.md](docs/interface-probe.md)): the human adds its exact command to the verification allowlist and `task_verify` runs it in the clean room. It is evidenced only for that contract — the failure, the probe, and the limits are in [docs/interview-case-study.md](docs/interview-case-study.md).
 - **Some fixes held but were never exercised live.**
   - In round 2, no master messaged a reviewer after its brief, and none tried a git write. The G1 check and the git write guard therefore never had to refuse anything live. They are covered by offline tests.
   - Brief-as-file worked in all 60 round-2 B1 reviews: every reviewer received the issued prompt, and every accepted verdict passed the read-coverage check.
@@ -130,7 +131,7 @@ Evidence for each item is in the benchmarks ([round 1](docs/benchmark-2026-09-22
 ## Development
 
 ```bash
-npm run check   # typecheck + 133 offline tests
+npm run check   # typecheck + offline tests
 ```
 
 Tests use real temporary git repositories, worktrees and allowlisted processes, with a fake Pier ledger, roles and sessions. They never call a model, Pi, herdr or the network. Node 24 runs the TypeScript directly; there is no build step.
@@ -150,11 +151,15 @@ Tests use real temporary git repositories, worktrees and allowlisted processes, 
 ## Documents
 
 - [docs/architecture.md](docs/architecture.md): design and invariants.
+- [docs/delivery-summary.md](docs/delivery-summary.md): the `task_status` delivery-evidence and plan-coverage report.
+- [docs/interface-probe.md](docs/interface-probe.md): the fixed-contract compile probe (reference).
+- [docs/interview-case-study.md](docs/interview-case-study.md): the interface failure, the probe built for it, and what an accepted revision does and does not claim.
+- [docs/summary-rounds-1-3.md](docs/summary-rounds-1-3.md): conclusions from all three benchmark rounds.
 - [docs/evaluation.md](docs/evaluation.md): evaluation method and the round-2 pre-registration.
 - [docs/benchmark-2026-09-22.md](docs/benchmark-2026-09-22.md): round-1 results.
 - [docs/benchmark-2026-09-29.md](docs/benchmark-2026-09-29.md): round-2 results, including the weak-master extension.
 - [docs/critical-path-2026-09-29.md](docs/critical-path-2026-09-29.md): where round-2 wall time went.
-- [docs/design-parallel-recovery.md](docs/design-parallel-recovery.md): proposed next changes (union merge for shared build files, a concurrency cap, integration repair); not implemented yet.
+- [docs/design-parallel-recovery.md](docs/design-parallel-recovery.md): the design behind the shipped union merge and agent cap; its remaining piece, integration repair, is not implemented.
 - [docs/field-report-2026-09.md](docs/field-report-2026-09.md): the live runs that motivated the design.
 - [docs/observations-2026-09-22.md](docs/observations-2026-09-22.md): operator observations (Chinese).
 
@@ -165,3 +170,5 @@ pi-taskgate 是一个与 Pier 并列加载的 Pi 扩展。Pi 主会话仍是唯�
 第二轮结论：
 - **强 master（gpt-6-sol）：** 各组都没有错误接受。
 - **弱 master（gpt-6-luna）：** 只用 Pier 的一组在 3 次试验中都接受了在 Release 下失效的 `assert` 测试，加载本扩展的一组为 0 次。
+
+第三轮之后：`task_status` 增加了只读的交付摘要（`docs/delivery-summary.md`）；针对第二、三轮反复出现的接口滑误（`valid_expire_at` 的 namespace 滑误）加入了最小编译探针（`docs/interface-probe.md`，失败分析与证据见 `docs/interview-case-study.md`）。它只覆盖这一个已知契约，不声称一般性的正确性或安全性保证。

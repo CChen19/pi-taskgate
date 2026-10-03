@@ -646,6 +646,17 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
       assert.match(started.prompt!, /CMakeLists\.txt is shared with tasks running in parallel\. .*only add lines there/);
       assert.equal(verified.outcome, 'check_failed');
       assert.match(verified.reasons.join(' '), /CMakeLists\.txt is merged with parallel tasks .* may only add lines to it; this change removes or edits 1 existing line\(s\): "project\(x\)"/);
+      // Unlike a refused tool call, this rejection changes the board: it records a check and spends one of the attempt's checks.
+      assert.equal(verified.checksUsed, 1);
+      assert.equal(verified.state, 'RUNNING');
+      const attempt = svc.task('T1').attemptRecords[0]!;
+      assert.deepEqual(attempt.checks.map((check) => check.stage), ['artifact']);
+      assert.match(attempt.checks[0]!.reasons.join(' '), /may only add lines to it/);
+      assert.equal(attempt.candidate, undefined, 'an edited union line never settles a candidate');
+      commit(started.workspacePath!, { 'CMakeLists.txt': cmake('add_executable(extra extra.cpp)\n') });
+      const fixed = await svc.verify('T1');
+      assert.equal(fixed.outcome, 'awaiting_review', fixed.reasons.join('; '));
+      assert.equal(fixed.checksUsed, 1, 'the recorded union check stays counted; the pass adds none');
       const plain = h.service();
       plain.plan([task('T9', { files_in_scope: ['CMakeLists.txt'] })]);
       assert.doesNotMatch(plain.start('T9').prompt!, /shared with tasks running in parallel/);
@@ -678,6 +689,26 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
       assert.equal(svc.start('T2').state, 'RUNNING');
     });
 
+    it('refuses a start at the cap without creating a workspace, a reservation, or an event', async () => {
+      const svc = capped(2);
+      svc.plan(three());
+      const one = svc.start('T1');
+      const two = svc.start('T2');
+      h.ledger.add({ paneId: 'w:1', cwd: one.workspacePath!, createdAt: h.now.value + 1 });
+      h.ledger.add({ paneId: 'w:2', cwd: two.workspacePath!, createdAt: h.now.value + 1 });
+      const worktrees = () => git(h.repo, ['worktree', 'list', '--porcelain']).split('\n').filter((line) => line.startsWith('worktree ')).length;
+      assert.equal(worktrees(), 3, 'the repo plus one worktree per started task');
+      const before = h.events.length;
+      await rejectsCode(() => svc.start('T3'), 'CAPACITY');
+      await assert.rejects(async () => svc.start('T3'), (error: unknown) => error instanceof TaskServiceError && error.code === 'CAPACITY' && /2 agent\(s\) are running/.test(error.message), 'refused starts do not reserve a slot of their own');
+      assert.equal(h.events.length, before, 'a refused start persists nothing');
+      assert.equal(svc.task('T3').state, 'READY');
+      assert.equal(worktrees(), 3, 'the refused task got no workspace');
+      h.ledger.add({ paneId: 'w:1', cwd: one.workspacePath!, status: 'settled', outcome: 'done', createdAt: h.now.value });
+      assert.equal(svc.start('T3').state, 'RUNNING', 'the freed slot goes to the next start');
+      assert.equal(worktrees(), 4);
+    });
+
     it('counts reviews: a review brief is refused at the cap', async () => {
       const svc = capped(1);
       svc.plan(three());
@@ -685,8 +716,10 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
       assert.equal(verified.outcome, 'awaiting_review');
       const other = svc.start('T2');
       h.ledger.add({ paneId: 'w:T2', cwd: other.workspacePath!, createdAt: h.now.value + 1 });
+      const before = h.events.length;
       await rejectsCode(() => svc.reviewBrief('T1'), 'CAPACITY');
       assert.equal(svc.task('T1').state, 'VERIFYING', 'a refused brief changes nothing');
+      assert.equal(h.events.length, before, 'a refused brief persists nothing');
       h.ledger.add({ paneId: 'w:T2', cwd: other.workspacePath!, status: 'settled', outcome: 'done', createdAt: h.now.value });
       assert.equal(svc.reviewBrief('T1').outcome, 'review_requested');
     });
@@ -892,6 +925,25 @@ describe('main-agent orchestration primitives', { skip: !gitOk }, () => {
     assert.equal(brief.outcome, 'rejected');
     assert.match(brief.reasons.join(' '), /artifact changed after verification/);
     assert.equal(svc.task('T1').state, 'RETRYING');
+  });
+
+  it('refuses a valid fresh review when the candidate moved after its brief, instead of accepting the stale revision', async () => {
+    const svc = h.service();
+    svc.plan([task('T1')]);
+    const { cwd, revision } = await toCandidate(h, svc, 'T1');
+    const brief = svc.reviewBrief('T1');
+    assert.equal(brief.outcome, 'review_requested');
+    // The reviewer itself is unimpeachable: issued prompt, whole brief read, verdict naming the reviewed revision.
+    h.ledger.add({ paneId: 'r:stale', cwd, kind: 'reviewer-readonly', status: 'settled', createdAt: h.now.value + 1, outcome: reviewerOutput(brief.reviewId!, 'passed', revision) }, h.ledger.briefed(brief.reviewId!));
+    commit(cwd, { 'src/a.txt': 'hello\nsneaky\n' }, 'change after the brief');
+    const recorded = svc.recordReview('T1', 'r:stale');
+    assert.equal(recorded.verdict, 'rejected', 'a review bound to the old revision cannot accept the moved candidate');
+    assert.match(recorded.reasons.join(' '), /artifact changed after verification/);
+    assert.equal(svc.task('T1').state, 'RETRYING');
+    const guard = svc.task('T1').attemptRecords[0]!.verdict;
+    assert.equal(guard?.source, 'guard');
+    assert.notEqual(guard?.verdict, 'passed');
+    assert.match(svc.start('T1', { reuseWorktree: true }).prompt!, /artifact changed after verification/, 'the guard reasons reach the next attempt as feedback');
   });
 
   it('branches a dependent from an accepted dependency revision', async () => {
