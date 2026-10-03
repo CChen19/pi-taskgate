@@ -403,6 +403,7 @@ describe('pi extension', () => {
       status: () => [],
       readySet: () => [],
       deliverable: () => ({ reason: 'no tasks planned', notIncluded: [] }),
+      deliverySummary: () => ({ coverage: { complete: false, total: 0, included: [], omitted: [], omittedCount: 0 }, notes: [], text: 'DELIVERY SUMMARY\n  deliverable: none (no tasks planned)\n  coverage: no planned tasks on the board' }),
       start() { throw new TaskServiceError('NOT_READY', 'T1 is PENDING'); },
     } as unknown as TaskService;
     createAgentOrchestratorExtension({ createService: () => fake })(pi.api);

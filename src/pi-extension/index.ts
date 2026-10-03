@@ -265,7 +265,9 @@ export function createAgentOrchestratorExtension(deps: ExtensionDeps): (pi: PiEx
         ? `DELIVERABLE: none (${deliverable.reason ?? 'not ready'})`
         : `DELIVERABLE: ${deliverable.revision} (${deliverable.taskId})${deliverable.notIncluded.length > 0 ? `; PASSED but not included: ${deliverable.notIncluded.join(', ')}` : ''}`;
       const shared = svc.sharedPathsNote?.();
-      return text(`${body}\nREADY: ${svc.readySet().join(', ') || '(none)'}\n${deliver}${shared === undefined ? '' : `\n${shared}`}${extra}`, { tasks: tasks.map((task) => ({ id: task.id, state: task.state, unmetDependencies: task.unmetDependencies, attempts: task.attemptRecords.length })), deliverable });
+      // Coverage is always global: filtering the task list by task_id must not shrink it.
+      const delivery = svc.deliverySummary();
+      return text(`${body}\nREADY: ${svc.readySet().join(', ') || '(none)'}\n${deliver}\n${delivery.text}${shared === undefined ? '' : `\n${shared}`}${extra}`, { tasks: tasks.map((task) => ({ id: task.id, state: task.state, unmetDependencies: task.unmetDependencies, attempts: task.attemptRecords.length })), deliverable, delivery });
     });
 
     tool({

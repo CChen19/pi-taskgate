@@ -26,6 +26,7 @@ import type { WorkerLedger } from '../host/pier-ledger.ts';
 import type { SubagentSession } from '../host/pi-session.ts';
 import type { RoleCheck } from '../host/pier-roles.ts';
 import { briefReadCoverage, parseReviewerOutcome, renderReviewerPrompt, renderReviewerSpawnPrompt, renderWorkerBrief, sameText } from './briefs.ts';
+import { deliverySummary, type DeliverySummary } from './delivery-summary.ts';
 import { replayTaskBoard, TaskBoard, TaskBoardError, type AppliedCommit, type AttemptRecord, type CandidateRecord, type CheckStage, type IntegrationInput, type ReviewBriefFile, type TaskEvent, type TaskView } from './task-board.ts';
 
 export interface TaskServiceSettings {
@@ -291,6 +292,11 @@ export class TaskService {
 
   readySet(): readonly string[] {
     return this.board.readySet();
+  }
+
+  /** Read-only delivery evidence and plan-coverage summary; no mutations, no host checks, and the DELIVERABLE selection is unchanged. */
+  deliverySummary(): DeliverySummary {
+    return deliverySummary(this.board.tasks(), this.deliverable());
   }
 
   /**
